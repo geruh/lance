@@ -73,15 +73,13 @@ jobs:
       - name: Setup environment
         run: |
           uv venv
-          source .venv/bin/activate
           uv pip install ruff pyright maturin tensorflow tqdm ray[data] datasets polars[pyarrow,pandas] lance-namespace
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Lint Python
         run: |
-          source .venv/bin/activate
-          ruff format --check --diff python
-          ruff check python
-          pyright
+          uv run ruff format --check --diff python
+          uv run ruff check python
+          uv run pyright
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
@@ -89,12 +87,10 @@ jobs:
           cargo clippy  --profile ci --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
-          source .venv/bin/activate
-          maturin develop --uv --profile ci --locked --extras tests,ray
+          uv run maturin develop --uv --profile ci --locked --extras tests,ray
       - name: Run doctest
         run: |
-          source .venv/bin/activate
-          pytest --doctest-modules python/lance
+          uv run pytest --doctest-modules python/lance
   linux:
     timeout-minutes: 45
     strategy:
