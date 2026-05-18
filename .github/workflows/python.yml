@@ -42,7 +42,7 @@ env:
 jobs:
   lint:
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    runs-on: "ubuntu-24.04-4x"
     defaults:
       run:
         shell: bash
@@ -64,6 +64,8 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - name: Install linting tools
         run: |
           pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas] lance-namespace
@@ -84,7 +86,6 @@ jobs:
           cargo clippy  --profile ci --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
-          pip install uv
           uv venv
           source .venv/bin/activate
           uv pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
