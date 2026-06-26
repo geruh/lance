@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
+use super::{Fragment, FragmentManifestRef};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -101,6 +101,8 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    pub child_manifests: Vec<FragmentManifestRef>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -196,6 +198,7 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            child_manifests: Vec::new(),
         }
     }
 
@@ -227,6 +230,7 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            child_manifests: previous.child_manifests.clone(),
         }
     }
 
@@ -289,6 +293,7 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            child_manifests: Vec::new(),
         }
     }
 
@@ -492,6 +497,15 @@ impl Manifest {
     /// Whether the dataset uses stable row ids.
     pub fn uses_stable_row_ids(&self) -> bool {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+    }
+
+    pub fn is_tiered(&self) -> bool {
+        !self.child_manifests.is_empty()
+    }
+
+    pub fn set_materialized_fragments(&mut self, fragments: Vec<Fragment>) {
+        self.fragment_offsets = compute_fragment_offsets(&fragments);
+        self.fragments = Arc::new(fragments);
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
@@ -865,8 +879,18 @@ impl TryFrom<pb::Manifest> for Manifest {
             _ => None,
         };
         let mut interner = DataFileFieldInterner::default();
-        let fragments = Arc::new(
+        let child_manifests: Vec<FragmentManifestRef> = p
+            .child_manifests
+            .into_iter()
+            .map(FragmentManifestRef::from)
+            .collect();
+        let inline_fragments = if child_manifests.is_empty() {
             p.fragments
+        } else {
+            p.buffer_fragments
+        };
+        let fragments = Arc::new(
+            inline_fragments
                 .into_iter()
                 .map(|f| interner.intern_fragment(f))
                 .collect::<Result<Vec<_>>>()?,
@@ -931,6 +955,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            child_manifests,
         })
     }
 }
@@ -948,6 +973,26 @@ impl From<&Manifest> for pb::Manifest {
             })
         };
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
+        let (fragments, buffer_fragments) = if m.child_manifests.is_empty() {
+            (
+                m.fragments.iter().map(pb::DataFragment::from).collect(),
+                Vec::new(),
+            )
+        } else {
+            let spilled: usize = m
+                .child_manifests
+                .iter()
+                .map(|c| c.fragment_count as usize)
+                .sum();
+            let buffer = m
+                .fragments
+                .get(spilled..)
+                .unwrap_or(&[])
+                .iter()
+                .map(pb::DataFragment::from)
+                .collect();
+            (Vec::new(), buffer)
+        };
         Self {
             fields: fields_with_meta.fields.0,
             schema_metadata: m
@@ -967,7 +1012,13 @@ impl From<&Manifest> for pb::Manifest {
                     prerelease: wv.prerelease.clone(),
                     build_metadata: wv.build_metadata.clone(),
                 }),
-            fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragments,
+            buffer_fragments,
+            child_manifests: m
+                .child_manifests
+                .iter()
+                .map(pb::FragmentManifestRef::from)
+                .collect(),
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -1067,6 +1118,118 @@ mod tests {
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+
+    #[test]
+    fn tiered_root_size_bounded_at_150k_fragments() {
+        use crate::format::{child_path, seal_run};
+        use prost::Message;
+
+        const TOTAL: u64 = 150_000;
+        const BUFFER_CAP: usize = 100_000;
+
+        // Realistic entries: one data file per fragment with a UUID-length path.
+        let fragments: Vec<Fragment> = (0..TOTAL)
+            .map(|id| {
+                let mut fragment = Fragment::new(id).with_physical_rows(1_000_000);
+                fragment.files.push(DataFile::new(
+                    format!("{id:032x}.lance"),
+                    vec![0],
+                    vec![0],
+                    2,
+                    0,
+                    NonZero::new(64 * 1024 * 1024),
+                    None,
+                ));
+                fragment
+            })
+            .collect();
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let flat = Manifest::new(
+            schema.clone(),
+            Arc::new(fragments.clone()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let flat_len = pb::Manifest::from(&flat).encoded_len();
+
+        let mut tiered = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        tiered.child_manifests = vec![seal_run(
+            &tiered.fragments[..BUFFER_CAP],
+            child_path(1, 0, BUFFER_CAP as u64 - 1),
+            0,
+        )];
+        let root_len = pb::Manifest::from(&tiered).encoded_len();
+
+        assert!(
+            root_len < 12 * 1024 * 1024,
+            "tiered root is {root_len} B at {TOTAL} fragments; expected < 12 MB"
+        );
+        assert!(
+            root_len < flat_len,
+            "tiered root ({root_len} B) must be smaller than flat ({flat_len} B)"
+        );
+        // The root carries 50K buffered fragments out of 150K total: it should
+        // sit near one third of flat, far from scaling with N.
+        assert!(
+            root_len < flat_len / 2,
+            "tiered root ({root_len} B) should be bounded by the buffer, flat is {flat_len} B"
+        );
+    }
+
+    #[test]
+    fn shallow_clone_of_tiered_manifest_is_flat() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let fragments: Vec<Fragment> = (0..5)
+            .map(|id| Fragment::new(id).with_physical_rows(1))
+            .collect();
+        let mut source = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        source.child_manifests = vec![FragmentManifestRef {
+            path: "_manifest_children/v1-0-2-aabbccdd.manifest".to_string(),
+            min_fragment_id: 0,
+            max_fragment_id: 2,
+            row_offset_start: 0,
+            total_rows: 3,
+            fragment_count: 3,
+            byte_size: 256,
+        }];
+
+        let clone = source.shallow_clone(
+            None,
+            "s3://src/data".to_string(),
+            1,
+            None,
+            "txn".to_string(),
+        );
+
+        // The clone lives under a different root, so it cannot reference the
+        // source's root-relative children: it is flat with the fragments inline.
+        assert!(!clone.is_tiered());
+        assert!(clone.child_manifests.is_empty());
+        let cloned_ids: Vec<u64> = clone.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(cloned_ids, vec![0, 1, 2, 3, 4]);
+    }
 
     #[test]
     fn test_writer_version() {

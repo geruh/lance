@@ -5,6 +5,7 @@ use arrow_buffer::ToByteSlice;
 use uuid::Uuid;
 
 mod fragment;
+mod fragment_catalog;
 mod index;
 mod manifest;
 mod transaction;
@@ -13,6 +14,13 @@ pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
 pub use fragment::*;
+#[cfg(test)]
+pub(crate) use fragment_catalog::TieredLayout;
+pub use fragment_catalog::{
+    DEFAULT_MANIFEST_BUFFER_CAP, FragmentManifestRef, MANIFEST_BUFFER_CAP_KEY,
+    MANIFEST_CHILDREN_DIR, MANIFEST_LAYOUT_FLAT, MANIFEST_LAYOUT_KEY, MANIFEST_LAYOUT_TIERED,
+    child_path, seal_run, spilled_rows,
+};
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
 pub use manifest::{

@@ -18,7 +18,7 @@ use lance_core::{
     utils::{deletion::DeletionVector, mask::RowAddrMask},
 };
 use lance_table::{
-    format::{DeletionFile, Manifest},
+    format::{DeletionFile, Fragment, Manifest},
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -78,6 +78,21 @@ impl CacheKey for ManifestKey<'_> {
     }
     fn type_name() -> &'static str {
         "Manifest"
+    }
+}
+
+#[derive(Debug)]
+pub struct ChildManifestKey<'a> {
+    pub path: &'a str,
+}
+
+impl CacheKey for ChildManifestKey<'_> {
+    type ValueType = Vec<Fragment>;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("manifest_child/{}", self.path))
+    }
+    fn type_name() -> &'static str {
+        "ChildManifest"
     }
 }
 

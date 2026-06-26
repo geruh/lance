@@ -658,6 +658,21 @@ impl DatasetBuilder {
             .then(|| Arc::new(std::mem::take(&mut self.base_store_params)));
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
+        let manifest = match manifest {
+            Some(mut m) if m.is_tiered() => {
+                let ds_cache = session.metadata_cache.for_dataset(&table_uri);
+                crate::dataset::tiered::materialize_tiered_at_root(
+                    &object_store,
+                    &base_path,
+                    &mut m,
+                    &ds_cache,
+                )
+                .await?;
+                Some(m)
+            }
+            other => other,
+        };
+
         // Two cases that need to check out after loading the manifest:
         // 1. If the target is configured as a branch, we need to check the branch field in the manifest
         // and reload the right branch in case the uri is not the right one.

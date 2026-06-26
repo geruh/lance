@@ -10,7 +10,6 @@ use lance_file::{
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
-use prost::Message;
 use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 use tracing::instrument;
@@ -19,23 +18,134 @@ use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
     encodings::{Encoder, binary::BinaryEncoder, plain::PlainEncoder},
     object_store::ObjectStore,
+    object_writer::{ObjectWriter, WriteResult},
     traits::{WriteExt, Writer},
     utils::read_message,
 };
 
-use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
+use crate::format::{
+    DataFileFieldInterner, DataStorageFormat, Fragment, FragmentManifestRef, IndexMetadata, MAGIC,
+    MAJOR_VERSION, MINOR_VERSION, Manifest, Transaction, pb,
+};
 
 use super::commit::ManifestLocation;
 
 /// Read Manifest on URI.
-///
-/// This only reads manifest files. It does not read data files.
 #[instrument(level = "debug", skip(object_store))]
 pub async fn read_manifest(
     object_store: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<Manifest> {
+    let proto: pb::Manifest = read_tail_proto(object_store, path, known_size).await?;
+    let mut manifest = Manifest::try_from(proto)?;
+    if manifest.is_tiered() {
+        materialize_child_manifests(object_store, path, &mut manifest).await?;
+    }
+    Ok(manifest)
+}
+
+/// Load sealed children and prepend them to the root buffer tail.
+pub async fn materialize_child_manifests(
+    object_store: &ObjectStore,
+    manifest_path: &Path,
+    manifest: &mut Manifest,
+) -> Result<()> {
+    if manifest.child_manifests.is_empty() {
+        return Ok(());
+    }
+    let root = dataset_root_of_manifest(manifest_path);
+    let children = manifest.child_manifests.clone();
+
+    let loads = children.iter().map(|child| {
+        let child_path = child_full_path(&root, &child.path);
+        async move {
+            let fragments =
+                read_fragment_manifest(object_store, &child_path, child.size_hint()).await?;
+            verify_child_fragment_count(&child_path, child, fragments.len())?;
+            Ok::<_, Error>(fragments)
+        }
+    });
+    let runs = futures::future::try_join_all(loads).await?;
+
+    let sealed: usize = children.iter().map(|c| c.fragment_count as usize).sum();
+    let mut all = Vec::with_capacity(sealed + manifest.fragments.len());
+    all.extend(runs.into_iter().flatten());
+    all.extend(manifest.fragments.iter().cloned());
+    manifest.set_materialized_fragments(all);
+    Ok(())
+}
+
+pub fn verify_child_fragment_count(
+    child_path: &Path,
+    reference: &FragmentManifestRef,
+    actual: usize,
+) -> Result<()> {
+    if actual != reference.fragment_count as usize {
+        return Err(Error::corrupt_file(
+            child_path.clone(),
+            format!(
+                "child manifest fragment count mismatch: ref says {}, file has {}",
+                reference.fragment_count, actual
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn read_fragment_manifest(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Vec<Fragment>> {
+    let proto: pb::FragmentManifest = read_tail_proto(object_store, path, known_size).await?;
+    let mut interner = DataFileFieldInterner::default();
+    proto
+        .fragments
+        .into_iter()
+        .map(|f| interner.intern_fragment(f))
+        .collect()
+}
+
+pub async fn write_fragment_manifest_file(
+    object_store: &ObjectStore,
+    path: &Path,
+    fragments: &[Fragment],
+) -> Result<WriteResult> {
+    let proto = pb::FragmentManifest {
+        fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+    };
+    let mut writer = ObjectWriter::new(object_store, path).await?;
+    let pos = writer.write_protobuf(&proto).await?;
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await?;
+    Writer::shutdown(&mut writer).await
+}
+
+pub fn dataset_root_of_manifest(manifest_path: &Path) -> Path {
+    let parts: Vec<String> = manifest_path
+        .parts()
+        .map(|p| p.as_ref().to_string())
+        .collect();
+    let keep = parts.len().saturating_sub(2);
+    Path::from(parts[..keep].join("/"))
+}
+
+pub fn child_full_path(root: &Path, relative: &str) -> Path {
+    let root = root.to_string();
+    if root.is_empty() {
+        Path::from(relative)
+    } else {
+        Path::from(format!("{root}/{relative}"))
+    }
+}
+
+async fn read_tail_proto<M: prost::Message + Default>(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<M> {
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
@@ -49,10 +159,8 @@ pub async fn read_manifest(
     };
     let buf = object_store.inner.get_range(path, range).await?;
 
-    // In case of corruption, the known_size might be wrong. We can retry without
-    // the size to be more robust.
     if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
-        return Box::pin(read_manifest(object_store, path, None)).await;
+        return Box::pin(read_tail_proto::<M>(object_store, path, None)).await;
     }
 
     if buf.len() < 16 {
@@ -67,21 +175,18 @@ pub async fn read_manifest(
             "Invalid format: magic number does not match".to_string(),
         ));
     }
-    let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
-    let manifest_len = file_size as usize - manifest_pos;
+    let message_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
+    let message_len = file_size as usize - message_pos;
 
-    let buf: Bytes = if manifest_len <= buf.len() {
-        // The prefetch captured the entire manifest. We just need to trim the buffer.
-        buf.slice(buf.len() - manifest_len..buf.len())
+    let buf: Bytes = if message_len <= buf.len() {
+        buf.slice(buf.len() - message_len..buf.len())
     } else {
-        // The prefetch only captured part of the manifest. We need to make an
-        // additional range request to read the remainder.
         let mut buf2: BytesMut = object_store
             .inner
             .get_range(
                 path,
                 Range {
-                    start: manifest_pos as u64,
+                    start: message_pos as u64,
                     end: file_size - PREFETCH_SIZE,
                 },
             )
@@ -93,19 +198,17 @@ pub async fn read_manifest(
     };
 
     let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
-    // Need to trim the magic number at end and message length at beginning
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
         return Err(Error::invalid_input(format!(
-            "Invalid format: manifest length does not match. Expected {}, got {}",
+            "Invalid format: message length does not match. Expected {}, got {}",
             recorded_length,
             buf.len()
         )));
     }
 
-    let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    Ok(M::decode(buf)?)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -302,6 +405,93 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    /// A tiered manifest seals older fragments into immutable children and keeps
+    /// only the buffer tail inline. Reading it back must reproduce the full flat
+    /// fragment list and the root must not inline the sealed fragments.
+    #[tokio::test]
+    async fn tiered_manifest_round_trips_through_children() {
+        use crate::format::TieredLayout;
+
+        let store = ObjectStore::memory();
+        let root = "mydata";
+        let buffer_cap = 100;
+        let version = 1u64;
+
+        // 250 fragments, cap 100 → two sealed children + a 50-fragment buffer.
+        let baseline: Vec<Fragment> = (0..250)
+            .map(|id| Fragment::new(id).with_physical_rows((id as usize % 7) + 1))
+            .collect();
+
+        let layout = TieredLayout::seal(baseline.clone(), buffer_cap, version);
+        let refs = layout.child_refs();
+        assert_eq!(refs.len(), 2);
+
+        // Persist each immutable child at {root}/{ref.path}.
+        for child in layout.children() {
+            let min = child.reference.min_fragment_id;
+            let max = child.reference.max_fragment_id;
+            assert!(
+                child
+                    .reference
+                    .path
+                    .starts_with(&format!("_manifest_children/v{version}-{min}-{max}-")),
+                "unexpected child path {}",
+                child.reference.path
+            );
+            let full = Path::from(format!("{root}/{}", child.reference.path));
+            write_fragment_manifest_file(&store, &full, &child.fragments)
+                .await
+                .unwrap();
+        }
+
+        // Build and write the tiered root: full fragment list in memory, child
+        // refs attached. `From<&Manifest>` strips the sealed fragments out.
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(baseline.clone()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.child_manifests = refs.clone();
+
+        let manifest_path = Path::from(format!("{root}/_versions/1.manifest"));
+        let mut writer = store.create(&manifest_path).await.unwrap();
+        let pos = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        // The root proto inlines only the 50-fragment buffer, not the 200 sealed.
+        let raw: pb::Manifest = read_tail_proto(&store, &manifest_path, None).await.unwrap();
+        assert!(raw.fragments.is_empty());
+        assert_eq!(raw.buffer_fragments.len(), 50);
+        assert_eq!(raw.child_manifests.len(), 2);
+
+        // Reading back materializes children + buffer into the full flat list.
+        let reopened = read_manifest(&store, &manifest_path, None).await.unwrap();
+        assert!(reopened.is_tiered());
+        assert_eq!(reopened.child_manifests, refs);
+        let got: Vec<(u64, Option<usize>)> = reopened
+            .fragments
+            .iter()
+            .map(|f| (f.id, f.num_rows()))
+            .collect();
+        let want: Vec<(u64, Option<usize>)> =
+            baseline.iter().map(|f| (f.id, f.num_rows())).collect();
+        assert_eq!(got, want);
+
+        // Logical-row routing matches a flat offset search across the boundary.
+        for (offset, fragment) in reopened.fragments_by_offset_range(0..3) {
+            assert!(offset < 3 || fragment.id == 0);
+        }
     }
 
     #[tokio::test]

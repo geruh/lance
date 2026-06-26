@@ -20,8 +20,10 @@ pub const FLAG_TABLE_CONFIG: u64 = 8;
 pub const FLAG_BASE_PATHS: u64 = 16;
 /// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
 pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
+/// Fragment metadata uses the tiered manifest layout (child refs + root buffer).
+pub const FLAG_TIERED_MANIFEST: u64 = 64;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 64;
+pub const FLAG_UNKNOWN: u64 = 128;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -74,6 +76,12 @@ pub fn apply_feature_flags(
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
+
+    // Tiered readers must load child manifests; old readers fail closed on flag 64.
+    if manifest.is_tiered() {
+        manifest.reader_feature_flags |= FLAG_TIERED_MANIFEST;
+        manifest.writer_feature_flags |= FLAG_TIERED_MANIFEST;
+    }
     Ok(())
 }
 
@@ -103,10 +111,12 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_TIERED_MANIFEST));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
+                | super::FLAG_TIERED_MANIFEST
         ));
         assert!(!can_read_dataset(super::FLAG_UNKNOWN));
     }
@@ -128,6 +138,48 @@ mod tests {
                 | super::FLAG_BASE_PATHS
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn tiered_manifest_sets_flag_and_old_readers_reject() {
+        use crate::format::{DataStorageFormat, FragmentManifestRef, Manifest};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.child_manifests = vec![FragmentManifestRef {
+            path: "_manifest_children/v1-0-9-aabbccdd.manifest".to_string(),
+            min_fragment_id: 0,
+            max_fragment_id: 9,
+            row_offset_start: 0,
+            total_rows: 10,
+            fragment_count: 10,
+            byte_size: 850,
+        }];
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_ne!(manifest.reader_feature_flags & FLAG_TIERED_MANIFEST, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_TIERED_MANIFEST, 0);
+        // The current reader accepts it.
+        assert!(can_read_dataset(manifest.reader_feature_flags));
+        // A reader built before the tiered flag treated 64 as its first unknown
+        // bit; its `flags < first_unknown` check rejects the tiered manifest.
+        let old_first_unknown_bit = 64u64;
+        assert!(manifest.reader_feature_flags >= old_first_unknown_bit);
     }
 
     #[test]

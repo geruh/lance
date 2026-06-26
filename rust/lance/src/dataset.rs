@@ -87,6 +87,7 @@ mod schema_evolution;
 pub mod sql;
 pub mod statistics;
 mod take;
+mod tiered;
 pub mod transaction;
 pub mod udtf;
 pub mod updater;
@@ -696,6 +697,15 @@ impl Dataset {
             populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
         }
 
+        let ds_cache = session.metadata_cache.for_dataset(uri);
+        crate::dataset::tiered::materialize_tiered_cached(
+            object_store,
+            &manifest_location.path,
+            &mut manifest,
+            &ds_cache,
+        )
+        .await?;
+
         Ok(manifest)
     }
 
@@ -1010,17 +1020,8 @@ impl Dataset {
         if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
-        let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
-            let reader = if let Some(size) = location.size {
-                self.object_store
-                    .open_with_size(&location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&location.path).await?
-            };
-            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
-        }
+        let manifest =
+            Self::load_manifest(&self.object_store, &location, &self.uri, &self.session).await?;
         let manifest_arc = Arc::new(manifest);
         self.metadata_cache
             .insert_with_key(&manifest_key, manifest_arc.clone())
@@ -3346,6 +3347,14 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
     mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    let is_pure_append = matches!(
+        transaction.map(|t| &t.operation),
+        Some(crate::dataset::transaction::Operation::Append { .. })
+    );
+    tiered::seal_into_tiered(object_store, base_path, manifest, is_pure_append)
+        .await
+        .map_err(CommitError::OtherError)?;
+
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it

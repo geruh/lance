@@ -113,6 +113,9 @@ message Manifest {
   // * 2: row ids are stable and stored as part of the fragment metadata.
   // * 4: use v2 format (deprecated)
   // * 8: table config is present
+  // * 16: dataset uses multiple base paths
+  // * 64: tiered (Bε) manifest layout — fragments are split across child
+  //       manifest files referenced by `child_manifests` plus `buffer_fragments`.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -205,7 +208,59 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Tiered (Bε) manifest layout (discussion #5947).
+  //
+  // When the tiered-manifest reader feature flag (64) is set, the dataset's
+  // fragments are split between immutable child manifest files referenced by
+  // `child_manifests` (the older, sealed runs) and `buffer_fragments` (the
+  // newest appends, held inline in the root). In that case `fragments` is
+  // empty and the materialized fragment list is the concatenation of every
+  // child's fragments, in `child_manifests` order, followed by
+  // `buffer_fragments`.
+  //
+  // When the flag is not set both fields are empty and `fragments` holds the
+  // full list as before.
+
+  // References to immutable child manifest files, oldest first. Each seals a
+  // contiguous run of fragments that is never rewritten on append.
+  repeated FragmentManifestRef child_manifests = 22;
+
+  // The newest fragments, held inline in the root until a run spills into a
+  // child. Empty for the flat layout.
+  repeated DataFragment buffer_fragments = 23;
 } // Manifest
+
+// A pointer from the root manifest to one immutable child manifest file.
+//
+// Carries enough summary (`row_offset_start`, `total_rows`) for the root to
+// route a logical row index to the correct child without loading any child.
+message FragmentManifestRef {
+  // Path to the child manifest file, relative to the dataset root.
+  string path = 1;
+  // First fragment id sealed in the child (inclusive). Matches the width of
+  // `DataFragment.id`.
+  uint64 min_fragment_id = 2;
+  // Last fragment id sealed in the child (inclusive).
+  uint64 max_fragment_id = 3;
+  // Prefix sum: the logical row index of the child's first row.
+  uint64 row_offset_start = 4;
+  // Total live rows across the child's fragments.
+  uint64 total_rows = 5;
+  // Number of fragments sealed in the child.
+  uint32 fragment_count = 6;
+  // Size of the child manifest file in bytes, so a reader can fetch the whole
+  // child in one sized GET with no preceding HEAD. Zero means unknown.
+  uint64 byte_size = 7;
+} // FragmentManifestRef
+
+// The body of an immutable child manifest file: a sorted run of fragments.
+// Stored with the same on-disk tail format (length prefix + magic footer) as
+// the root manifest.
+message FragmentManifest {
+  // Fragments sealed in this child, sorted by fragment id.
+  repeated DataFragment fragments = 1;
+} // FragmentManifest
 
 // external dataset base path
 message BasePath {
