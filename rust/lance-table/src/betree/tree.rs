@@ -320,10 +320,7 @@ impl BeTree {
         self.buffer = buffer;
 
         // Grow: if the root still overflows, split it and lift a new root over the pieces.
-        if self.children.len() as u32 > self.config.max_children_per_node
-            || node::internal_logical_bytes(&self.children, &self.buffer)
-                >= self.config.split_ceiling()
-        {
+        if node::internal_overflows(&self.children, &self.buffer, &self.config) {
             let pieces = node::split_internal(
                 std::mem::take(&mut self.children),
                 std::mem::take(&mut self.buffer),
@@ -501,10 +498,7 @@ impl BeTree {
                 if children.is_empty() {
                     return Ok((vec![], acc));
                 }
-                if children.len() as u32 > self.config.max_children_per_node
-                    || node::internal_logical_bytes(&children, &buffer)
-                        >= self.config.split_ceiling()
-                {
+                if node::internal_overflows(&children, &buffer, &self.config) {
                     let mut refs = Vec::new();
                     for (ch, buf) in node::split_internal(
                         children,
@@ -556,6 +550,7 @@ impl BeTree {
                     bytes + c.byte_size <= self.config.coalesce_ceiling()
                 } else {
                     fan + c.num_children <= self.config.max_children_per_node
+                        && bytes + c.byte_size <= self.config.coalesce_ceiling()
                 };
                 if !fits {
                     break;
@@ -609,9 +604,12 @@ impl BeTree {
     async fn maybe_shrink_root(&mut self) -> Result<()> {
         while self.children.len() == 1 && self.children[0].height > 0 {
             let node = self.store.read_internal(&self.children[0]).await?;
-            self.children = node.children;
             let mut buffer = node.buffer;
-            buffer.append(&mut self.buffer);
+            buffer.extend(self.buffer.iter().cloned());
+            if node::internal_overflows(&node.children, &buffer, &self.config) {
+                break;
+            }
+            self.children = node.children;
             self.buffer = buffer;
         }
         Ok(())

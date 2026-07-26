@@ -119,13 +119,34 @@ pub fn leaf_logical_bytes(fragments: &[Fragment]) -> u64 {
     fragments.iter().map(fragment_logical_bytes).sum()
 }
 
-/// Logical byte size of an internal node = its encoded protobuf size.
+fn varint_bytes(mut value: u64) -> u64 {
+    let mut bytes = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes += 1;
+    }
+    bytes
+}
+
+fn repeated_message_bytes(message: &impl Message) -> u64 {
+    let payload_bytes = message.encoded_len() as u64;
+    1 + varint_bytes(payload_bytes) + payload_bytes
+}
+
+/// Logical byte size of an internal node = its exact encoded protobuf size.
 pub fn internal_logical_bytes(children: &[pb::ChildRef], buffer: &[pb::TaggedAction]) -> u64 {
-    let node = pb::InternalNode {
-        children: children.to_vec(),
-        buffer: buffer.to_vec(),
-    };
-    node.encoded_len() as u64
+    children.iter().map(repeated_message_bytes).sum::<u64>()
+        + buffer.iter().map(repeated_message_bytes).sum::<u64>()
+}
+
+/// Whether an internal node violates its encoded-byte or fanout limit.
+pub fn internal_overflows(
+    children: &[pb::ChildRef],
+    buffer: &[pb::TaggedAction],
+    config: &BeTreeConfig,
+) -> bool {
+    children.len() as u32 > config.max_children_per_node
+        || internal_logical_bytes(children, buffer) >= config.split_ceiling()
 }
 
 /// The target key of a buffered action (the fragment id it mutates).
@@ -248,13 +269,15 @@ fn sum_aggregate_values(values: impl IntoIterator<Item = u64>, name: &str) -> Re
     })
 }
 
-/// Is this child underflowing (a merge candidate)? Leaves by bytes (≤ 0.25 B),
-/// internal nodes by direct-child count (< max_children_per_node/4).
+/// Is this child underflowing (a merge candidate)? Leaves underflow by bytes.
+/// Internal nodes must be sparse by both direct-child count and their exact
+/// encoded size so a hot ε-buffer is never merged as "small."
 pub fn is_underflow(child: &pb::ChildRef, config: &BeTreeConfig) -> bool {
     if child.height == 0 {
         child.byte_size <= config.merge_floor()
     } else {
         child.num_children < (config.max_children_per_node / 4).max(1)
+            && child.byte_size <= config.merge_floor()
     }
 }
 
@@ -381,53 +404,46 @@ pub fn split_leaf_fragments(fragments: Vec<Fragment>, piece_bytes: u64) -> Vec<V
     pieces
 }
 
-/// Split an internal node's (children, buffer) into contiguous pieces of roughly
-/// equal size (≤ `piece_bytes` and ≤ `max_children_per_node` children each). The buffer follows
-/// its child by key range. Used when an internal node overflows.
+/// Split an internal node's (children, buffer) into contiguous pieces targeting
+/// `piece_bytes` and at most `max_children_per_node` children each. The buffer
+/// follows its child by key range. A single indivisible child-plus-message unit
+/// may exceed the byte target, but never the original node's split ceiling.
 pub fn split_internal(
     children: Vec<pb::ChildRef>,
     buffer: Vec<pb::TaggedAction>,
     piece_bytes: u64,
     max_children_per_node: u32,
 ) -> Vec<(Vec<pb::ChildRef>, Vec<pb::TaggedAction>)> {
-    // Enough pieces to satisfy both the byte and max_children_per_node ceilings, then cut evenly.
-    let total: u64 = children.iter().map(|c| c.byte_size).sum();
-    let by_bytes = total.div_ceil(piece_bytes.max(1));
-    let by_fanout = (children.len() as u64).div_ceil(max_children_per_node.max(1) as u64);
-    let num_pieces = by_bytes.max(by_fanout).max(1) as usize;
-    let target_bytes = total / num_pieces as u64;
-    let target_count = children.len().div_ceil(num_pieces);
+    if children.is_empty() {
+        return vec![(children, buffer)];
+    }
+    let action_buckets = partition_buffer_by_child(&children, buffer);
+    let piece_bytes = piece_bytes.max(1);
+    let max_children_per_node = max_children_per_node.max(1) as usize;
+    let mut pieces = Vec::new();
+    let mut piece_children = Vec::new();
+    let mut piece_buffer = Vec::new();
+    let mut encoded_bytes = 0u64;
 
-    let mut groups: Vec<Vec<pb::ChildRef>> = Vec::new();
-    let mut cur: Vec<pb::ChildRef> = Vec::new();
-    let mut cur_bytes = 0u64;
-    for c in children {
-        cur_bytes += c.byte_size;
-        cur.push(c);
-        if (cur_bytes >= target_bytes || cur.len() >= target_count) && groups.len() + 1 < num_pieces
-        {
-            groups.push(std::mem::take(&mut cur));
-            cur_bytes = 0;
+    for (child, actions) in children.into_iter().zip(action_buckets) {
+        let unit_bytes = repeated_message_bytes(&child)
+            + actions.iter().map(repeated_message_bytes).sum::<u64>();
+        let exceeds_piece = !piece_children.is_empty()
+            && (piece_children.len() >= max_children_per_node
+                || encoded_bytes + unit_bytes > piece_bytes);
+        if exceeds_piece {
+            pieces.push((
+                std::mem::take(&mut piece_children),
+                std::mem::take(&mut piece_buffer),
+            ));
+            encoded_bytes = 0;
         }
+        encoded_bytes += unit_bytes;
+        piece_children.push(child);
+        piece_buffer.extend(actions);
     }
-    if !cur.is_empty() {
-        groups.push(cur);
-    }
-
-    // Route each buffered action to the group whose key range contains it.
-    let group_bounds: Vec<u64> = groups.iter().map(|g| g[0].min_key).collect();
-    let mut group_buffers: Vec<Vec<pb::TaggedAction>> = vec![Vec::new(); groups.len()];
-    for tagged in buffer {
-        let key = action_key(&tagged);
-        let gi = match group_bounds.binary_search(&key) {
-            Ok(i) => i,
-            Err(0) => 0,
-            Err(i) => i - 1,
-        };
-        group_buffers[gi].push(tagged);
-    }
-
-    groups.into_iter().zip(group_buffers).collect()
+    pieces.push((piece_children, piece_buffer));
+    pieces
 }
 
 #[cfg(test)]
@@ -443,6 +459,78 @@ mod tests {
             fragment_count_delta: 0,
             total_rows_delta: 0,
         }
+    }
+
+    fn child_ref(index: u64, byte_size: u64, height: u32) -> pb::ChildRef {
+        pb::ChildRef {
+            node_path: format!("node-{index}"),
+            min_key: index * 10,
+            max_key: index * 10 + 9,
+            num_keys: 10,
+            byte_size,
+            height,
+            num_children: u32::from(height > 0),
+            total_rows: 10,
+            object_size: byte_size,
+        }
+    }
+
+    #[test]
+    fn internal_logical_bytes_matches_protobuf_encoding() {
+        let children = vec![child_ref(0, 1_000, 0), child_ref(1, 2_000, 0)];
+        let buffer = vec![
+            tagged(action::remove_fragment(3)),
+            tagged(action::add_data_file(7, &make_backfill_data_file(7, 0))),
+        ];
+        let encoded = pb::InternalNode {
+            children: children.clone(),
+            buffer: buffer.clone(),
+        }
+        .encoded_len() as u64;
+
+        assert_eq!(internal_logical_bytes(&children, &buffer), encoded);
+    }
+
+    #[test]
+    fn split_internal_uses_parent_encoding_not_child_payload_sizes() {
+        let children = (0..8)
+            .map(|index| child_ref(index, 1024 * 1024, 0))
+            .collect();
+        let pieces = split_internal(children, Vec::new(), 1024, 4);
+
+        assert_eq!(pieces.len(), 2);
+        assert!(pieces.iter().all(|(children, _)| children.len() == 4));
+        assert!(
+            pieces
+                .iter()
+                .all(|(children, buffer)| internal_logical_bytes(children, buffer) <= 1024)
+        );
+    }
+
+    #[test]
+    fn hot_internal_node_is_not_an_underflow_merge_candidate() {
+        let config = BeTreeConfig::new(1024, 16);
+        let mut child = child_ref(0, 512, 1);
+        child.num_children = 1;
+        assert!(!is_underflow(&child, &config));
+
+        child.byte_size = 128;
+        assert!(is_underflow(&child, &config));
+    }
+
+    #[test]
+    fn internal_overflow_checks_encoded_bytes_and_fanout() {
+        let config = BeTreeConfig::new(256, 4);
+        let four_children: Vec<_> = (0..4).map(|index| child_ref(index, 1_000_000, 0)).collect();
+        assert!(!internal_overflows(&four_children, &[], &config));
+
+        let five_children: Vec<_> = (0..5).map(|index| child_ref(index, 1, 0)).collect();
+        assert!(internal_overflows(&five_children, &[], &config));
+
+        let hot_buffer: Vec<_> = (0..20)
+            .map(|fragment_id| tagged(action::remove_fragment(fragment_id)))
+            .collect();
+        assert!(internal_overflows(&four_children, &hot_buffer, &config));
     }
 
     #[test]
