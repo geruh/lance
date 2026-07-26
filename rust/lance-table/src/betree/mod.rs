@@ -39,11 +39,14 @@ mod tests {
     use crate::betree::support::{make_backfill_data_file, make_fragment};
     use crate::format::Fragment;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::TryStreamExt;
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::tracking_store::IOTracker;
+    use object_store::path::Path;
     use std::sync::Arc;
 
     fn test_env() -> (Arc<ObjectStore>, Arc<ScanScheduler>, Arc<LanceCache>) {
@@ -60,6 +63,55 @@ mod tests {
             ArrowField::new("name", DataType::Utf8, false),
         ]))
         .unwrap()
+    }
+
+    async fn tracked_test_env(
+        io: &IOTracker,
+    ) -> (Arc<ObjectStore>, Path, Arc<ScanScheduler>, Arc<LanceCache>) {
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(io.clone())),
+            ..Default::default()
+        };
+        let (object_store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory://",
+            &params,
+        )
+        .await
+        .unwrap();
+        let scheduler =
+            ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
+        let cache = Arc::new(LanceCache::with_capacity(0));
+        (object_store, base, scheduler, cache)
+    }
+
+    async fn tracked_lazy_tree(
+        io: &IOTracker,
+    ) -> (
+        BeTree,
+        BootstrapStats,
+        Arc<ObjectStore>,
+        Path,
+        Arc<ScanScheduler>,
+        Arc<LanceCache>,
+    ) {
+        const NUM_FRAGMENTS: u64 = 400;
+        let (object_store, base, scheduler, cache) = tracked_test_env(io).await;
+        let fragments = (0..NUM_FRAGMENTS).map(make_fragment).collect();
+        let (tree, stats) = BeTree::bootstrap(
+            object_store.clone(),
+            base.clone(),
+            scheduler.clone(),
+            cache.clone(),
+            BeTreeConfig::new(4 * 1024, 4),
+            fragments,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(stats.height >= 2, "lazy tests require a multi-level tree");
+        io.incremental_stats();
+        (tree, stats, object_store, base, scheduler, cache)
     }
 
     /// A multi-column backfill over a multi-level Bε-tree grows leaves past max_node_bytes, so
@@ -255,6 +307,133 @@ mod tests {
         assert!(
             remaining.iter().all(|f| f.id >= remove),
             "the deleted prefix must not resurrect"
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_open_does_not_read_leaves() {
+        let io = IOTracker::default();
+        let (tree, _, object_store, base, scheduler, cache) = tracked_lazy_tree(&io).await;
+        let expected_height = tree.height();
+        let expected_root_children = tree.root_child_count();
+
+        let opened = BeTree::open(object_store, base, scheduler, cache)
+            .await
+            .unwrap();
+        let open_io = io.incremental_stats();
+
+        assert_eq!(open_io.read_iops, 2, "open should read hint and root only");
+        assert_eq!(opened.height(), expected_height);
+        assert_eq!(opened.root_child_count(), expected_root_children);
+        assert_eq!(opened.root_buffer_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_matches_materialize() {
+        let io = IOTracker::default();
+        let (mut tree, _, object_store, base, scheduler, cache) = tracked_lazy_tree(&io).await;
+        let actions = (0..100)
+            .map(|frag_id| action::add_data_file(frag_id, &make_backfill_data_file(frag_id, 0)))
+            .collect();
+        tree.commit(actions).await.unwrap();
+        let expected: std::collections::BTreeMap<_, _> = tree
+            .materialize()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|fragment| (fragment.id, fragment))
+            .collect();
+        let opened = BeTree::open(object_store, base, scheduler, cache)
+            .await
+            .unwrap();
+
+        for index in 0..40 {
+            let frag_id = (index * 37) % 400;
+            assert_eq!(
+                opened.resolve_fragment(frag_id).await.unwrap(),
+                expected.get(&frag_id).cloned(),
+                "resolved fragment differs for frag_id={frag_id}"
+            );
+        }
+        assert_eq!(opened.resolve_fragment(10_000).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_get_bound() {
+        let io = IOTracker::default();
+        let (_, _, object_store, base, scheduler, cache) = tracked_lazy_tree(&io).await;
+        let opened = BeTree::open(object_store, base, scheduler, cache)
+            .await
+            .unwrap();
+        io.incremental_stats();
+
+        assert!(opened.resolve_fragment(211).await.unwrap().is_some());
+        let resolve_io = io.incremental_stats();
+        assert!(
+            resolve_io.read_iops <= u64::from(opened.height()) + 2,
+            "resolve used {} reads at height {}",
+            resolve_io.read_iops,
+            opened.height()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_equals_materialize() {
+        let io = IOTracker::default();
+        let (mut tree, _, object_store, base, scheduler, cache) = tracked_lazy_tree(&io).await;
+        let actions = (0..100)
+            .map(|frag_id| action::add_data_file(frag_id, &make_backfill_data_file(frag_id, 0)))
+            .collect();
+        tree.commit(actions).await.unwrap();
+        let expected = tree.materialize().await.unwrap();
+        let opened = BeTree::open(object_store, base, scheduler, cache)
+            .await
+            .unwrap();
+
+        let actual = opened
+            .iter_fragments()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(actual.windows(2).all(|pair| pair[0].id < pair[1].id));
+    }
+
+    #[tokio::test]
+    async fn counts_without_io() {
+        let io = IOTracker::default();
+        let (mut tree, _, object_store, base, scheduler, cache) = tracked_lazy_tree(&io).await;
+        let mut added = make_fragment(400);
+        added.physical_rows = Some(7);
+        tree.commit(vec![
+            action::remove_fragment(0),
+            action::add_fragment(&added),
+        ])
+        .await
+        .unwrap();
+        io.incremental_stats();
+
+        let opened = BeTree::open(object_store, base, scheduler, cache)
+            .await
+            .unwrap();
+        io.incremental_stats();
+        assert_eq!(opened.count_fragments(), 400);
+        assert_eq!(opened.count_rows(), 406);
+        assert_eq!(
+            io.incremental_stats().read_iops,
+            0,
+            "aggregate access should not read child nodes"
+        );
+
+        let fragments = opened.materialize().await.unwrap();
+        assert_eq!(opened.count_fragments(), fragments.len() as u64);
+        assert_eq!(
+            opened.count_rows(),
+            fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows.unwrap_or(0) as u64)
+                .sum::<u64>()
         );
     }
 }

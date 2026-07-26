@@ -11,9 +11,11 @@
 //! node on the root→leaf path is rewritten (copy-on-write) and the root repoint
 //! is the commit.
 
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use futures::Stream;
 use futures::future::BoxFuture;
 
 use crate::betree::node::{self, BeTreeConfig, InternalNode};
@@ -86,6 +88,8 @@ pub struct BeTree {
     buffer: Vec<pb::TaggedAction>,
     next_msn: u64,
     schema_pb: Vec<u8>,
+    total_fragments: u64,
+    total_rows: u64,
 }
 
 impl BeTree {
@@ -148,8 +152,17 @@ impl BeTree {
         let mut layer: Vec<pb::ChildRef> = Vec::new();
         let mut buf: Vec<Fragment> = Vec::new();
         let mut buf_bytes = 0u64;
+        let mut total_rows = 0u64;
         for id in 0..num_fragments {
             let f = gen_fn(id);
+            total_rows = total_rows
+                .checked_add(f.physical_rows.unwrap_or(0) as u64)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Bε-tree total_rows overflow while bootstrapping fragment id={}",
+                        f.id
+                    ))
+                })?;
             buf_bytes += node::fragment_logical_bytes(&f);
             buf.push(f);
             if buf_bytes >= target {
@@ -187,6 +200,8 @@ impl BeTree {
             buffer: Vec::new(),
             next_msn: 1,
             schema_pb,
+            total_fragments: num_fragments,
+            total_rows,
         };
         io += tree.write_root().await?;
         Ok((
@@ -203,6 +218,31 @@ impl BeTree {
         self.children.iter().map(|c| c.height).max().unwrap_or(0) + 1
     }
 
+    /// Number of logical fragments, including buffered adds and removes.
+    ///
+    /// This reads root metadata only and performs no object-store IO.
+    pub fn count_fragments(&self) -> u64 {
+        self.total_fragments
+    }
+
+    /// Sum of physical rows across logical fragments.
+    ///
+    /// Fragments whose physical row count is unknown contribute zero. This
+    /// reads root metadata only and performs no object-store IO.
+    pub fn count_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Number of actions currently buffered directly in the in-memory root.
+    pub fn root_buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Number of direct child references currently held by the in-memory root.
+    pub fn root_child_count(&self) -> usize {
+        self.children.len()
+    }
+
     fn to_pb_root(&self) -> pb::BeTreeRoot {
         pb::BeTreeRoot {
             version: self.version,
@@ -212,6 +252,8 @@ impl BeTree {
             schema_pb: self.schema_pb.clone(),
             max_node_bytes: self.config.max_node_bytes,
             max_children_per_node: self.config.max_children_per_node,
+            total_fragments: self.total_fragments,
+            total_rows: self.total_rows,
         }
     }
 
@@ -222,13 +264,49 @@ impl BeTree {
     /// Inject actions into the root buffer (msn-tagged), flush/split/rebalance,
     /// and copy-on-write the touched path + a new root.
     pub async fn commit(&mut self, actions: Vec<pb::FragmentAction>) -> Result<CommitStats> {
-        for action in actions {
+        let action_count = u64::try_from(actions.len()).map_err(|_| {
+            Error::invalid_input(format!(
+                "Bε-tree action count does not fit u64: {}",
+                actions.len()
+            ))
+        })?;
+        let next_msn = self.next_msn.checked_add(action_count).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree msn overflow: next_msn={}, action_count={action_count}",
+                self.next_msn
+            ))
+        })?;
+        let aggregate_deltas = self.action_aggregate_deltas(&actions).await?;
+        let fragment_count_delta = sum_aggregate_deltas(
+            aggregate_deltas
+                .iter()
+                .map(|(fragment_delta, _)| *fragment_delta),
+            "fragment_count_delta",
+        )?;
+        let total_rows_delta = sum_aggregate_deltas(
+            aggregate_deltas.iter().map(|(_, row_delta)| *row_delta),
+            "total_rows_delta",
+        )?;
+        let total_fragments = apply_aggregate_delta(
+            self.total_fragments,
+            fragment_count_delta,
+            "total_fragments",
+        )?;
+        let total_rows = apply_aggregate_delta(self.total_rows, total_rows_delta, "total_rows")?;
+
+        for (offset, (action, (fragment_count_delta, total_rows_delta))) in
+            actions.into_iter().zip(aggregate_deltas).enumerate()
+        {
             self.buffer.push(pb::TaggedAction {
-                msn: self.next_msn,
+                msn: self.next_msn + offset as u64,
                 action: Some(action),
+                fragment_count_delta,
+                total_rows_delta,
             });
-            self.next_msn += 1;
         }
+        self.next_msn = next_msn;
+        self.total_fragments = total_fragments;
+        self.total_rows = total_rows;
         self.version += 1;
 
         let mut acc = WriteAcc::default();
@@ -280,6 +358,44 @@ impl BeTree {
             height: self.height(),
             max_flush_depth: acc.max_flush_depth,
         })
+    }
+
+    async fn action_aggregate_deltas(
+        &self,
+        actions: &[pb::FragmentAction],
+    ) -> Result<Vec<(i64, i64)>> {
+        let mut states: HashMap<u64, Option<Fragment>> = HashMap::new();
+        let mut deltas = Vec::with_capacity(actions.len());
+
+        for fragment_action in actions {
+            let Some(action) = fragment_action.action.as_ref() else {
+                deltas.push((0, 0));
+                continue;
+            };
+            let (frag_id, new_fragment) = match action {
+                pb::fragment_action::Action::AddFragment(fragment) => {
+                    (fragment.id, Some(Fragment::try_from(fragment.clone())?))
+                }
+                pb::fragment_action::Action::RemoveFragment(frag_id) => (*frag_id, None),
+                _ => {
+                    deltas.push((0, 0));
+                    continue;
+                }
+            };
+
+            if let Entry::Vacant(entry) = states.entry(frag_id) {
+                entry.insert(self.resolve_fragment(frag_id).await?);
+            }
+            let previous = states.get(&frag_id).and_then(Option::as_ref);
+            let previous_count = i64::from(previous.is_some());
+            let new_count = i64::from(new_fragment.is_some());
+            let previous_rows = fragment_physical_rows(previous)?;
+            let new_rows = fragment_physical_rows(new_fragment.as_ref())?;
+            deltas.push((new_count - previous_count, new_rows - previous_rows));
+            states.insert(frag_id, new_fragment);
+        }
+
+        Ok(deltas)
     }
 
     /// Flush an internal node's buffer to its children while it overflows,
@@ -511,6 +627,113 @@ impl BeTree {
         Ok(map.into_values().collect())
     }
 
+    /// Resolve one fragment by loading only the root-to-leaf path.
+    ///
+    /// Buffered actions from every node on the path are applied with the same
+    /// msn ordering as [`Self::materialize`].
+    pub async fn resolve_fragment(&self, frag_id: u64) -> Result<Option<Fragment>> {
+        let mut actions: Vec<pb::TaggedAction> = self
+            .buffer
+            .iter()
+            .filter(|tagged| node::action_key(tagged) == frag_id)
+            .cloned()
+            .collect();
+        let mut children = self.children.clone();
+        let mut fragment = None;
+
+        while !children.is_empty() {
+            let child = children[node::child_index_for(&children, frag_id)].clone();
+            if child.height == 0 {
+                fragment = self
+                    .store
+                    .read_leaf(&child)
+                    .await?
+                    .into_iter()
+                    .find(|candidate| candidate.id == frag_id);
+                break;
+            }
+
+            let internal = self.store.read_internal(&child).await?;
+            actions.extend(
+                internal
+                    .buffer
+                    .into_iter()
+                    .filter(|tagged| node::action_key(tagged) == frag_id),
+            );
+            children = internal.children;
+        }
+
+        let mut fragments = BTreeMap::new();
+        if let Some(fragment) = fragment {
+            fragments.insert(fragment.id, fragment);
+        }
+        node::apply_actions(&mut fragments, actions)?;
+        Ok(fragments.remove(&frag_id))
+    }
+
+    /// Stream fragments in id order while retaining at most one materialized
+    /// leaf plus the buffered actions for not-yet-visited subtrees.
+    pub fn iter_fragments(&self) -> impl Stream<Item = Result<Fragment>> + '_ {
+        let mut stack = Vec::new();
+        let mut ready = VecDeque::new();
+        let mut initial_error = None;
+        if self.children.is_empty() {
+            let mut fragments = BTreeMap::new();
+            match node::apply_actions(&mut fragments, self.buffer.clone()) {
+                Ok(()) => ready.extend(fragments.into_values()),
+                Err(error) => initial_error = Some(error),
+            }
+        } else {
+            let action_buckets =
+                node::partition_buffer_by_child(&self.children, self.buffer.clone());
+            for (child, actions) in self.children.iter().cloned().zip(action_buckets).rev() {
+                stack.push((child, actions));
+            }
+        }
+
+        futures::stream::try_unfold(
+            (stack, ready, initial_error),
+            move |(mut stack, mut ready, initial_error)| async move {
+                if let Some(error) = initial_error {
+                    return Err(error);
+                }
+                loop {
+                    if let Some(fragment) = ready.pop_front() {
+                        return Ok(Some((fragment, (stack, ready, None))));
+                    }
+                    let Some((child, mut actions)) = stack.pop() else {
+                        return Ok(None);
+                    };
+                    if child.height == 0 {
+                        let fragments = self.store.read_leaf(&child).await?;
+                        let mut fragments: BTreeMap<u64, Fragment> = fragments
+                            .into_iter()
+                            .map(|fragment| (fragment.id, fragment))
+                            .collect();
+                        node::apply_actions(&mut fragments, actions)?;
+                        ready.extend(fragments.into_values());
+                        continue;
+                    }
+
+                    let internal = self.store.read_internal(&child).await?;
+                    actions.extend(internal.buffer);
+                    if internal.children.is_empty() {
+                        let mut fragments = BTreeMap::new();
+                        node::apply_actions(&mut fragments, actions)?;
+                        ready.extend(fragments.into_values());
+                        continue;
+                    }
+                    let action_buckets =
+                        node::partition_buffer_by_child(&internal.children, actions);
+                    for (child, actions) in internal.children.into_iter().zip(action_buckets).rev()
+                    {
+                        stack.push((child, actions));
+                    }
+                }
+            },
+        )
+    }
+
     /// Walk the tree and collect `(height, logical_bytes)` for every internal node
     /// (root included). Used to measure how full internal ε-buffers are — a node
     /// near `B` is holding a big buffer, a node near its ref-only size is "cold".
@@ -585,17 +808,17 @@ impl BeTree {
         })
     }
 
-    /// Cold open from storage: read the latest root and materialize.
-    pub async fn cold_open(
+    /// Open the latest tree by loading only the version hint and root object.
+    pub async fn open(
         object_store: Arc<ObjectStore>,
         base: Path,
         scheduler: Arc<ScanScheduler>,
         cache: Arc<LanceCache>,
-    ) -> Result<Vec<Fragment>> {
+    ) -> Result<Self> {
         let store = NodeStore::new(object_store, base, scheduler, cache);
         let version = store.read_latest_version().await?;
         let root = store.read_root(version).await?;
-        let tree = Self {
+        Ok(Self {
             store,
             config: BeTreeConfig::new(root.max_node_bytes, root.max_children_per_node),
             version: root.version,
@@ -603,7 +826,59 @@ impl BeTree {
             buffer: root.buffer,
             next_msn: root.next_msn,
             schema_pb: root.schema_pb,
-        };
-        tree.materialize().await
+            total_fragments: root.total_fragments,
+            total_rows: root.total_rows,
+        })
     }
+
+    /// Open the latest tree and fully materialize it for compatibility with the
+    /// original benchmark API.
+    pub async fn cold_open(
+        object_store: Arc<ObjectStore>,
+        base: Path,
+        scheduler: Arc<ScanScheduler>,
+        cache: Arc<LanceCache>,
+    ) -> Result<Vec<Fragment>> {
+        Self::open(object_store, base, scheduler, cache)
+            .await?
+            .materialize()
+            .await
+    }
+}
+
+fn fragment_physical_rows(fragment: Option<&Fragment>) -> Result<i64> {
+    let rows = fragment
+        .and_then(|fragment| fragment.physical_rows)
+        .unwrap_or(0);
+    i64::try_from(rows).map_err(|_| {
+        Error::invalid_input(format!(
+            "fragment physical_rows does not fit aggregate delta: physical_rows={rows}"
+        ))
+    })
+}
+
+fn apply_aggregate_delta(base: u64, delta: i64, name: &str) -> Result<u64> {
+    if delta >= 0 {
+        base.checked_add(delta as u64).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree {name} aggregate overflow: base={base}, delta={delta}"
+            ))
+        })
+    } else {
+        base.checked_sub(delta.unsigned_abs()).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree {name} aggregate underflow: base={base}, delta={delta}"
+            ))
+        })
+    }
+}
+
+fn sum_aggregate_deltas(deltas: impl IntoIterator<Item = i64>, name: &str) -> Result<i64> {
+    deltas.into_iter().try_fold(0i64, |sum, delta| {
+        sum.checked_add(delta).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree {name} overflow while summing: sum={sum}, delta={delta}"
+            ))
+        })
+    })
 }

@@ -28,6 +28,12 @@ message ChildRef {
   uint64 byte_size = 5;    // logical bytes of the child (leaf split/merge metric)
   uint32 height = 6;       // 0 = leaf, >0 = internal
   uint32 num_children = 7;  // direct children of the child (0 for a leaf); internal split/merge metric
+  // Sum of physical_rows for fragments in the subtree after applying all
+  // buffered actions stored in that subtree. Unknown physical row counts add 0.
+  uint64 total_rows = 8;
+  // Exact stored object size. Readers use this to fetch a leaf in one GET and
+  // decode subsequent ranges from memory.
+  uint64 object_size = 9;
 }
 
 // AddDataFile is the backfill / add-column action: attach a new DataFile to an
@@ -47,6 +53,11 @@ message AddDeletionFile {
   DeletionFile deletion_file = 2;
 }
 
+// Remove the deletion file from an existing fragment.
+message ClearDeletionFile {
+  uint64 frag_id = 1;
+}
+
 // A single ε-buffer message, keyed by the fragment id it targets.
 message FragmentAction {
   oneof action {
@@ -55,6 +66,7 @@ message FragmentAction {
     AddDataFile add_data_file = 3;
     RemoveDataFile remove_data_file = 4;
     AddDeletionFile add_deletion_file = 5;
+    ClearDeletionFile clear_deletion_file = 6;
   }
 }
 
@@ -63,6 +75,11 @@ message FragmentAction {
 message TaggedAction {
   uint64 msn = 1;
   FragmentAction action = 2;
+  // Changes contributed by this action while it remains buffered. Once the
+  // action reaches a leaf, the rewritten leaf ref incorporates the change and
+  // the action is no longer present, so aggregates are never double-counted.
+  sint64 fragment_count_delta = 3;
+  sint64 total_rows_delta = 4;
 }
 
 // An internal node: child pivots + this node's ε-buffer. Stored as a standalone
@@ -84,4 +101,8 @@ message BeTreeRoot {
   // Config echoed so readers can interpret the tree (node-size + branching-factor limits).
   uint64 max_node_bytes = 6;
   uint32 max_children_per_node = 7;
+  // Exact logical totals after applying all buffered actions in the tree.
+  uint64 total_fragments = 8;
+  // Sum of Fragment.physical_rows, treating an unknown count as zero.
+  uint64 total_rows = 9;
 }

@@ -147,8 +147,19 @@ pub fn child_index_for(children: &[pb::ChildRef], key: u64) -> usize {
 }
 
 /// Build a `ChildRef` for a leaf that has just been written.
-pub fn leaf_ref(node_path: String, fragments: &[Fragment], byte_size: u64) -> pb::ChildRef {
-    pb::ChildRef {
+pub fn leaf_ref(
+    node_path: String,
+    fragments: &[Fragment],
+    byte_size: u64,
+    object_size: u64,
+) -> Result<pb::ChildRef> {
+    let total_rows = sum_aggregate_values(
+        fragments
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0) as u64),
+        "total_rows",
+    )?;
+    Ok(pb::ChildRef {
         node_path,
         min_key: fragments.first().map(|f| f.id).unwrap_or(0),
         max_key: fragments.last().map(|f| f.id).unwrap_or(0),
@@ -156,14 +167,39 @@ pub fn leaf_ref(node_path: String, fragments: &[Fragment], byte_size: u64) -> pb
         byte_size,
         height: 0,
         num_children: 0,
-    }
+        total_rows,
+        object_size,
+    })
 }
 
 /// Build a `ChildRef` for an internal node that has just been written.
-pub fn internal_ref(node_path: String, children: &[pb::ChildRef], byte_size: u64) -> pb::ChildRef {
-    let num_keys = children.iter().map(|c| c.num_keys).sum();
+pub fn internal_ref(
+    node_path: String,
+    children: &[pb::ChildRef],
+    buffer: &[pb::TaggedAction],
+    byte_size: u64,
+    object_size: u64,
+) -> Result<pb::ChildRef> {
+    let fragment_count_delta = sum_aggregate_deltas(
+        buffer.iter().map(|action| action.fragment_count_delta),
+        "fragment_count_delta",
+    )?;
+    let total_rows_delta = sum_aggregate_deltas(
+        buffer.iter().map(|action| action.total_rows_delta),
+        "total_rows_delta",
+    )?;
+    let num_keys = apply_aggregate_delta(
+        sum_aggregate_values(children.iter().map(|child| child.num_keys), "num_keys")?,
+        fragment_count_delta,
+        "num_keys",
+    )?;
+    let total_rows = apply_aggregate_delta(
+        sum_aggregate_values(children.iter().map(|child| child.total_rows), "total_rows")?,
+        total_rows_delta,
+        "total_rows",
+    )?;
     let height = children.iter().map(|c| c.height).max().unwrap_or(0) + 1;
-    pb::ChildRef {
+    Ok(pb::ChildRef {
         node_path,
         min_key: children.first().map(|c| c.min_key).unwrap_or(0),
         max_key: children.last().map(|c| c.max_key).unwrap_or(0),
@@ -171,7 +207,45 @@ pub fn internal_ref(node_path: String, children: &[pb::ChildRef], byte_size: u64
         byte_size,
         height,
         num_children: children.len() as u32,
+        total_rows,
+        object_size,
+    })
+}
+
+fn apply_aggregate_delta(base: u64, delta: i64, name: &str) -> Result<u64> {
+    if delta >= 0 {
+        base.checked_add(delta as u64).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree {name} aggregate overflow: base={base}, delta={delta}"
+            ))
+        })
+    } else {
+        base.checked_sub(delta.unsigned_abs()).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree {name} aggregate underflow: base={base}, delta={delta}"
+            ))
+        })
     }
+}
+
+fn sum_aggregate_deltas(deltas: impl IntoIterator<Item = i64>, name: &str) -> Result<i64> {
+    deltas.into_iter().try_fold(0i64, |sum, delta| {
+        sum.checked_add(delta).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree {name} overflow while summing: sum={sum}, delta={delta}"
+            ))
+        })
+    })
+}
+
+fn sum_aggregate_values(values: impl IntoIterator<Item = u64>, name: &str) -> Result<u64> {
+    values.into_iter().try_fold(0u64, |sum, value| {
+        sum.checked_add(value).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Bε-tree {name} overflow while summing: sum={sum}, value={value}"
+            ))
+        })
+    })
 }
 
 /// Is this child underflowing (a merge candidate)? Leaves by bytes (≤ 0.25 B),
@@ -216,19 +290,46 @@ fn apply_one(frags: &mut BTreeMap<u64, Fragment>, action: pb::FragmentAction) ->
                 a.file
                     .ok_or_else(|| Error::invalid_input("AddDataFile action missing file"))?,
             )?;
-            if let Some(fragment) = frags.get_mut(&a.frag_id) {
-                fragment.files.push(file);
-            }
+            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "AddDataFile action targets missing frag_id={}",
+                    a.frag_id
+                ))
+            })?;
+            fragment.files.push(file);
         }
         Action::RemoveDataFile(a) => {
-            if let Some(fragment) = frags.get_mut(&a.frag_id) {
-                fragment.files.retain(|f| f.path != a.path);
-            }
+            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RemoveDataFile action targets missing frag_id={}",
+                    a.frag_id
+                ))
+            })?;
+            fragment.files.retain(|f| f.path != a.path);
         }
         Action::AddDeletionFile(a) => {
-            if let (Some(df), Some(fragment)) = (a.deletion_file, frags.get_mut(&a.frag_id)) {
-                fragment.deletion_file = Some(crate::format::DeletionFile::try_from(df)?);
-            }
+            let deletion_file = a.deletion_file.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "AddDeletionFile action for frag_id={} is missing deletion_file",
+                    a.frag_id
+                ))
+            })?;
+            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "AddDeletionFile action targets missing frag_id={}",
+                    a.frag_id
+                ))
+            })?;
+            fragment.deletion_file = Some(crate::format::DeletionFile::try_from(deletion_file)?);
+        }
+        Action::ClearDeletionFile(a) => {
+            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "ClearDeletionFile action targets missing frag_id={}",
+                    a.frag_id
+                ))
+            })?;
+            fragment.deletion_file = None;
         }
     }
     Ok(())
@@ -327,4 +428,75 @@ pub fn split_internal(
     }
 
     groups.into_iter().zip(group_buffers).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::betree::support::{make_backfill_data_file, make_fragment};
+    use crate::format::{DeletionFile, DeletionFileType};
+
+    fn tagged(action: pb::FragmentAction) -> pb::TaggedAction {
+        pb::TaggedAction {
+            msn: 1,
+            action: Some(action),
+            fragment_count_delta: 0,
+            total_rows_delta: 0,
+        }
+    }
+
+    #[test]
+    fn clear_deletion_file_action() {
+        let mut fragment = make_fragment(7);
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 3,
+            id: 11,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        });
+        let mut fragments = BTreeMap::from([(fragment.id, fragment)]);
+
+        apply_actions(&mut fragments, vec![tagged(action::clear_deletion_file(7))]).unwrap();
+
+        assert_eq!(fragments[&7].deletion_file, None);
+    }
+
+    #[test]
+    fn mutation_actions_reject_missing_fragment() {
+        let deletion_file = pb::DeletionFile {
+            read_version: 3,
+            id: 11,
+            file_type: pb::deletion_file::DeletionFileType::Bitmap.into(),
+            num_deleted_rows: 1,
+            base_id: None,
+        };
+        let cases = [
+            (
+                "AddDataFile",
+                action::add_data_file(7, &make_backfill_data_file(7, 0)),
+            ),
+            (
+                "RemoveDataFile",
+                action::remove_data_file(7, "missing.lance"),
+            ),
+            (
+                "AddDeletionFile",
+                pb::FragmentAction {
+                    action: Some(Action::AddDeletionFile(pb::AddDeletionFile {
+                        frag_id: 7,
+                        deletion_file: Some(deletion_file),
+                    })),
+                },
+            ),
+        ];
+
+        for (action_name, action) in cases {
+            let error = apply_actions(&mut BTreeMap::new(), vec![tagged(action)]).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains(action_name), "{message}");
+            assert!(message.contains("frag_id=7"), "{message}");
+        }
+    }
 }

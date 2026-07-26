@@ -23,6 +23,9 @@
 //! - `FANOUT`               branching factor max_children_per_node (split above, merge below a quarter of it). Default 16.
 //! - `BETREE_COMMITS`       Bε-tree commits to run per config (M). Default 3000.
 //! - `FLAT_SAMPLE_COMMITS`  flat commits to sample. Default 20.
+//! - `LAZY_BENCH`           "true" runs lazy open/resolve/stream scenarios instead.
+//! - `LAZY_RESOLVES`        Point resolutions per lazy scenario. Default 100.
+//! - `LAZY_BACKFILL_COMMITS` F=10 commits before the L4 scenario. Default 10.
 //! - `S3_EXPRESS`           "true" for S3 Express directory buckets.
 //! - `AWS_REGION`           required for S3.
 
@@ -35,6 +38,7 @@ use std::time::Instant;
 
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use criterion::{Criterion, criterion_group, criterion_main};
+use futures::TryStreamExt;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -68,6 +72,12 @@ fn env_usize(key: &str, default: usize) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_bool(key: &str) -> bool {
+    env::var(key)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 fn env_sweep_u64(key: &str, default: &str) -> Vec<u64> {
@@ -570,17 +580,209 @@ async fn run_deep_flush(
     println!();
 }
 
+struct LazyRunResult {
+    scenario: &'static str,
+    height: u32,
+    open_gets: u64,
+    open_ms: f64,
+    resolve_gets_avg: f64,
+    resolve_ms_avg: f64,
+    materialize_gets: u64,
+    materialize_ms: f64,
+    stream_gets: u64,
+    stream_ms: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn measure_lazy_scenario(
+    scenario: &'static str,
+    io: &IOTracker,
+    object_store: Arc<ObjectStore>,
+    base: Path,
+    scheduler: Arc<ScanScheduler>,
+    cache: Arc<LanceCache>,
+    n: u64,
+    num_resolves: u64,
+) -> LazyRunResult {
+    io.incremental_stats();
+    let start = Instant::now();
+    let tree = BeTree::open(
+        object_store.clone(),
+        base.clone(),
+        scheduler.clone(),
+        cache.clone(),
+    )
+    .await
+    .expect("lazy open");
+    let open_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let open_gets = io.incremental_stats().read_iops;
+    assert_eq!(tree.count_fragments(), n);
+
+    let start = Instant::now();
+    let materialized = tree.materialize().await.expect("lazy materialize oracle");
+    let materialize_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let materialize_gets = io.incremental_stats().read_iops;
+    assert_eq!(materialized.len() as u64, n);
+
+    let expected: BTreeMap<_, _> = materialized
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
+    let mut resolve_ms = 0.0;
+    let mut resolve_gets = 0u64;
+    for index in 0..num_resolves {
+        let frag_id = (index * 104_729 + 17) % n;
+        let start = Instant::now();
+        let resolved = tree
+            .resolve_fragment(frag_id)
+            .await
+            .expect("lazy point resolve");
+        resolve_ms += start.elapsed().as_secs_f64() * 1000.0;
+        resolve_gets += io.incremental_stats().read_iops;
+        assert_eq!(resolved.as_ref(), expected.get(&frag_id).copied());
+    }
+
+    let start = Instant::now();
+    let streamed = tree
+        .iter_fragments()
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("lazy stream");
+    let stream_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let stream_gets = io.incremental_stats().read_iops;
+    assert_eq!(streamed, materialized);
+
+    LazyRunResult {
+        scenario,
+        height: tree.height(),
+        open_gets,
+        open_ms,
+        resolve_gets_avg: resolve_gets as f64 / num_resolves.max(1) as f64,
+        resolve_ms_avg: resolve_ms / num_resolves.max(1) as f64,
+        materialize_gets,
+        materialize_ms,
+        stream_gets,
+        stream_ms,
+    }
+}
+
+fn print_lazy_result(result: &LazyRunResult) {
+    println!(
+        "  {:<18} h={} | open {:>3} GET {:>8.2}ms | resolve avg {:>5.2} GET {:>7.2}ms | \
+         materialize {:>5} GET {:>9.2}ms | stream {:>5} GET {:>9.2}ms",
+        result.scenario,
+        result.height,
+        result.open_gets,
+        result.open_ms,
+        result.resolve_gets_avg,
+        result.resolve_ms_avg,
+        result.materialize_gets,
+        result.materialize_ms,
+        result.stream_gets,
+        result.stream_ms,
+    );
+    println!(
+        "LAZY_RESULT|{}|{}|{}|{:.3}|{:.3}|{:.3}|{}|{:.3}|{}|{:.3}",
+        result.scenario,
+        result.height,
+        result.open_gets,
+        result.open_ms,
+        result.resolve_gets_avg,
+        result.resolve_ms_avg,
+        result.materialize_gets,
+        result.materialize_ms,
+        result.stream_gets,
+        result.stream_ms,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_lazy_bench(
+    uri: &str,
+    n: u64,
+    node_bytes: u64,
+    max_children_per_node: u32,
+    num_resolves: u64,
+    backfill_commits: u64,
+) {
+    let io = IOTracker::default();
+    let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
+    let config = BeTreeConfig::new(node_bytes, max_children_per_node);
+
+    let start = Instant::now();
+    let (mut tree, bootstrap) = BeTree::bootstrap_generate(
+        object_store.clone(),
+        base.clone(),
+        scheduler.clone(),
+        cache.clone(),
+        config,
+        n,
+        make_fragment,
+        Vec::new(),
+    )
+    .await
+    .expect("lazy benchmark bootstrap");
+    let bootstrap_ms = start.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        bootstrap.height >= 2,
+        "lazy benchmark requires height >= 2; got height {} (lower NODE_SIZE_MB or FANOUT)",
+        bootstrap.height
+    );
+    println!(
+        "bootstrap: N={n}, leaves={}, height={}, write={:.2} MiB, {:.2}ms",
+        bootstrap.num_leaves,
+        bootstrap.height,
+        bootstrap.io_write_bytes as f64 / MIB as f64,
+        bootstrap_ms,
+    );
+
+    let initial = measure_lazy_scenario(
+        "L1-L3 bootstrap",
+        &io,
+        object_store.clone(),
+        base.clone(),
+        scheduler.clone(),
+        cache.clone(),
+        n,
+        num_resolves,
+    )
+    .await;
+    print_lazy_result(&initial);
+
+    const FRAGMENTS_PER_COMMIT: u64 = 10;
+    for commit in 0..backfill_commits {
+        let actions = commit_window(commit, FRAGMENTS_PER_COMMIT, n)
+            .map(|frag_id| action::add_data_file(frag_id, &make_backfill_data_file(frag_id, 0)))
+            .collect();
+        tree.commit(actions).await.expect("lazy benchmark backfill");
+    }
+
+    let after_backfill = measure_lazy_scenario(
+        "L4 after F=10",
+        &io,
+        object_store,
+        base,
+        scheduler,
+        cache,
+        n,
+        num_resolves,
+    )
+    .await;
+    print_lazy_result(&after_backfill);
+}
+
 fn bench_betree_backfill(c: &mut Criterion) {
     let runtime = Runtime::new().expect("tokio runtime");
 
+    let is_lazy_bench = env_bool("LAZY_BENCH");
     let base_uri = env::var("BASE_URI").unwrap_or_else(|_| {
         let dir = std::env::temp_dir().join(format!("betree_bench_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.to_string_lossy().to_string()
     });
-    let n = env_u64("NUM_FRAGMENTS", 5000);
+    let n = env_u64("NUM_FRAGMENTS", if is_lazy_bench { 100_000 } else { 5000 });
     let f_sweep = env_sweep_u64("FRAGMENTS_PER_COMMIT", "10,100");
-    let node_sweep = env_sweep_f64("NODE_SIZE_MB", "4,10");
+    let node_sweep = env_sweep_f64("NODE_SIZE_MB", if is_lazy_bench { "0.25" } else { "4,10" });
     let max_children_per_node = env_usize("FANOUT", 16) as u32;
     let betree_commits = env_u64("BETREE_COMMITS", 3000);
     let flat_sample = env_u64("FLAT_SAMPLE_COMMITS", 20);
@@ -588,6 +790,28 @@ fn bench_betree_backfill(c: &mut Criterion) {
 
     let base_files = env_usize("BASE_FILES_PER_FRAGMENT", 1) as u32;
     let backfill_columns = env_usize("BACKFILL_COLUMNS", 1) as u32;
+
+    if is_lazy_bench {
+        let node_mib = *node_sweep.first().unwrap_or(&0.25);
+        let num_resolves = env_u64("LAZY_RESOLVES", 100);
+        let backfill_commits = env_u64("LAZY_BACKFILL_COMMITS", 10);
+        let uri = format!("{}/{run_tag}/lazy", base_uri.trim_end_matches('/'));
+        println!("=== recursive Bε-tree LAZY READ benchmark ===");
+        println!(
+            "base_uri={base_uri}\nN={n} node_size={node_mib} MiB max_children_per_node={max_children_per_node} \
+             resolves={num_resolves} backfill_commits={backfill_commits} run_tag={run_tag}\n"
+        );
+        runtime.block_on(run_lazy_bench(
+            &uri,
+            n,
+            (node_mib * MIB as f64) as u64,
+            max_children_per_node,
+            num_resolves,
+            backfill_commits,
+        ));
+        let _ = c;
+        return;
+    }
 
     // Deep-flush mode: sustained backfill that cascades flushes into internal nodes.
     let deep_commits = env_u64("DEEP_FLUSH_COMMITS", 0);

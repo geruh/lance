@@ -43,6 +43,13 @@ pub fn remove_fragment(frag_id: u64) -> pb::FragmentAction {
     }
 }
 
+/// Clear the deletion file attached to `frag_id`.
+pub fn clear_deletion_file(frag_id: u64) -> pb::FragmentAction {
+    pb::FragmentAction {
+        action: Some(Action::ClearDeletionFile(pb::ClearDeletionFile { frag_id })),
+    }
+}
+
 /// The fragment id an action targets, used to route it to the owning child.
 pub fn target_frag_id(action: &pb::FragmentAction) -> Option<u64> {
     match action.action.as_ref()? {
@@ -51,5 +58,6 @@ pub fn target_frag_id(action: &pb::FragmentAction) -> Option<u64> {
         Action::AddDataFile(a) => Some(a.frag_id),
         Action::RemoveDataFile(a) => Some(a.frag_id),
         Action::AddDeletionFile(a) => Some(a.frag_id),
+        Action::ClearDeletionFile(a) => Some(a.frag_id),
     }
 }
