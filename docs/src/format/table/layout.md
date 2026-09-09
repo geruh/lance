@@ -74,6 +74,8 @@ Each of these file types includes an optional `base_id` field in their metadata 
 When a file's `base_id` is absent, the file is located relative to the dataset root.
 When a file's `base_id` is present, readers must look up the corresponding base path entry in the manifest's `base_paths` array to determine where the file is stored.
 
+Fragment metadata children and fragment files stored in the tree also carry optional `base_id`. Resolution is specified in [Fragment Metadata Tree](fragment_metadata.md#object-references).
+
 At read time, path resolution follows a two-step process.
 First, the reader determines the base path: if `base_id` is absent, the base path is the dataset root; otherwise, the reader looks up the base path entry using the `base_id` to obtain the path and its `is_dataset_root` flag.
 Second, the reader constructs the full file path based on whether the base path represents a dataset root.
