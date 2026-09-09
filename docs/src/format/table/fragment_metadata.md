@@ -51,17 +51,18 @@ snapshot.
 
 A tree table must set `Manifest.fragment_metadata`, leave `Manifest.fragments`
 empty, and set flag 512 in both `reader_feature_flags` and
-`writer_feature_flags`. These fields must agree.
+`writer_feature_flags`. These fields must agree. When `FLAG_FRAGMENT_METADATA`
+is set, `FragmentMetadata.layout` must select exactly one recognized layout.
 
-A `FragmentMetadataTree` must contain exactly one of an inline root or an
-external `root_path`.
+A `FragmentMetadataTree` must contain exactly one of an inline root or a
+`root_path`.
 
 An inline root carries the complete `FragmentMetadataRoot` in the Version
 Manifest. `mutations_since_root` must be empty.
 
-An external root is named by `root_path`. `mutations_since_root` contains every
-mutation in this version that is not represented by the referenced root.
-Readers must not follow a mutation chain.
+An external root named by `root_path` belongs to the current dataset.
+`mutations_since_root` contains every mutation in this version that is not
+represented by that root. Readers must not follow a mutation chain.
 
 ```
 Version Manifest N
@@ -79,9 +80,9 @@ not been pushed to that node's children.
 
 ## Tree objects
 
-Tree objects are immutable and live under `_bt/` in the dataset root. Paths
-are relative to the dataset root and must begin with `_bt/`. Readers must
-reject an absolute path or a path outside `_bt/`.
+Tree objects are immutable and stored under `_bt/` relative to a dataset root.
+Tree object paths must begin with `_bt/`. Readers must reject absolute paths
+and paths outside `_bt/`.
 
 ```
 {dataset_root}/
@@ -99,9 +100,43 @@ raw `FragmentMetadataNode` protobuf. Neither has an extra header or footer.
 `FragmentMetadataNode` holds the child list and a mutation buffer for that
 subtree.
 
-Child paths in roots and interior nodes must be unique and non-empty.
+Child `path` values must be non-empty. Resolved child locations within a child
+list must be unique.
 
 A leaf is a Lance file of complete fragment records for one fragment-ID range.
+
+## Object references
+
+The Version Manifest root belongs to the current dataset. It is either an
+inline `FragmentMetadataRoot` or a `root_path` in the current dataset.
+
+A `FragmentMetadataChild` contains a `path` relative to its resolved dataset
+and an optional `base_id`.
+
+When `base_id` is set, it must identify a `BasePath` in the Version Manifest
+with `is_dataset_root` set to true. When `base_id` is absent, the reference
+inherits the resolved dataset of the containing tree object.
+
+A child object resolves to `{resolved_dataset}/{path}`. Tree object paths must
+begin with `_bt/` and must not be resolved under `data/`.
+
+A reference with `base_id` set may name an immutable tree object in another
+dataset. Descendant references with no `base_id` inherit that object's resolved
+dataset.
+
+New tree objects must belong to the current dataset. Tree objects owned by
+another dataset must not be modified.
+
+A shallow clone's root must belong to the clone dataset. Unchanged source
+subtrees may be referenced through `base_id`. The clone's `base_paths` must
+contain a `BasePath` for the source dataset root and preserve every `BasePath`
+entry referenced by a shared tree object at the same id. New base paths must
+use previously unused ids.
+
+When a tree object is copied into another dataset, references that inherited
+the source dataset must be rewritten with a `base_id` naming that dataset.
+Existing explicit `base_id` values must continue to resolve to the same
+`BasePath` entries.
 
 ## Leaf format
 
@@ -143,9 +178,13 @@ A FRAGMENT row carries `fragment_meta`, the `DataFragment` protobuf with
 `files` cleared. Its remaining columns are sentinels: empty `path`, empty
 `field_ids` and `column_indices`, version and size 0, and a null `base_id`.
 A DATA_FILE row carries one `DataFile` across those columns and a null
-`fragment_meta`. `file_size_bytes` of 0 means unknown. A null `base_id` means
-the file lives under the dataset root. Otherwise it indexes
-`Manifest.base_paths`.
+`fragment_meta`. `file_size_bytes` of 0 means unknown. A null `base_id`
+inherits the leaf object's resolved dataset. A set `base_id` indexes this
+Version Manifest's `base_paths`. The same rule applies to deletion files,
+overlays, and other fragment-owned files.
+
+A null `base_id` in a buffered mutation inherits the resolved dataset of the
+structure containing that mutation.
 
 Counts in a leaf are known. `physical_rows` of 0 is zero rows. A deletion file
 must carry `num_deleted_rows`, which must not exceed `physical_rows`.
@@ -307,10 +346,20 @@ sequence is at or below the owning leaf's
 
 ## Fragment IDs
 
-Fragment ID allocation is owned by `Manifest.max_fragment_id`. The tree has no
-separate allocator. Every fragment ID stored or targeted by the tree must be
-at most `Manifest.max_fragment_id`. If `max_fragment_id` is absent, the tree
-must contain no fragment records or fragment-targeting mutations.
+`Manifest.max_fragment_id` is authoritative for fragment ID allocation. The
+tree has no separate allocator.
+
+`max_fragment_id` is absent only when no fragment ID has ever been allocated or
+reserved in the lineage. It must not decrease. Deletion does not make fragment
+IDs reusable, and restore must not lower the value.
+
+The first allocated fragment ID is 0. Otherwise, allocation uses
+`max_fragment_id + 1`. `ReserveFragments` advances the value. A value of
+`2^32 - 1` exhausts the fragment-ID space.
+
+Every fragment ID stored or targeted by the tree must be at most
+`Manifest.max_fragment_id`. If `max_fragment_id` is absent, the tree must
+contain no fragment records or fragment-targeting mutations.
 
 ## Validation
 
@@ -319,8 +368,8 @@ not treat a corrupt snapshot as empty.
 
 | Object | Additional checks |
 |---|---|
-| Manifest | Feature flags set, `fragments` empty, `fragment_metadata` present |
-| `FragmentMetadataTree` | Exactly one root representation, sequence range valid, no target above `max_fragment_id` |
+| Manifest | Feature flags set, `fragments` empty, `fragment_metadata` present, layout selected |
+| `FragmentMetadataTree` | Exactly one root representation, sequence range valid, tree object references valid, no target above `max_fragment_id` |
 | Root | Children and buffer valid, derived visible rows at most derived total rows |
 | Node / leaf | Fetched byte length equals parent `object_size`. Shape and aggregate fields that can be recomputed from the object agree with the parent child reference. Routing bounds and the leaf watermark follow Routing and Sequence numbers. |
 
@@ -334,13 +383,19 @@ A failed attempt leaves unreachable objects that are eligible for cleanup.
 Whether to inline the root or publish a new external root is writer policy and
 may change between versions.
 
+Unchanged immutable subtrees may be reused. New tree objects must belong to
+the current dataset. Reused references must preserve their resolved dataset.
+
 Cleanup computes reachability from the fragment state of every
 retained manifest, applying buffers and `mutations_since_root`. The reachable
 set is the `root_path` if any, every `.node` and `.lance` reachable from that
-root, and every data file, deletion file, and related object that state names.
+root after resolving child references, and every data file, deletion file, and
+related object that state names.
 A file named only by a pending mutation is reachable through that resolved
 state. A file named only by a mutation that a later mutation in the same
-snapshot supersedes is not. Objects under `_bt/` outside the set follow the
-same age and in-progress rules as data files.
+snapshot supersedes is not. Objects under this dataset's `_bt/` outside the
+set follow the same age and in-progress rules as data files.
 
-An object reachable from any retained manifest must not be removed.
+An object reachable from any retained manifest of this dataset must not be
+removed. Tree object lifetime across datasets follows the same contract as
+data files named through `base_paths`.
