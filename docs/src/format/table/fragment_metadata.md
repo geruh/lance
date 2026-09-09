@@ -138,6 +138,14 @@ the source dataset must be rewritten with a `base_id` naming that dataset.
 Existing explicit `base_id` values must continue to resolve to the same
 `BasePath` entries.
 
+An `ExternalFile` embedded in `DataFragment` has no `base_id`. Its path is
+relative to the resolved dataset of the tree object or Version Manifest that
+contains the fragment state.
+
+When fragment state is written to a different dataset, each referenced
+`ExternalFile` must be copied to that dataset and its path rewritten before
+publication. The write must fail if any such reference cannot be preserved.
+
 ## Leaf format
 
 A leaf is a Lance file with this schema. The tree does not require a specific
