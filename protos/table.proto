@@ -43,13 +43,14 @@ message FragmentMetadata {
 message FragmentMetadataTree {
   oneof root {
     FragmentMetadataRoot inline_root = 1;
+    // External root path relative to this dataset.
     string root_path = 2;
   }
 
   // Mutations not represented by the selected root.
   repeated FragmentMetadataMutation mutations_since_root = 3;
 
-  // Next action sequence after this version.
+  // Next unused action sequence for this version.
   uint64 next_action_sequence = 4;
 }
 
@@ -66,34 +67,38 @@ message FragmentMetadataRoot {
  * the last child inherits its parent's upper bound.
  */
 message FragmentMetadataChild {
-  // Dataset-relative object path.
-  string node_path = 1;
+  // Tree object path relative to its resolved dataset.
+  string path = 1;
+
+  // Absent inherits the containing object's dataset. Otherwise indexes Manifest.base_paths.
+  optional uint32 base_id = 2;
 
   // Inclusive lower bound of this child's range.
-  uint64 min_key = 2;
+  uint64 min_key = 3;
 
   // Fragment count in this subtree, including this object's buffer.
-  uint64 num_keys = 3;
+  uint64 num_keys = 4;
 
   // Edges from this object to its leaves. Zero for a leaf.
-  uint32 height = 4;
+  uint32 height = 5;
 
   // Direct child count. Zero for a leaf.
-  uint32 num_children = 5;
+  uint32 num_children = 6;
 
   // Physical rows in this subtree, including this object's buffer.
-  uint64 total_rows = 6;
+  uint64 total_rows = 7;
 
   // Stored byte length of the child object.
-  uint64 object_size = 7;
+  uint64 object_size = 8;
 
   /* Every mutation for this leaf's range at or below this value has been
-   * applied, and none remain buffered above it. Zero means none.
+   * applied, and none remain buffered above it. Zero means none. Must be 0
+   * for interiors.
    */
-  uint64 materialized_through_action_sequence = 8;
+  uint64 materialized_through_action_sequence = 9;
 
   // Visible rows in this subtree, including this object's buffer.
-  uint64 visible_rows = 9;
+  uint64 visible_rows = 10;
 }
 
 // Interior routing node.
@@ -279,15 +284,9 @@ message Manifest {
    */
   uint64 writer_feature_flags = 10;
 
-  /* The highest fragment ID that has been used so far.
-   *
-   * This ID is not guaranteed to be present in the current version, but it may
-   * have been used in previous versions.
-   *
-   * For a single fragment, will be zero. For no fragments, will be absent.
-   *
-   * This is the authoritative fragment-id allocation high-water mark for both
-   * flat and fragment metadata tree layouts, reservations included.
+  /* Highest fragment id ever allocated or reserved in this lineage.
+   * Absent only before the first allocation or reservation. Never decreases.
+   * u32::MAX means the fragment-id space is exhausted.
    */
   optional uint32 max_fragment_id = 11;
 
