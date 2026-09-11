@@ -4,7 +4,8 @@
 
     This layout is unstable. Readers and writers may change it without
     keeping compatibility with earlier unstable revisions. Flat manifests
-    remain the default.
+    remain the default. Use disposable datasets. Do not keep tree tables
+    you cannot rebuild.
 
 **This page specifies a proposed on-disk format for storing fragment state.
 Support for creating or reading tree tables is not yet available in released

@@ -630,8 +630,30 @@ impl DatasetBuilder {
             .await
     }
 
-    #[instrument(skip_all)]
+    /// Load a dataset with resident metadata for the synchronous fragment APIs.
     pub async fn load(self) -> Result<Dataset> {
+        let mut dataset = self.load_unmaterialized().await?;
+        dataset.hydrate_fragments_for_maintenance().await?;
+        Ok(dataset)
+    }
+
+    /// Load metadata on demand. Use [`super::LazyDataset::into_dataset`] when
+    /// an operation needs the complete fragment list.
+    ///
+    /// ```
+    /// # use lance::{dataset::builder::DatasetBuilder, Result};
+    /// # async fn example(uri: &str) -> Result<()> {
+    /// let dataset = DatasetBuilder::from_uri(uri).load_lazy().await?;
+    /// let fragment = dataset.get_fragment(42).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn load_lazy(self) -> Result<super::LazyDataset> {
+        Ok(super::LazyDataset::new(self.load_unmaterialized().await?))
+    }
+
+    #[instrument(skip_all)]
+    pub(crate) async fn load_unmaterialized(self) -> Result<Dataset> {
         let uri = self.table_uri.clone();
         let target_ref = self.version.clone();
         match self.load_impl().boxed().await {
@@ -804,7 +826,7 @@ impl DatasetBuilder {
             (base_path, table_uri)
         };
 
-        let dataset = Self::load_by_uri(
+        let dataset = Self::load_by_uri_unmaterialized(
             session,
             manifest,
             file_reader_options,
@@ -868,6 +890,36 @@ impl DatasetBuilder {
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Dataset> {
+        let mut dataset = Self::load_by_uri_unmaterialized(
+            session,
+            manifest,
+            file_reader_options,
+            table_uri,
+            version_number,
+            object_store,
+            base_path,
+            commit_handler,
+            store_params,
+            base_store_params,
+        )
+        .await?;
+        dataset.hydrate_fragments_for_maintenance().await?;
+        Ok(dataset)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_by_uri_unmaterialized(
+        session: Arc<Session>,
+        manifest: Option<Manifest>,
+        file_reader_options: Option<FileReaderOptions>,
+        table_uri: String,
+        version_number: Option<u64>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        commit_handler: Arc<dyn CommitHandler>,
+        store_params: Option<ObjectStoreParams>,
+        base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
+    ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             ensure_can_read_manifest(&manifest)?;
             let location = commit_handler
@@ -879,37 +931,13 @@ impl DatasetBuilder {
             }
             (Arc::new(manifest), location)
         } else {
-            let manifest_location = match version_number {
-                Some(version) => {
-                    let target_manifest_result = commit_handler
-                        .resolve_version_location(&base_path, version, &object_store.inner)
-                        .await;
-                    // This may fail due to the uri is not the right branch
-                    // In this case we should try to load the latest version and checkout the right branch and version_number
-                    match target_manifest_result {
-                        Ok(manifest_location) => manifest_location,
-                        Err(e) => {
-                            if let Error::VersionNotFound { message: _ } = e {
-                                // If the version is not found, we need to try to load the latest version.
-                                commit_handler
-                                    .resolve_latest_location(&base_path, &object_store)
-                                    .await?
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-                None => commit_handler
-                    .resolve_latest_location(&base_path, &object_store)
-                    .await
-                    .map_err(|e| match &e {
-                        Error::NotFound { .. } => {
-                            Error::dataset_not_found(base_path.to_string(), Box::new(e))
-                        }
-                        _ => e,
-                    })?,
-            };
+            let manifest_location = Self::resolve_manifest_location(
+                &commit_handler,
+                &base_path,
+                &object_store,
+                version_number,
+            )
+            .await?;
 
             let manifest = Dataset::get_manifest(
                 &object_store,
@@ -932,7 +960,49 @@ impl DatasetBuilder {
             file_reader_options,
             store_params,
             base_store_params,
-        )
+        )?
+        .attach_fragment_source()
+        .await
+    }
+
+    async fn resolve_manifest_location(
+        commit_handler: &Arc<dyn CommitHandler>,
+        base_path: &Path,
+        object_store: &Arc<ObjectStore>,
+        version_number: Option<u64>,
+    ) -> Result<lance_table::io::commit::ManifestLocation> {
+        let manifest_location = match version_number {
+            Some(version) => {
+                let target_manifest_result = commit_handler
+                    .resolve_version_location(base_path, version, &object_store.inner)
+                    .await;
+                // This may fail due to the uri is not the right branch
+                // In this case we should try to load the latest version and checkout the right branch and version_number
+                match target_manifest_result {
+                    Ok(manifest_location) => manifest_location,
+                    Err(e) => {
+                        if let Error::VersionNotFound { message: _ } = e {
+                            // If the version is not found, we need to try to load the latest version.
+                            commit_handler
+                                .resolve_latest_location(base_path, object_store)
+                                .await?
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            None => commit_handler
+                .resolve_latest_location(base_path, object_store)
+                .await
+                .map_err(|e| match &e {
+                    Error::NotFound { .. } => {
+                        Error::dataset_not_found(base_path.to_string(), Box::new(e))
+                    }
+                    _ => e,
+                })?,
+        };
+        Ok(manifest_location)
     }
 }
 

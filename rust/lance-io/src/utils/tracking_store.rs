@@ -430,15 +430,24 @@ impl ObjectStore for IoTrackingStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let _guard = self.stage_guard();
+        let is_head = options.head;
         let range = match &options.range {
             Some(GetRange::Bounded(range)) => Some(range.clone()),
             _ => None, // TODO: fill in other options.
         };
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-
-            self.record_read("get_opts", location.to_owned(), num_bytes, range);
+            let num_bytes = if is_head {
+                0
+            } else {
+                result.range.end - result.range.start
+            };
+            self.record_read(
+                if is_head { "head" } else { "get_opts" },
+                location.to_owned(),
+                num_bytes,
+                range,
+            );
         }
         result
     }
@@ -590,5 +599,31 @@ impl Drop for StageGuard {
             let mut stats = self.stats.lock().unwrap();
             stats.num_stages += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::{ObjectStoreExt, memory::InMemory};
+
+    #[tokio::test]
+    async fn head_counts_a_request_without_reading_the_object_body() {
+        let tracker = IOTracker::default();
+        let store = tracker.wrap("", Arc::new(InMemory::new()));
+        let path = Path::from("payload");
+        store.put(&path, vec![7u8; 4096].into()).await.unwrap();
+        tracker.incremental_stats();
+        store.head(&path).await.unwrap();
+        let stats = tracker.incremental_stats();
+        assert_eq!(stats.read_iops, 1);
+        assert_eq!(stats.read_bytes, 0);
+        #[cfg(feature = "test-util")]
+        assert_eq!(stats.requests[0].method, "head");
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap().len(),
+            4096
+        );
+        assert_eq!(tracker.incremental_stats().read_bytes, 4096);
     }
 }
