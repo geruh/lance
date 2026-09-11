@@ -51,7 +51,7 @@ use lance_core::{
     },
 };
 use lance_table::{
-    format::{IndexMetadata, Manifest},
+    format::{Fragment, IndexMetadata, Manifest, pb},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -61,6 +61,7 @@ use lance_table::{
 use object_store::ObjectMeta;
 use object_store::path::Path;
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     future,
@@ -77,6 +78,7 @@ struct ReferencedFiles {
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
+    metadata_paths: HashSet<Path>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -149,6 +151,9 @@ pub enum CleanupFileKind {
     /// logs to match the long-standing cleanup behavior.  Their bytes
     /// are still included in `bytes_removed`.
     TemporaryManifest,
+    /// Tree metadata contributes to bytes removed, but not data-file or
+    /// version counts.
+    FragmentMetadata,
 }
 
 impl CleanupCandidateFile {
@@ -197,7 +202,7 @@ impl RemovalStats {
             CleanupFileKind::Transaction => self.transaction_files_removed += 1,
             CleanupFileKind::Index => self.index_files_removed += 1,
             CleanupFileKind::Deletion => self.deletion_files_removed += 1,
-            CleanupFileKind::TemporaryManifest => {}
+            CleanupFileKind::TemporaryManifest | CleanupFileKind::FragmentMetadata => {}
         }
     }
 
@@ -583,6 +588,7 @@ impl<'a> CleanupTask<'a> {
             }
             Err(error) => return Err(error),
         };
+        let tree_files = self.inspect_tree(&manifest).await?;
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
@@ -590,6 +596,14 @@ impl<'a> CleanupTask<'a> {
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
         let mut inspection = inspection.lock().unwrap();
+        let files = if in_working_set {
+            &mut inspection.referenced_files
+        } else {
+            &mut inspection.verified_files
+        };
+        files.data_paths.extend(tree_files.data_paths);
+        files.delete_paths.extend(tree_files.delete_paths);
+        files.metadata_paths.extend(tree_files.metadata_paths);
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -621,6 +635,64 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
+    async fn inspect_tree(&self, manifest: &Manifest) -> Result<ReferencedFiles> {
+        let mut files = ReferencedFiles::default();
+        let Some(snapshot) = &manifest.fragment_metadata else {
+            return Ok(files);
+        };
+        let mut tree = super::fragment_metadata::tree_from_manifest(
+            self.dataset.object_store.clone(),
+            self.dataset.base.clone(),
+            manifest,
+        )
+        .await?;
+        tree.set_foreign_bases(self.dataset.tree_foreign_bases_for(manifest).await?);
+        let tree = Arc::new(tree);
+        let mut paths = tree.node_paths().await?;
+        if let Some(pb::fragment_metadata_tree::Root::RootPath(path)) = &snapshot.root {
+            paths.push(path.clone());
+        }
+        for path in paths {
+            files.metadata_paths.insert(Path::from(path));
+        }
+        let mut fragments = tree.fragment_stream();
+        while let Some(fragment) = fragments.try_next().await? {
+            self.record_fragment(&fragment, &mut files);
+        }
+        Ok(files)
+    }
+
+    fn record_fragment(&self, fragment: &Fragment, referenced_files: &mut ReferencedFiles) {
+        for file in fragment.referenced_lance_files() {
+            let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
+            referenced_files
+                .data_paths
+                .insert(remove_prefix(&full_data_path, &self.dataset.base));
+        }
+        if let Some(lance_table::format::RowIdMeta::External(slice)) = &fragment.row_id_meta {
+            referenced_files
+                .metadata_paths
+                .insert(Path::from(slice.path.as_str()));
+        }
+        for metadata in [
+            &fragment.created_at_version_meta,
+            &fragment.last_updated_at_version_meta,
+        ] {
+            if let Some(lance_table::format::RowDatasetVersionMeta::External(slice)) = metadata {
+                referenced_files
+                    .metadata_paths
+                    .insert(Path::from(slice.path.as_str()));
+            }
+        }
+
+        if let Some(deletion_file) = &fragment.deletion_file {
+            let path = deletion_file_path(&self.dataset.base, fragment.id, deletion_file);
+            referenced_files
+                .delete_paths
+                .insert(remove_prefix(&path, &self.dataset.base));
+        }
+    }
+
     fn process_manifest(
         &self,
         manifest: &Manifest,
@@ -637,19 +709,7 @@ impl<'a> CleanupTask<'a> {
         };
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.referenced_lance_files() {
-                let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
-                let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
-                referenced_files.data_paths.insert(relative_data_path);
-            }
-            let delpath = fragment
-                .deletion_file
-                .as_ref()
-                .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
-            if let Some(delpath) = delpath {
-                let relative_path = remove_prefix(&delpath, &self.dataset.base);
-                referenced_files.delete_paths.insert(relative_path);
-            }
+            self.record_fragment(fragment, referenced_files);
         }
         if let Some(relative_tx_path) = &manifest.transaction_file {
             referenced_files
@@ -745,6 +805,7 @@ impl<'a> CleanupTask<'a> {
             // the proof when the old manifests are removed by this cleanup pass.
             build_listing_stream(self.dataset.indices_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.base.clone().join("_bt"), None),
         ];
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
@@ -785,7 +846,7 @@ impl<'a> CleanupTask<'a> {
                     CleanupFileKind::Index => {
                         info!(target: TRACE_FILE_AUDIT, mode=mode, r#type=AUDIT_TYPE_INDEX, path = path_str);
                     }
-                    CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest => {}
+                    CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest | CleanupFileKind::FragmentMetadata => {}
                 }
             }
             cleanup_result
@@ -895,6 +956,38 @@ impl<'a> CleanupTask<'a> {
         let path = obj_meta.location;
         let relative_path = remove_prefix(&path, &self.dataset.base);
         let size_bytes = obj_meta.size;
+        if inspection
+            .referenced_files
+            .metadata_paths
+            .contains(&relative_path)
+        {
+            return Ok(None);
+        }
+        let maybe_in_progress = maybe_in_progress
+            && !inspection
+                .verified_files
+                .metadata_paths
+                .contains(&relative_path);
+        if relative_path.as_ref().starts_with("_bt/") {
+            let referenced = inspection
+                .referenced_files
+                .metadata_paths
+                .contains(&relative_path);
+            let verified = inspection
+                .verified_files
+                .metadata_paths
+                .contains(&relative_path);
+            return Ok(if !referenced && (!maybe_in_progress || verified) {
+                cleanup_file(
+                    path,
+                    CleanupFileKind::FragmentMetadata,
+                    !verified,
+                    size_bytes,
+                )
+            } else {
+                None
+            });
+        }
         if relative_path.as_ref().starts_with("_versions/.tmp") {
             // This is a temporary manifest file.
             //
@@ -1227,6 +1320,7 @@ impl<'a> CleanupTask<'a> {
                 .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                     self.process_branch_referenced_manifests(
                         location,
+                        &branch_location.path,
                         *root_version_number,
                         &inspection,
                     )
@@ -1239,17 +1333,30 @@ impl<'a> CleanupTask<'a> {
     async fn process_branch_referenced_manifests(
         &self,
         location: ManifestLocation,
+        branch_base: &Path,
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        let mut fragments = if manifest.fragment_metadata.is_some() {
+            let mut tree = super::fragment_metadata::tree_from_manifest(
+                self.dataset.object_store.clone(),
+                branch_base.clone(),
+                &manifest,
+            )
+            .await?;
+            tree.set_foreign_bases(self.dataset.tree_foreign_bases_for(&manifest).await?);
+            Arc::new(tree).fragment_stream()
+        } else {
+            futures::stream::iter(manifest.fragments.as_ref().clone().into_iter().map(Ok)).boxed()
+        };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-        let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
 
-        for fragment in manifest.fragments.iter() {
+        while let Some(fragment) = fragments.try_next().await? {
+            let mut inspection = inspection.lock().unwrap();
             for file in fragment.referenced_lance_files() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
@@ -1297,6 +1404,7 @@ impl<'a> CleanupTask<'a> {
                 }
             }
         }
+        let mut inspection = inspection.lock().unwrap();
         for index in indexes {
             if let Some(base_id) = index.base_id {
                 let base_path = manifest.base_paths.get(&base_id);
@@ -2977,6 +3085,7 @@ mod tests {
         }
         task.process_branch_referenced_manifests(
             branch.manifest_location.clone(),
+            &branch.base,
             root_version,
             &inspection,
         )

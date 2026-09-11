@@ -30,8 +30,8 @@ use lance_file::versions as file_versions;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
-    ObjectStoreParams, StorageOptions, StorageOptionsAccessor, StorageOptionsProvider,
-    WrappingObjectStore,
+    ObjectStoreParams, ObjectStoreRegistry, StorageOptions, StorageOptionsAccessor,
+    StorageOptionsProvider, WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::{
@@ -73,6 +73,10 @@ mod data_file;
 pub mod delta;
 pub mod files;
 pub mod fragment;
+pub mod fragment_metadata;
+pub mod fragment_source;
+mod lazy;
+pub use lazy::LazyDataset;
 mod hash_joiner;
 pub mod index;
 pub mod mem_wal;
@@ -249,6 +253,8 @@ pub struct Dataset {
     /// Object stores for additional base paths, normally shared across clones.
     /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
+    /// Immutable external fragment state for this manifest version.
+    pub(crate) lazy_fragments: Option<Arc<fragment_source::LazyFragments>>,
 }
 
 /// The `OnceCell` coalesces concurrent first resolutions into one build.
@@ -555,25 +561,38 @@ impl Dataset {
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
         let (manifest, manifest_location) = self.latest_manifest().await?;
-        self.set_manifest(manifest, manifest_location);
+        self.set_manifest(manifest, manifest_location).await?;
         Ok(())
     }
 
     /// Replace the manifest, refreshing derived state. Base stores are kept
     /// when `base_paths` is unchanged.
-    fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
+    async fn set_manifest(
+        &mut self,
+        manifest: Arc<Manifest>,
+        manifest_location: ManifestLocation,
+    ) -> Result<()> {
+        let mut replacement = self.clone();
         if manifest.base_paths != self.manifest.base_paths {
-            self.base_object_stores = Default::default();
+            replacement.base_object_stores = Default::default();
         }
-        self.manifest = manifest;
-        self.manifest_location = manifest_location;
-        self.fragment_bitmap = Arc::new(
-            self.manifest
+        replacement.manifest = manifest;
+        replacement.manifest_location = manifest_location;
+        replacement.lazy_fragments = None;
+        replacement.fragment_bitmap = Arc::new(
+            replacement
+                .manifest
                 .fragments
                 .iter()
                 .map(|f| f.id as u32)
                 .collect(),
         );
+        replacement = replacement.attach_fragment_source().await?;
+        if self.lazy_fragments.is_none() {
+            replacement.hydrate_fragments_for_maintenance().await?;
+        }
+        *self = replacement;
+        Ok(())
     }
 
     /// Check out the latest version of the branch
@@ -719,7 +738,7 @@ impl Dataset {
             )));
         }
 
-        Self::checkout_manifest(
+        let mut dataset = Self::checkout_manifest(
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
@@ -730,7 +749,13 @@ impl Dataset {
             self.file_reader_options.clone(),
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
-        )
+        )?
+        .attach_fragment_source()
+        .await?;
+        if self.lazy_fragments.is_none() {
+            dataset.hydrate_fragments_for_maintenance().await?;
+        }
+        Ok(dataset)
     }
 
     pub(crate) async fn load_manifest(
@@ -929,7 +954,102 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
+            lazy_fragments: None,
         })
+    }
+
+    pub(crate) fn with_prepared_tree(
+        mut self,
+        tree: lance_table::fragment_metadata::FragmentMetadataTree,
+    ) -> Self {
+        self.lazy_fragments = Some(Arc::new(fragment_source::LazyFragments::new(Arc::new(
+            tree,
+        ))));
+        self
+    }
+
+    pub(crate) async fn attach_fragment_source(self) -> Result<Self> {
+        if self.manifest.fragment_metadata.is_none() {
+            return Ok(self);
+        }
+        let mut tree = fragment_metadata::tree_from_manifest(
+            self.object_store.clone(),
+            self.base.clone(),
+            &self.manifest,
+        )
+        .await?;
+        tree.set_foreign_bases(self.tree_foreign_bases().await?);
+        Ok(self.with_prepared_tree(tree))
+    }
+
+    async fn tree_foreign_bases(
+        &self,
+    ) -> Result<std::collections::HashMap<u32, (Arc<ObjectStore>, Path)>> {
+        self.tree_foreign_bases_for(&self.manifest).await
+    }
+
+    pub(crate) async fn tree_foreign_bases_for(
+        &self,
+        manifest: &Manifest,
+    ) -> Result<std::collections::HashMap<u32, (Arc<ObjectStore>, Path)>> {
+        Self::resolve_tree_foreign_bases(
+            self.session.store_registry(),
+            &self.uri,
+            &self.object_store,
+            manifest,
+            Some(self),
+        )
+        .await
+    }
+
+    /// Resolve dataset-root bases named by `manifest`.
+    ///
+    /// Call this before writing a Version Manifest. A later failure would report
+    /// an error after that version is already visible.
+    pub(crate) async fn resolve_tree_foreign_bases(
+        registry: Arc<ObjectStoreRegistry>,
+        uri: &str,
+        store: &Arc<ObjectStore>,
+        manifest: &Manifest,
+        source: Option<&Self>,
+    ) -> Result<std::collections::HashMap<u32, (Arc<ObjectStore>, Path)>> {
+        let mut foreign = std::collections::HashMap::new();
+        for (id, base_path) in &manifest.base_paths {
+            if !base_path.is_dataset_root {
+                continue;
+            }
+            let path = base_path.extract_path(registry.clone())?;
+            let resolved = if base_path.path == uri || base_path.path.starts_with("memory:") {
+                store.clone()
+            } else if let Some(dataset) = source {
+                if dataset.manifest.base_paths.get(id) == Some(base_path) {
+                    dataset.base_object_store(*id).await?
+                } else {
+                    let params = dataset.store_params_for_base(Some(base_path));
+                    ObjectStore::from_uri_and_params(registry.clone(), &base_path.path, &params)
+                        .await?
+                        .0
+                }
+            } else {
+                ObjectStore::from_uri_and_params(
+                    registry.clone(),
+                    &base_path.path,
+                    &ObjectStoreParams::default(),
+                )
+                .await?
+                .0
+            };
+            foreign.insert(*id, (resolved, path));
+        }
+        Ok(foreign)
+    }
+
+    /// Where scans get fragments: the manifest list, or the fragment metadata tree.
+    pub fn fragment_source(&self) -> fragment_source::FragmentSource {
+        match &self.lazy_fragments {
+            Some(lazy) => fragment_source::FragmentSource::Lazy(lazy.clone()),
+            None => fragment_source::FragmentSource::Manifest(self.manifest.fragments.clone()),
+        }
     }
 
     /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
@@ -1657,6 +1777,29 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
+        if fragment_metadata::dataset_uses_fragment_metadata(&self.manifest) {
+            let mut committed = fragment_metadata::execute_commit(
+                fragment_metadata::CommitTarget {
+                    context: Some(Arc::new(self.clone())),
+                    materialize_fragments: self.lazy_fragments.is_none(),
+                    object_store: self.object_store.clone(),
+                    base_path: self.base.clone(),
+                    uri: self.uri.clone(),
+                    session: self.session.clone(),
+                    commit_handler: self.commit_handler.clone(),
+                },
+                commit_config,
+                &transaction,
+                None,
+                write_config,
+            )
+            .await?;
+            if self.lazy_fragments.is_none() {
+                committed.hydrate_fragments_for_maintenance().await?;
+            }
+            *self = committed;
+            return Ok(());
+        }
         let (manifest, manifest_location) = commit_transaction(
             self,
             self.object_store.as_ref(),
@@ -1670,7 +1813,8 @@ impl Dataset {
         )
         .await?;
 
-        self.set_manifest(Arc::new(manifest), manifest_location);
+        self.set_manifest(Arc::new(manifest), manifest_location)
+            .await?;
 
         Ok(())
     }
@@ -1700,6 +1844,10 @@ impl Dataset {
     }
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {
+        if let Some(lazy) = &self.lazy_fragments {
+            return usize::try_from(lazy.tree().count_visible_rows())
+                .map_err(|_| Error::invalid_input("Visible row count does not fit usize"));
+        }
         let cnts = stream::iter(self.get_fragments())
             .map(|f| async move { f.count_rows(None).await })
             .buffer_unordered(16)
@@ -1715,6 +1863,7 @@ impl Dataset {
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
+        self.fragment_source().materialized("take by row offset")?;
         take::take(self, row_indices, projection.into()).await
     }
 
@@ -1757,6 +1906,7 @@ impl Dataset {
         row_ids: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
+        self.fragment_source().materialized("take by row id")?;
         Arc::new(self.clone())
             .take_builder(row_ids, projection)?
             .execute()
@@ -1856,7 +2006,7 @@ impl Dataset {
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
-        let fragments = self.get_fragments();
+        let fragments = self.get_fragments_async().await?;
         let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
@@ -2037,6 +2187,10 @@ impl Dataset {
     }
 
     pub async fn count_deleted_rows(&self) -> Result<usize> {
+        if let Some(lazy) = &self.lazy_fragments {
+            return usize::try_from(lazy.tree().count_rows() - lazy.tree().count_visible_rows())
+                .map_err(|_| Error::invalid_input("Deleted row count does not fit usize"));
+        }
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.count_deletions().await })
             .buffer_unordered(self.object_store.io_parallelism())
@@ -2059,6 +2213,16 @@ impl Dataset {
         cloned.base_object_stores = Default::default();
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
+        }
+        if let Some(lazy) = &cloned.lazy_fragments {
+            let tree = lazy
+                .tree()
+                .as_ref()
+                .clone()
+                .with_object_store(cloned.object_store.clone());
+            cloned.lazy_fragments = Some(Arc::new(fragment_source::LazyFragments::new(Arc::new(
+                tree,
+            ))));
         }
         cloned
     }
@@ -2111,6 +2275,16 @@ impl Dataset {
                     .collect(),
             )
         });
+        if let Some(lazy) = &cloned.lazy_fragments {
+            let tree = lazy
+                .tree()
+                .as_ref()
+                .clone()
+                .with_object_store(cloned.object_store.clone());
+            cloned.lazy_fragments = Some(Arc::new(fragment_source::LazyFragments::new(Arc::new(
+                tree,
+            ))));
+        }
         cloned
     }
 
@@ -2722,7 +2896,10 @@ impl Dataset {
     }
 
     pub fn count_fragments(&self) -> usize {
-        self.manifest.fragments.len()
+        self.lazy_fragments.as_ref().map_or_else(
+            || self.manifest.fragments.len(),
+            |lazy| lazy.tree().count_fragments() as usize,
+        )
     }
 
     /// Get the schema of the dataset
@@ -2741,7 +2918,8 @@ impl Dataset {
         Projection::full(self.clone())
     }
 
-    /// Get fragments.
+    /// Get all fragments. Ordinary dataset opens materialize external metadata
+    /// so this synchronous API retains its behavior across layouts.
     pub fn get_fragments(&self) -> Vec<FileFragment> {
         let dataset = Arc::new(self.clone());
         self.manifest
@@ -2751,14 +2929,111 @@ impl Dataset {
             .collect()
     }
 
+    /// Resolve every Fragment through its metadata backend. This explicitly
+    /// materializes the full list; use [`Self::fragment_source`] for streaming
+    /// or selective metadata access.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let fragments = dataset.get_fragments_async().await?;
+    /// assert_eq!(fragments.len(), dataset.count_fragments());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_fragments_async(&self) -> Result<Vec<FileFragment>> {
+        let dataset = Arc::new(self.clone());
+        self.fragment_source()
+            .stream()
+            .map_ok(|fragment| FileFragment::new(dataset.clone(), fragment))
+            .try_collect()
+            .await
+    }
+
+    /// Populate metadata for APIs that require resident fragments. Install the
+    /// list and derived offsets together, after every metadata read succeeds.
+    pub(crate) async fn hydrate_fragments_for_maintenance(&mut self) -> Result<()> {
+        let Some(lazy) = &self.lazy_fragments else {
+            return Ok(());
+        };
+        let fragments: Vec<_> = lazy
+            .tree()
+            .clone()
+            .fragment_stream_with_prefetch(self.object_store.io_parallelism())
+            .try_collect()
+            .await?;
+        self.set_materialized_fragments(fragments);
+        Ok(())
+    }
+
+    pub(crate) fn set_materialized_fragments(&mut self, fragments: Vec<Fragment>) {
+        let bitmap = fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        let mut manifest = self.manifest.as_ref().clone();
+        manifest.set_fragments(fragments);
+        self.manifest = Arc::new(manifest);
+        self.fragment_bitmap = Arc::new(bitmap);
+        self.lazy_fragments = None;
+    }
+
     /// Iterate over manifest fragments without allocating [`FileFragment`] wrappers.
     pub fn iter_fragments(&self) -> impl Iterator<Item = &Fragment> {
         self.manifest.fragments.iter()
     }
 
+    /// The fragments with these ids as [`FileFragment`]s, resolved through
+    /// the lazy source when the manifest list is not in memory. Reads are
+    /// proportional to the requested ids, never the table.
+    pub(crate) async fn file_fragments_for_ids(
+        &self,
+        fragment_ids: &[u64],
+    ) -> Result<Vec<FileFragment>> {
+        let dataset = Arc::new(self.clone());
+        if let Some(lazy) = &self.lazy_fragments {
+            let bitmap: RoaringBitmap = fragment_ids
+                .iter()
+                .map(|id| {
+                    u32::try_from(*id).map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Fragment ID {id} exceeds Lance's u32 address space"
+                        ))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            return Ok(lazy
+                .tree()
+                .resolve_fragments_concurrent(&bitmap, 8)
+                .await?
+                .into_iter()
+                .map(|fragment| FileFragment::new(dataset.clone(), fragment))
+                .collect());
+        }
+        Ok(self
+            .manifest
+            .fragments
+            .iter()
+            .filter(|fragment| fragment_ids.contains(&fragment.id))
+            .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
+            .collect())
+    }
+
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
         let metadata = self.find_fragment(fragment_id as u64)?.clone();
         Some(FileFragment::new(Arc::new(self.clone()), metadata))
+    }
+
+    /// Resolve a Fragment by its ID without loading unrelated metadata.
+    pub async fn get_fragment_async(&self, fragment_id: usize) -> Result<Option<FileFragment>> {
+        if let Some(lazy) = &self.lazy_fragments {
+            return Ok(lazy
+                .tree()
+                .resolve_fragment(fragment_id as u64)
+                .await?
+                .map(|metadata| FileFragment::new(Arc::new(self.clone()), metadata)));
+        }
+        Ok(self.get_fragment(fragment_id))
     }
 
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
@@ -2916,7 +3191,22 @@ impl Dataset {
             .map(|addr| RowAddress::from(*addr).fragment_id())
             .dedup()
             .collect::<Vec<_>>();
-        let frags = self.get_frags_from_ordered_ids(&referenced_frag_ids);
+        let resolved = self
+            .file_fragments_for_ids(
+                &referenced_frag_ids
+                    .iter()
+                    .map(|id| u64::from(*id))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        let by_id: BTreeMap<_, _> = resolved
+            .into_iter()
+            .map(|fragment| (fragment.id(), fragment))
+            .collect();
+        let frags: Vec<_> = referenced_frag_ids
+            .iter()
+            .map(|id| by_id.get(&(*id as usize)))
+            .collect();
         let dv_futs = frags
             .iter()
             .map(|frag| {
@@ -3046,48 +3336,26 @@ impl Dataset {
     }
 
     pub async fn validate(&self) -> Result<()> {
-        // All fragments have unique ids
-        let id_counts =
-            self.manifest
-                .fragments
-                .iter()
-                .map(|f| f.id)
-                .fold(HashMap::new(), |mut acc, id| {
-                    *acc.entry(id).or_insert(0) += 1;
-                    acc
-                });
-        for (id, count) in id_counts {
-            if count > 1 {
-                return Err(Error::corrupt_file(
-                    self.base.clone(),
-                    format!(
-                        "Duplicate fragment id {} found in dataset {:?}",
-                        id, self.base
-                    ),
-                ));
-            }
-        }
-
-        // Fragments are sorted in increasing fragment id order
-        self.manifest
-            .fragments
-            .iter()
-            .map(|f| f.id)
-            .try_fold(0, |prev, id| {
-                if id < prev {
-                    Err(Error::corrupt_file(self.base.clone(), format!(
-                        "Fragment ids are not sorted in increasing fragment-id order. Found {} after {} in dataset {:?}",
-                        id, prev, self.base
-                    )))
+        let dataset = Arc::new(self.clone());
+        let mut previous_id = None;
+        self.fragment_source()
+            .stream()
+            .map_ok(move |fragment| {
+                let result = if previous_id.is_some_and(|id| fragment.id <= id) {
+                    Err(Error::corrupt_file(
+                        dataset.base.clone(),
+                        format!(
+                            "Fragment ids must be unique and increasing: {:?} followed by {}",
+                            previous_id, fragment.id
+                        ),
+                    ))
                 } else {
-                    Ok(id)
-                }
-            })?;
-
-        // All fragments have equal lengths
-        futures::stream::iter(self.get_fragments())
-            .map(|f| async move { f.validate().await })
-            .buffer_unordered(self.object_store.io_parallelism())
+                    Ok(FileFragment::new(dataset.clone(), fragment.clone()))
+                };
+                previous_id = Some(fragment.id);
+                async move { result?.validate().await }
+            })
+            .try_buffer_unordered(self.object_store.io_parallelism())
             .try_collect::<Vec<()>>()
             .await?;
 
@@ -3442,7 +3710,8 @@ impl Dataset {
     /// Collect all (relative_path, path) of the dataset files.
     async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
-        for fragment in self.manifest.fragments.iter() {
+        let mut fragments = self.fragment_source().stream();
+        while let Some(fragment) = fragments.try_next().await? {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
                 return Err(Error::internal(format!(
                     "External row_id_meta is not supported yet. external file path: {}",
@@ -3618,7 +3887,9 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.file_reader_options.clone(),
                 dataset.store_params.as_deref().cloned(),
                 dataset.base_store_params.clone(),
-            )
+            )?
+            .attach_fragment_source()
+            .await
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
             // with the current manifest.
@@ -3738,7 +4009,7 @@ impl Dataset {
 
         // Write new data file to each fragment. Parallelism is done over columns,
         // so no parallelism done at this level.
-        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
+        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments_async().await?)
             .then(|f| {
                 let joiner = joiner.clone();
                 async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }

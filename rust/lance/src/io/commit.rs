@@ -136,7 +136,7 @@ pub(crate) async fn read_transaction_file(
 /// have NOT landed (see [`verify_commit_outcome`]): a landed manifest
 /// references its transaction file by path, so deleting it would corrupt the
 /// version.
-async fn cleanup_transaction_file(
+pub(crate) async fn cleanup_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
@@ -169,7 +169,7 @@ async fn cleanup_transaction_file(
 
 /// Who owns the manifest at a version, checked after a failed commit attempt.
 #[derive(Debug)]
-enum CommitOutcome {
+pub(crate) enum CommitOutcome {
     /// The manifest at the version is the one this attempt wrote: the commit
     /// actually landed even though the store reported a failure (e.g. the
     /// response to a successful conditional PUT was lost and an internal
@@ -199,7 +199,7 @@ const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 ///
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
-async fn verify_commit_outcome(
+pub(crate) async fn verify_commit_outcome(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
@@ -270,7 +270,7 @@ async fn verify_commit_outcome(
     }
 }
 
-async fn read_manifest_transaction(
+pub(crate) async fn read_manifest_transaction(
     object_store: &ObjectStore,
     base_path: &Path,
     manifest: &Manifest,
@@ -386,7 +386,12 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
-        Some((source_store, source_manifest_location, source_manifest))
+        Some((
+            source_store,
+            source_manifest_location,
+            source_manifest,
+            source_base_path,
+        ))
     } else {
         None
     };
@@ -405,7 +410,7 @@ async fn do_commit_new_dataset(
             branch_name,
             ..
         },
-        Some((source_store, source_manifest_location, source_manifest)),
+        Some((source_store, source_manifest_location, source_manifest, source_base_path)),
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
@@ -415,13 +420,24 @@ async fn do_commit_new_dataset(
                 .max()
                 .map(|id| *id + 1)
                 .unwrap_or(0);
-            let new_manifest = source_manifest.shallow_clone(
+            let mut new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
                 new_base_id,
                 branch_name.clone(),
                 transaction_file.clone(),
             );
+            if new_manifest.fragment_metadata.is_some() {
+                crate::dataset::fragment_metadata::clone_fragment_metadata(
+                    Arc::new(object_store.clone()),
+                    base_path.clone(),
+                    Arc::new(source_store.clone()),
+                    source_base_path,
+                    new_base_id,
+                    &mut new_manifest,
+                )
+                .await?;
+            }
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
                 let reader = source_store.open(&source_manifest_location.path).await?;
@@ -459,6 +475,37 @@ async fn do_commit_new_dataset(
                 }
             }
             new_manifest.fragments = Arc::new(new_frags);
+
+            if new_manifest.fragment_metadata.is_some() {
+                let tree = crate::dataset::fragment_metadata::tree_from_manifest(
+                    Arc::new(source_store.clone()),
+                    source_base_path.clone(),
+                    &source_manifest,
+                )
+                .await?;
+                let mut fragments = tree.materialize().await?;
+                crate::dataset::fragment_metadata::inline_clone_lineage(
+                    source_store,
+                    &source_base_path,
+                    &mut fragments,
+                )
+                .await?;
+                for fragment in &mut fragments {
+                    for file in fragment.referenced_lance_files_mut() {
+                        file.base_id = None;
+                    }
+                    if let Some(deletion) = fragment.deletion_file.as_mut() {
+                        deletion.base_id = None;
+                    }
+                }
+                new_manifest.set_fragments(fragments);
+                crate::dataset::fragment_metadata::rebuild_fragment_metadata(
+                    Arc::new(object_store.clone()),
+                    base_path.clone(),
+                    &mut new_manifest,
+                )
+                .await?;
+            }
 
             // Indices: keep metadata but normalize base to local
             let mut updated_indices = Vec::new();
@@ -672,7 +719,7 @@ pub fn manifest_needs_migration(manifest: &Manifest, indices: &[IndexMetadata]) 
 ///
 /// Fields such as `physical_rows` and `num_deleted_rows` may not have been
 /// in older datasets. To bring these old manifests up-to-date, we add them here.
-async fn migrate_manifest(
+pub(crate) async fn migrate_manifest(
     dataset: &Dataset,
     manifest: &mut Manifest,
     recompute_stats: bool,
@@ -692,7 +739,7 @@ async fn migrate_manifest(
     Ok(())
 }
 
-fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
+pub(crate) fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     crate::dataset::versions::check_manifest_storage_version(manifest)
 }
 
@@ -716,14 +763,14 @@ fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn check_column_indices(manifest: &Manifest) -> Result<()> {
+pub(crate) fn check_column_indices(manifest: &Manifest) -> Result<()> {
     crate::dataset::versions::validate_column_indices(manifest)
 }
 
 /// Fix schema in case of duplicate field ids.
 ///
 /// See test dataset v0.10.5/corrupt_schema
-fn fix_schema(manifest: &mut Manifest) -> Result<()> {
+pub(crate) fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We can short-circuit if there is only one file per fragment or no fragments.
     if manifest.fragments.iter().all(|f| f.files.len() <= 1) {
         return Ok(());
@@ -937,7 +984,10 @@ fn must_recalculate_fragment_bitmap(
 /// the only changes here that alter what an index covers, and the caller has to
 /// withdraw MemWAL catch-up for them: this runs after the coverage derivation,
 /// and it keeps the segment's UUID.
-async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<Vec<String>> {
+pub(crate) async fn migrate_indices(
+    dataset: &Dataset,
+    indices: &mut [IndexMetadata],
+) -> Result<Vec<String>> {
     infer_missing_vector_details(dataset, indices).await;
     let mut recovered_coverage = Vec::new();
     let needs_recalculating = match detect_overlapping_fragments(indices) {

@@ -1934,7 +1934,7 @@ async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
 
     let mut unsupported_manifest = source.manifest.as_ref().clone();
     unsupported_manifest.version += 1;
-    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    unsupported_manifest.writer_feature_flags |= 1u64 << 63; // An unassigned writer capability.
     write_manifest_file(
         source.object_store.as_ref(),
         source.commit_handler.as_ref(),
@@ -1982,7 +1982,7 @@ async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
 
     let mut unsupported_manifest = source.manifest.as_ref().clone();
     unsupported_manifest.version += 1;
-    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    unsupported_manifest.writer_feature_flags |= 1u64 << 63; // An unassigned writer capability.
     write_manifest_file(
         source.object_store.as_ref(),
         source.commit_handler.as_ref(),

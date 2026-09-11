@@ -1860,15 +1860,14 @@ impl<'a> TransactionRebase<'a> {
                     .collect::<Vec<_>>();
                 // We are rewriting the deletion files on the *current* dataset.
                 let files_to_rewrite = dataset
-                    .fragments()
-                    .as_slice()
-                    .iter()
-                    .filter_map(|fragment| {
-                        if fragments_ids_to_rewrite.contains(&fragment.id) {
-                            Some((fragment.id, fragment.deletion_file.clone()))
-                        } else {
-                            None
-                        }
+                    .file_fragments_for_ids(&fragments_ids_to_rewrite)
+                    .await?
+                    .into_iter()
+                    .map(|fragment| {
+                        (
+                            fragment.metadata().id,
+                            fragment.metadata().deletion_file.clone(),
+                        )
                     })
                     .collect::<Vec<_>>();
                 let existing_deletion_vecs = futures::stream::iter(files_to_rewrite)
@@ -2034,11 +2033,8 @@ impl<'a> TransactionRebase<'a> {
         }
 
         for (fragment_id, coverage) in coverage_by_fragment {
-            let Some(current_fragment) = dataset
-                .fragments()
-                .as_slice()
-                .iter()
-                .find(|f| f.id == fragment_id)
+            let fragments = dataset.file_fragments_for_ids(&[fragment_id]).await?;
+            let Some(current_fragment) = fragments.first().map(|fragment| fragment.metadata())
             else {
                 // The fragment is gone entirely; the overlay is orphaned.
                 return Err(crate::Error::retryable_commit_conflict_source(
@@ -2295,13 +2291,10 @@ async fn initial_fragments_for_rebase(
     };
 
     Ok(dataset
-        .fragments()
-        .iter()
-        .filter(|fragment| {
-            // Check if the fragment is modified by the transaction.
-            modified_fragment_ids.contains(&fragment.id)
-        })
-        .map(|fragment| (fragment.id, (fragment.clone(), false)))
+        .file_fragments_for_ids(&modified_fragment_ids.iter().copied().collect::<Vec<_>>())
+        .await?
+        .into_iter()
+        .map(|fragment| (fragment.metadata().id, (fragment.metadata().clone(), false)))
         .collect())
 }
 

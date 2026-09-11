@@ -28,6 +28,7 @@ use crate::{
 
 use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::fragment_metadata;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
@@ -275,6 +276,26 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        let mut dataset = self.execute_with_fragments(transaction, true).await?;
+        dataset.hydrate_fragments_for_maintenance().await?;
+        Ok(dataset)
+    }
+
+    /// Commit and return a handle that reads fragment metadata on demand.
+    pub async fn execute_lazy(
+        self,
+        transaction: Transaction,
+    ) -> Result<crate::dataset::LazyDataset> {
+        Ok(crate::dataset::LazyDataset::new(
+            self.execute_with_fragments(transaction, false).await?,
+        ))
+    }
+
+    async fn execute_with_fragments(
+        self,
+        transaction: Transaction,
+        materialize_fragments: bool,
+    ) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
             && t.is_zero()
@@ -286,7 +307,7 @@ impl<'a> CommitBuilder<'a> {
         // Box the inner future so wrapping it in `tokio::time::Timeout` does
         // not deepen the future type — downstream `async fn`s that await
         // `execute` otherwise hit the compiler's layout-query depth limit.
-        let fut = Box::pin(self.execute_inner(transaction));
+        let fut = Box::pin(self.execute_inner(transaction, materialize_fragments));
         match timeout {
             Some(t) => match tokio::time::timeout(t, fut).await {
                 Ok(res) => res,
@@ -300,7 +321,11 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+    async fn execute_inner(
+        self,
+        transaction: Transaction,
+        materialize_fragments: bool,
+    ) -> Result<Dataset> {
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -362,7 +387,7 @@ impl<'a> CommitBuilder<'a> {
                     builder = builder.with_version(transaction.read_version)
                 }
 
-                match builder.load().await {
+                match builder.load_unmaterialized().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
                         WriteDestination::Uri(uri)
@@ -371,6 +396,91 @@ impl<'a> CommitBuilder<'a> {
                 }
             }
         };
+
+        let use_stable_row_ids = if self.migration_next_row_id.is_some() {
+            true
+        } else if let Some(ds) = dest.dataset() {
+            ds.manifest.uses_stable_row_ids()
+        } else {
+            self.use_stable_row_ids.unwrap_or(false)
+        };
+        // Validate storage format matches existing dataset
+        if let Some(ds) = dest.dataset()
+            && let Some(storage_format) = self.storage_format
+        {
+            let passed_storage_format = DataStorageFormat::new(storage_format);
+            if ds.manifest.data_storage_format != passed_storage_format
+                && !matches!(transaction.operation, Operation::Overwrite { .. })
+            {
+                return Err(Error::invalid_input_source(format!(
+                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
+                    ds.manifest.data_storage_format,
+                    passed_storage_format
+                ).into()));
+            }
+        }
+
+        let manifest_config = ManifestWriteConfig {
+            use_stable_row_ids,
+            storage_format: self.storage_format.map(DataStorageFormat::new),
+            migration_next_row_id: self.migration_next_row_id,
+            ..Default::default()
+        };
+
+        // Route the selected metadata backend through the same Version Manifest handler.
+        let fragment_metadata_target = || fragment_metadata::CommitTarget {
+            context: dest.dataset().map(|dataset| Arc::new(dataset.clone())),
+            materialize_fragments,
+            object_store: object_store.clone(),
+            base_path: base_path.clone(),
+            uri: match &self.dest {
+                WriteDestination::Dataset(dataset) => dataset.uri().to_string(),
+                WriteDestination::Uri(uri) => uri.to_string(),
+            },
+            session: session.clone(),
+            commit_handler: commit_handler.clone(),
+        };
+        match &dest {
+            WriteDestination::Dataset(dataset) => {
+                if fragment_metadata::dataset_uses_fragment_metadata(&dataset.manifest) {
+                    if self.detached {
+                        return Err(Error::not_supported_source(
+                            "Detached fragment metadata publication is not implemented".into(),
+                        ));
+                    }
+                    return fragment_metadata::execute_commit_with_timeout(
+                        fragment_metadata_target(),
+                        &self.commit_config,
+                        self.retry_timeout,
+                        &transaction,
+                        self.affected_rows.as_ref(),
+                        &manifest_config,
+                    )
+                    .await;
+                }
+                if fragment_metadata::create_requested(&transaction.operation)? {
+                    return Err(Error::invalid_input(
+                        "cannot overwrite an existing flat-manifest dataset with \
+                         lance.manifest.layout=tree; tree layout is selected at create time",
+                    ));
+                }
+            }
+            WriteDestination::Uri(_) => {
+                if fragment_metadata::create_requested(&transaction.operation)? {
+                    if self.detached {
+                        return Err(Error::not_supported_source(
+                            "Detached fragment metadata publication is not implemented".into(),
+                        ));
+                    }
+                    return fragment_metadata::execute_create(
+                        fragment_metadata_target(),
+                        &transaction,
+                        &manifest_config,
+                    )
+                    .await;
+                }
+            }
+        }
 
         if dest.dataset().is_none()
             && !matches!(
@@ -406,38 +516,6 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V2
         } else {
             ManifestNamingScheme::V1
-        };
-
-        let use_stable_row_ids = if self.migration_next_row_id.is_some() {
-            // Migration activation always enables stable row IDs regardless of
-            // the current dataset state.
-            true
-        } else if let Some(ds) = dest.dataset() {
-            ds.manifest.uses_stable_row_ids()
-        } else {
-            self.use_stable_row_ids.unwrap_or(false)
-        };
-        // Validate storage format matches existing dataset
-        if let Some(ds) = dest.dataset()
-            && let Some(storage_format) = self.storage_format
-        {
-            let passed_storage_format = DataStorageFormat::new(storage_format);
-            if ds.manifest.data_storage_format != passed_storage_format
-                && !matches!(transaction.operation, Operation::Overwrite { .. })
-            {
-                return Err(Error::invalid_input_source(format!(
-                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                    ds.manifest.data_storage_format,
-                    passed_storage_format
-                ).into()));
-            }
-        }
-
-        let manifest_config = ManifestWriteConfig {
-            use_stable_row_ids,
-            storage_format: self.storage_format.map(DataStorageFormat::new),
-            migration_next_row_id: self.migration_next_row_id,
-            ..Default::default()
         };
 
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
@@ -502,22 +580,22 @@ impl<'a> CommitBuilder<'a> {
         );
 
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
-
-        match &self.dest {
+        let dataset = match &self.dest {
             WriteDestination::Dataset(dataset) => {
                 let base_object_stores = if manifest.base_paths == dataset.manifest.base_paths {
                     dataset.base_object_stores.clone()
                 } else {
                     Default::default()
                 };
-                Ok(Dataset {
+                Dataset {
+                    lazy_fragments: None,
                     manifest: Arc::new(manifest),
                     manifest_location,
                     session,
                     fragment_bitmap,
                     base_object_stores,
                     ..dataset.as_ref().clone()
-                })
+                }
             }
             WriteDestination::Uri(uri) => {
                 let refs = Refs::new(
@@ -530,7 +608,8 @@ impl<'a> CommitBuilder<'a> {
                     },
                 );
 
-                Ok(Dataset {
+                Dataset {
+                    lazy_fragments: None,
                     object_store,
                     base: base_path,
                     uri: uri.to_string(),
@@ -546,9 +625,10 @@ impl<'a> CommitBuilder<'a> {
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
                     base_object_stores: Default::default(),
-                })
+                }
             }
-        }
+        };
+        dataset.attach_fragment_source().await
     }
 
     /// Commit a set of transactions as a single new version.
