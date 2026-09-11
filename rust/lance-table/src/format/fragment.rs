@@ -274,15 +274,19 @@ impl<T: Eq + std::hash::Hash + Clone> Default for InternCache<T> {
 }
 
 impl<T: Eq + std::hash::Hash + Clone> InternCache<T> {
-    fn intern(&mut self, v: Vec<T>) -> Arc<[T]> {
+    fn get(&self, v: &[T]) -> Option<Arc<[T]>> {
+        match self {
+            Self::Small(entries) => entries
+                .iter()
+                .find(|existing| existing.as_ref() == v)
+                .cloned(),
+            Self::Large(map) => map.get_key_value(v).map(|(existing, _)| existing.clone()),
+        }
+    }
+
+    fn insert(&mut self, arc: Arc<[T]>) -> Arc<[T]> {
         match self {
             Self::Small(entries) => {
-                for existing in entries.iter() {
-                    if existing.as_ref() == v.as_slice() {
-                        return existing.clone();
-                    }
-                }
-                let arc: Arc<[T]> = Arc::from(v);
                 entries.push(arc.clone());
                 if entries.len() > INTERN_CACHE_UPGRADE_THRESHOLD {
                     let mut map = HashMap::with_capacity(entries.len());
@@ -294,15 +298,24 @@ impl<T: Eq + std::hash::Hash + Clone> InternCache<T> {
                 arc
             }
             Self::Large(map) => {
-                if let Some((existing, _)) = map.get_key_value(v.as_slice()) {
-                    existing.clone()
-                } else {
-                    let arc: Arc<[T]> = Arc::from(v);
-                    map.insert(arc.clone(), ());
-                    arc
-                }
+                map.insert(arc.clone(), ());
+                arc
             }
         }
+    }
+
+    fn intern(&mut self, v: Vec<T>) -> Arc<[T]> {
+        if let Some(existing) = self.get(v.as_slice()) {
+            return existing;
+        }
+        self.insert(Arc::from(v))
+    }
+
+    fn intern_slice(&mut self, v: &[T]) -> Arc<[T]> {
+        if let Some(existing) = self.get(v) {
+            return existing;
+        }
+        self.insert(Arc::from(v))
     }
 }
 
@@ -345,6 +358,16 @@ impl DataFileFieldInterner {
                 }))
             }
         }
+    }
+
+    /// Share one allocation for an already-decoded field-id or column-index list.
+    pub fn intern_field_ids(&mut self, ids: &[i32]) -> Arc<[i32]> {
+        self.fields.intern_slice(ids)
+    }
+
+    /// Share one allocation for an already-decoded column-index list.
+    pub fn intern_column_indices(&mut self, ids: &[i32]) -> Arc<[i32]> {
+        self.column_indices.intern_slice(ids)
     }
 
     /// Convert a protobuf `DataFile`, interning `fields` and `column_indices`.
@@ -1018,5 +1041,27 @@ mod tests {
         data_file
             .validate(&base_path)
             .expect("validation should allow extra columns without field ids");
+    }
+
+    #[test]
+    fn intern_slice_reuses_the_same_allocation() {
+        let mut intern = DataFileFieldInterner::default();
+        let first = intern.intern_field_ids(&[0, 1, 2]);
+        let second = intern.intern_field_ids(&[0, 1, 2]);
+        assert!(Arc::ptr_eq(&first, &second));
+        let other = intern.intern_field_ids(&[0, 1]);
+        assert!(!Arc::ptr_eq(&first, &other));
+        let from_vec = intern
+            .intern_data_file(pb::DataFile {
+                path: "a.lance".into(),
+                fields: vec![0, 1, 2],
+                column_indices: vec![0, 1, 2],
+                file_major_version: MAJOR_VERSION as u32,
+                file_minor_version: MINOR_VERSION as u32,
+                file_size_bytes: 0,
+                base_id: None,
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &from_vec.fields));
     }
 }
