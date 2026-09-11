@@ -53,11 +53,14 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// Reserved for datasets that reference recognized V2 data files with
 /// different exact versions.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
+/// Fragment records are stored outside the manifest in immutable tree objects.
+/// Bit 7 belongs to covering indices and bit 8 is reserved for file versions.
+pub const FLAG_FRAGMENT_METADATA: u64 = 1 << 9;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 8;
 
-// Supported flags stay below the unknown boundary; the mixed-version bit is
-// reserved at the boundary until its storage contract lands.
+// The contiguous supported range ends before the reserved mixed-version bit.
+// Later capabilities, including external metadata, are listed explicitly.
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
@@ -85,9 +88,22 @@ pub fn apply_feature_flags(
         & FLAG_COVERED_INDEX_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
 
+    // Untouched external fragment records still contribute these requirements.
+    let fragment_flags = if manifest.fragment_metadata.is_some() {
+        (manifest.reader_feature_flags | manifest.writer_feature_flags)
+            & (FLAG_DELETION_FILES | FLAG_STABLE_ROW_IDS | FLAG_UNSTABLE_DATA_OVERLAY_FILES)
+    } else {
+        0
+    };
+
     // Reset flags
-    manifest.reader_feature_flags = 0;
-    manifest.writer_feature_flags = 0;
+    manifest.reader_feature_flags = fragment_flags;
+    manifest.writer_feature_flags = fragment_flags;
+
+    if manifest.fragment_metadata.is_some() {
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_METADATA;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_METADATA;
+    }
 
     let has_deletion_files = manifest
         .fragments
@@ -187,7 +203,7 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// is enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
-    let mut supported = FLAG_UNKNOWN - 1;
+    let mut supported = (FLAG_UNKNOWN - 1) | FLAG_FRAGMENT_METADATA;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -294,6 +310,28 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    #[test]
+    fn lazy_fragment_metadata_preserves_fragment_feature_requirements() {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            std::sync::Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_metadata = Some(std::sync::Arc::new(Default::default()));
+        let features = FLAG_DELETION_FILES | FLAG_STABLE_ROW_IDS | FLAG_UNSTABLE_DATA_OVERLAY_FILES;
+        manifest.reader_feature_flags = features;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(
+            manifest.reader_feature_flags,
+            features | FLAG_FRAGMENT_METADATA
+        );
+        assert_eq!(
+            manifest.writer_feature_flags,
+            features | FLAG_FRAGMENT_METADATA
+        );
+    }
 
     #[test]
     fn test_read_check() {
