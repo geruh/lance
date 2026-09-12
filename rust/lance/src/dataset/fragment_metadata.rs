@@ -676,6 +676,8 @@ mod gate_tests;
 mod publication_tests;
 #[cfg(test)]
 mod scan_tests;
+#[cfg(test)]
+mod wide_table_io;
 
 #[cfg(test)]
 mod tests {
