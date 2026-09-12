@@ -59,7 +59,7 @@ use crate::io::exec::{
 pub fn create_scan_stream(
     version: ConcreteFileVersion,
     dataset: Arc<Dataset>,
-    fragments: Arc<Vec<Fragment>>,
+    fragments: impl Into<super::fragment_source::FragmentSource>,
     offsets: Option<Range<u64>>,
     projection: Arc<Schema>,
     config: LanceScanConfig,

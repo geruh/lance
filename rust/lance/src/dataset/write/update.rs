@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +33,6 @@ use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
-use roaring::RoaringTreemap;
 use snafu::ResultExt;
 
 /// Collect a field id and all of its descendant field ids (pre-order). A struct
@@ -480,7 +479,8 @@ impl UpdateJob {
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
-        let deletions_result = self.apply_deletions(&row_addrs).await;
+        let deletions_result =
+            crate::dataset::utils::apply_deletions(&self.dataset, &row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,
             Err(e) => {
@@ -592,55 +592,6 @@ impl UpdateJob {
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
         }
         Ok(batch)
-    }
-
-    /// Use previous found rows ids to delete rows from existing fragments.
-    ///
-    /// Returns the set of modified fragments and removed fragments, if any.
-    async fn apply_deletions(
-        &self,
-        removed_row_addrs: &RoaringTreemap,
-    ) -> Result<(Vec<Fragment>, Vec<u64>)> {
-        let bitmaps = Arc::new(removed_row_addrs.bitmaps().collect::<BTreeMap<_, _>>());
-
-        enum FragmentChange {
-            Unchanged,
-            Modified(Box<Fragment>),
-            Removed(u64),
-        }
-
-        let mut updated_fragments = Vec::new();
-        let mut removed_fragments = Vec::new();
-
-        let mut stream = futures::stream::iter(self.dataset.get_fragments())
-            .map(move |fragment| {
-                let bitmaps_ref = bitmaps.clone();
-                async move {
-                    let fragment_id = fragment.id();
-                    if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
-                        match fragment.extend_deletions(*bitmap).await {
-                            Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
-                            }
-                            Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok(FragmentChange::Unchanged)
-                    }
-                }
-            })
-            .buffer_unordered(self.dataset.object_store.io_parallelism());
-
-        while let Some(res) = stream.next().await.transpose()? {
-            match res {
-                FragmentChange::Unchanged => {}
-                FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
-                FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
-            }
-        }
-
-        Ok((updated_fragments, removed_fragments))
     }
 }
 
@@ -1969,7 +1920,7 @@ mod tests {
             .count()
     }
 
-    /// Site 4 in PR #6320: when `UpdateJob::apply_deletions` fails after the new
+    /// Site 4 in PR #6320: when `apply_deletions` fails after the new
     /// rewrite fragments have been written, those new data files must be cleaned up.
     #[tokio::test]
     async fn test_update_cleans_up_data_on_apply_deletions_failure() {

@@ -30,7 +30,8 @@ use crate::dataset::write::merge_insert::{
     create_duplicate_row_error, resolve_target_bases,
 };
 
-use super::{MergeInsertMetrics, apply_deletions};
+use super::MergeInsertMetrics;
+use crate::dataset::utils::apply_deletions;
 
 /// Specialized physical execution node for delete-only merge insert operations.
 ///

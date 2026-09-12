@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Result;
+use crate::{Dataset, Result};
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -15,11 +15,62 @@ use lance_arrow::json::{
     has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
 use lance_core::ROW_ID;
+use lance_table::format::Fragment;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+
+/// Apply physical-row deletions only to referenced Fragments, resolving through
+/// the dataset metadata source so update and merge-insert share identical behavior.
+pub async fn apply_deletions(
+    dataset: &Dataset,
+    removed_row_ids: &RoaringTreemap,
+) -> Result<(Vec<Fragment>, Vec<u64>)> {
+    let bitmaps = Arc::new(removed_row_ids.bitmaps().collect::<BTreeMap<_, _>>());
+
+    enum FragmentChange {
+        Unchanged,
+        Modified(Box<Fragment>),
+        Removed(u64),
+    }
+
+    let mut updated_fragments = Vec::new();
+    let mut removed_fragments = Vec::new();
+
+    let fragment_ids: Vec<_> = bitmaps.keys().map(|id| u64::from(*id)).collect();
+    let mut stream = futures::stream::iter(dataset.file_fragments_for_ids(&fragment_ids).await?)
+        .map(move |fragment| {
+            let bitmaps_ref = bitmaps.clone();
+            async move {
+                let fragment_id = fragment.id();
+                if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
+                    match fragment.extend_deletions(*bitmap).await {
+                        Ok(Some(new_fragment)) => {
+                            Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
+                        }
+                        Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Ok(FragmentChange::Unchanged)
+                }
+            }
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism());
+
+    while let Some(res) = stream.next().await.transpose()? {
+        match res {
+            FragmentChange::Unchanged => {}
+            FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
+            FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
+        }
+    }
+
+    Ok((updated_fragments, removed_fragments))
+}
 
 fn extract_row_ids(
     row_ids: &mut CapturedRowIds,
