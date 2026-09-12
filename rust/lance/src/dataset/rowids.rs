@@ -112,7 +112,7 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
 ) -> Result<RowAddrTreeMap> {
     let mut row_ids = RowAddrTreeMap::new();
     for (fragment_id, selection) in addrs.iter() {
-        let Some(file_fragment) = dataset.get_fragment(*fragment_id as usize) else {
+        let Some(file_fragment) = dataset.get_fragment_async(*fragment_id as usize).await? else {
             continue;
         };
         let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
@@ -211,7 +211,7 @@ async fn row_addrs_to_row_ids_impl(
 
     let mut ids: Vec<Option<u64>> = vec![None; addrs.len()];
     for (fragment_id, positions) in positions_by_fragment {
-        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+        let Some(fragment) = dataset.get_fragment_async(fragment_id as usize).await? else {
             continue;
         };
         let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
@@ -241,13 +241,10 @@ async fn row_addrs_to_row_ids_impl(
 /// keyed by the fragment's content; the index is keyed by manifest generation
 /// and cannot stand in for it.
 async fn load_row_id_index(dataset: &Dataset) -> Result<RowIdIndex> {
-    // A `for` loop rather than `map`: a closure returning a future that borrows
-    // its argument trips the higher-ranked lifetime check on the outer future.
-    let mut loads = Vec::with_capacity(dataset.manifest.fragments.len());
-    for fragment in dataset.manifest.fragments.iter() {
-        loads.push(read_fragment_row_id_index(dataset, fragment));
-    }
-    let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
+    let fragment_indices: Vec<FragmentRowIdIndex> = dataset
+        .fragment_source()
+        .stream()
+        .map(|fragment| async move { read_fragment_row_id_index(dataset, &fragment?).await })
         .buffer_unordered(dataset.object_store.io_parallelism())
         .try_collect()
         .await?;
@@ -306,6 +303,32 @@ mod test {
             false,
         )]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn row_id_index_propagates_missing_deletion_file() {
+        let batch = sequence_batch(0..10);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id < 2").await.unwrap();
+        let fragment = &dataset.manifest.fragments[0];
+        let path = lance_table::io::deletion::deletion_file_path(
+            &dataset.base,
+            fragment.id,
+            fragment.deletion_file.as_ref().unwrap(),
+        );
+        dataset.object_store.delete(&path).await.unwrap();
+        let error = load_row_id_index(&dataset).await.unwrap_err();
+        assert!(matches!(error, Error::NotFound { .. }), "{error}");
+        assert!(error.to_string().contains(path.filename().unwrap()));
     }
 
     #[tokio::test]

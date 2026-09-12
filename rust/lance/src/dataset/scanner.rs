@@ -94,6 +94,7 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
+use super::fragment_source::FragmentSource;
 use super::versions;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::row_offsets_to_row_addresses;
@@ -1388,13 +1389,21 @@ impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
+        // Late materialization takes deferred columns by row id through the
+        // manifest fragment list. A lazily loaded fragment metadata table has
+        // no such list yet, so every projected column is read in the scan itself.
+        let materialization_style = if dataset.lazy_fragments.is_some() {
+            MaterializationStyle::AllEarly
+        } else {
+            MaterializationStyle::Heuristic
+        };
         let mut scanner = Self {
             dataset,
             projection_plan,
             blob_handling: BlobHandling::default(),
             prefilter: false,
             external_row_mask: None,
-            materialization_style: MaterializationStyle::Heuristic,
+            materialization_style,
             filter: LanceFilter::default(),
             full_text_query: None,
             batch_size: None,
@@ -2944,10 +2953,14 @@ impl Scanner {
             // This tests if any of the fragments are missing the physical_rows property (old style)
             // If they are then we cannot use scalar indices
             if filter_plan.index_query.is_some() {
+                let dataset_fragments = self
+                    .dataset
+                    .fragment_source()
+                    .materialized("scalar index planning")?;
                 let fragments = if let Some(fragments) = self.fragments.as_ref() {
                     fragments
                 } else {
-                    self.dataset.fragments()
+                    dataset_fragments.as_ref()
                 };
                 let mut has_missing_row_count = false;
                 for frag in fragments {
@@ -3096,6 +3109,15 @@ impl Scanner {
         log::trace!("creating scanner plan");
         self.validate_options()?;
 
+        if self.dataset.lazy_fragments.is_some()
+            && (self.full_text_query.is_some()
+                || self.nearest.as_ref().is_some_and(|query| query.use_index))
+        {
+            return Err(Error::not_supported(
+                "Indexed search requires a materialized Dataset; call LazyDataset::into_dataset",
+            ));
+        }
+
         let full_text_query = match &self.full_text_query {
             Some(query) => Some(self.resolve_full_text_search_query(query).await?),
             None => None,
@@ -3117,6 +3139,12 @@ impl Scanner {
         let mut filter_plan = self
             .create_filter_plan(use_scalar_index, query_filter, fts_document_granularity)
             .await?;
+
+        if self.dataset.lazy_fragments.is_some() && filter_plan.expr_filter_plan.has_index_query() {
+            return Err(Error::not_supported(
+                "Indexed scan requires a materialized Dataset; call LazyDataset::into_dataset",
+            ));
+        }
 
         let mut use_limit_node = true;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
@@ -3325,7 +3353,10 @@ impl Scanner {
         scan_range: Option<Range<u64>>,
         is_prefilter: bool,
     ) -> Result<PlannedFilteredScan> {
-        let fragments = fragments.unwrap_or(self.dataset.fragments().clone());
+        let fragments = match fragments {
+            Some(fragments) => FragmentSource::Manifest(fragments),
+            None => self.dataset.fragment_source(),
+        };
         let mut filter_pushed_down = false;
 
         let plan: Arc<dyn ExecutionPlan> = if filter_plan.has_index_query() {
@@ -3334,6 +3365,7 @@ impl Scanner {
                     "Cannot include deleted rows in a scalar indexed scan".into(),
                 ));
             }
+            let fragments = fragments.materialized("scalar indexed scan")?;
             self.scalar_indexed_scan(projection, filter_plan, fragments)
                 .await
         } else if !is_prefilter
@@ -3673,6 +3705,9 @@ impl Scanner {
             }
             TakeOperation::RowAddrs(addrs) => self.row_addrs_as_take_input(addrs).await,
             TakeOperation::RowOffsets(offsets) => {
+                self.dataset
+                    .fragment_source()
+                    .materialized("take by row offset")?;
                 let mut addrs =
                     row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
@@ -5672,7 +5707,7 @@ impl Scanner {
                 false,
                 false,
                 vector_scan_projection,
-                Arc::new(fallback_fragments),
+                Arc::new(fallback_fragments).into(),
                 // Can't pushdown limit/offset in an ANN search
                 None,
                 // We are re-ordering anyways, so no need to get data in a deterministic order.
@@ -6190,9 +6225,9 @@ impl Scanner {
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
-            Arc::new(fragment.clone())
+            FragmentSource::Manifest(Arc::new(fragment.clone()))
         } else {
-            self.dataset.fragments().clone()
+            self.dataset.fragment_source()
         };
         let ordered = if self.ordering.is_some() || self.nearest.is_some() {
             // If we are sorting the results there is no need to scan in order
@@ -6222,11 +6257,11 @@ impl Scanner {
         with_row_created_at_version: bool,
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
-        fragments: Arc<Vec<Fragment>>,
+        fragments: FragmentSource,
         range: Option<Range<u64>>,
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
-        log::trace!("scan_fragments covered {} fragments", fragments.len());
+        log::trace!("scan_fragments covered {:?}", fragments);
         let config = LanceScanConfig {
             batch_size: self.get_batch_size(),
             batch_readahead: self.batch_readahead,
@@ -6273,7 +6308,9 @@ impl Scanner {
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
             Arc::new(fragment.clone())
         } else {
-            self.dataset.fragments().clone()
+            self.dataset
+                .fragment_source()
+                .materialized("pushdown scan")?
         };
 
         Ok(Arc::new(LancePushdownScanExec::try_new(

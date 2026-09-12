@@ -451,7 +451,7 @@ pub(super) async fn add_columns(
             dataset,
             transforms,
             read_columns,
-            &dataset.get_fragments(),
+            &dataset.get_fragments_async().await?,
             batch_size,
         )
         .await?;
@@ -937,7 +937,7 @@ pub(super) async fn alter_columns(
         };
         let mapper = Box::new(mapper);
 
-        let source_fragments = dataset.get_fragments();
+        let source_fragments = dataset.get_fragments_async().await?;
         let original_file_counts = source_fragments
             .iter()
             .map(|fragment| (fragment.id() as u64, fragment.metadata.files.len()))

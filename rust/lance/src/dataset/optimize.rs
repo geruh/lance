@@ -103,7 +103,7 @@ use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
-use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
+use crate::io::commit::migrate_fragments;
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
@@ -762,7 +762,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
-        let fragments = dataset.get_fragments();
+        let fragments = dataset.get_fragments_async().await?;
 
         debug_assert!(
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
@@ -2266,25 +2266,18 @@ async fn reserve_fragment_ids(
         None,
     );
 
-    let (manifest, _) = commit_transaction(
-        dataset,
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &transaction,
-        &Default::default(),
-        &Default::default(),
-        DEFAULT_COMMIT_RETRY_TIMEOUT,
-        dataset.manifest_location.naming_scheme,
-        None,
-    )
-    .await?;
+    let mut committed = dataset.clone();
+    committed
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
+    let manifest = &committed.manifest;
 
     // Need +1 since max_fragment_id is inclusive in this case and ranges are exclusive
-    let new_max_exclusive = manifest.max_fragment_id.unwrap_or(0) + 1;
-    let reserved_ids = (new_max_exclusive - fragments.len() as u32)..(new_max_exclusive);
+    let new_max_exclusive = u64::from(manifest.max_fragment_id.unwrap_or(0)) + 1;
+    let reserved_ids = (new_max_exclusive - fragments.len() as u64)..new_max_exclusive;
 
     for (fragment, new_id) in fragments.zip(reserved_ids) {
-        fragment.id = new_id as u64;
+        fragment.id = new_id;
     }
 
     Ok(())

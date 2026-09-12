@@ -674,6 +674,8 @@ mod differential;
 mod gate_tests;
 #[cfg(test)]
 mod publication_tests;
+#[cfg(test)]
+mod scan_tests;
 
 #[cfg(test)]
 mod tests {

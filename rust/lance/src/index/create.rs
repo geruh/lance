@@ -155,6 +155,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
+        self.dataset.hydrate_fragments_for_maintenance().await?;
         self.execute_uncommitted_impl().await
     }
 
@@ -624,6 +625,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     async fn execute(mut self) -> Result<IndexMetadata> {
+        self.dataset.hydrate_fragments_for_maintenance().await?;
         // Multi-segment FM-Index path: when num_segments > 1, build one segment
         // per fragment group and commit them all atomically.
         if let Some(num_segments) = self.fmindex_num_segments()

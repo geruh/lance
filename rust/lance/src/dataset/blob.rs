@@ -4398,7 +4398,8 @@ async fn resolve_blob_read_location(
     }
 
     let frag = dataset
-        .get_fragment(frag_id as usize)
+        .get_fragment_async(frag_id as usize)
+        .await?
         .ok_or_else(|| Error::internal("Fragment not found".to_string()))?;
     let data_file = frag
         .data_file_for_field(blob_field_id)
