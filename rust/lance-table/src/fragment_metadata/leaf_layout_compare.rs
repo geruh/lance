@@ -5,7 +5,20 @@
 //!
 //! Compares flat and nested leaf layouts. Nested files are not a voted leaf
 //! format. Reports encoded bytes, encode-time Arrow batch memory, decoded
-//! Arrow batch memory, and interned fragment heap separately.
+//! Arrow batch memory, interned fragment heap, and a matched projection of
+//! fragment ID plus file field IDs.
+//!
+//! Production leaf reads use [`SmallReader`]: one GET of the whole object.
+//! Projection also reports range-GET bytes through the generic file opener,
+//! which is not the production leaf path.
+//!
+//! Reproduce at the default 1 MiB leaf budget:
+//!
+//! ```text
+//! cargo test -p lance-table --profile release-with-debug --lib \
+//!   fragment_metadata::leaf_layout_compare::leaf_layouts_at_default_leaf_budget \
+//!   -- --ignored --nocapture
+//! ```
 
 #![allow(clippy::print_stdout)]
 
@@ -17,8 +30,8 @@ use arrow_array::builder::{Int32Builder, ListBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, UInt32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, RecordBatch, StringArray,
-    StructArray, UInt8Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, Int32Array, RecordBatch,
+    StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -36,8 +49,10 @@ use lance_file::versions::create_writer;
 use lance_file::writer::FileWriterOptions;
 use lance_io::ReadBatchParams;
 use lance_io::object_reader::SmallReader;
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
+use lance_io::utils::tracking_store::IOTracker;
 use object_store::path::Path;
 use object_store::{PutOptions, PutPayload};
 use prost::Message;
@@ -46,6 +61,7 @@ use serde_json::json;
 use crate::format::pb;
 use crate::format::{DataFile, DataFileFieldInterner, Fragment, RowDatasetVersionMeta};
 use crate::fragment_metadata::action;
+use crate::fragment_metadata::node::DEFAULT_MAX_LEAF_BYTES;
 use crate::fragment_metadata::store::get_whole;
 use crate::fragment_metadata::support::{data_file_path, make_backfill_data_file};
 
@@ -53,6 +69,40 @@ const FILE_VERSION: ConcreteFileVersion = ConcreteFileVersion::V2_1;
 const ROW_KIND_FRAGMENT: u8 = 0;
 const ROW_KIND_DATA_FILE: u8 = 1;
 const DISABLE_PHYSICAL_DICTIONARY: &str = "1000000000";
+
+#[derive(Clone, Copy)]
+enum LeafReader {
+    /// Production leaf path: one GET of the whole object.
+    Small,
+    /// Generic Lance file opener. Range GETs; 64 KiB blocks on memory://.
+    Range,
+}
+
+struct LeafRead {
+    batch: RecordBatch,
+    read_bytes: u64,
+    read_iops: u64,
+}
+
+struct Projected {
+    columns: &'static [&'static str],
+    ns: u128,
+    arrow_bytes: usize,
+    rows: usize,
+    small_read_bytes: u64,
+    small_read_iops: u64,
+    range_ns: u128,
+    range_arrow_bytes: usize,
+    range_read_bytes: u64,
+    range_read_iops: u64,
+}
+
+fn project_columns(layout: Layout) -> &'static [&'static str] {
+    match layout {
+        Layout::Flat => &["frag_id", "field_ids"],
+        Layout::Nested => &["id", "files.item.field_ids"],
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Layout {
@@ -95,6 +145,17 @@ pub(super) fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn git_head() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn int_list_type() -> DataType {
@@ -497,20 +558,47 @@ async fn write_lance(batch: &RecordBatch) -> Result<Bytes> {
     get_whole(&memory, &path).await
 }
 
-async fn read_lance(bytes: Bytes, columns: Option<&[&str]>) -> Result<RecordBatch> {
-    let store = ObjectStore::memory();
+async fn tracked_memory() -> Result<(Arc<ObjectStore>, IOTracker)> {
+    let io = IOTracker::default();
+    let (store, _) = ObjectStore::from_uri_and_params(
+        Arc::new(ObjectStoreRegistry::default()),
+        "memory://",
+        &ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(io.clone())),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok((store, io))
+}
+
+async fn read_lance(
+    bytes: Bytes,
+    columns: Option<&[&str]>,
+    reader: LeafReader,
+) -> Result<LeafRead> {
+    let (store, io) = tracked_memory().await?;
     let path = Path::from("encoded-leaf");
     let size = bytes.len();
     store
         .inner
         .put_opts(&path, PutPayload::from(bytes), PutOptions::default())
         .await?;
-    let store = Arc::new(store);
+    let _write = io.incremental_stats();
     let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
-    let object_reader = Arc::new(SmallReader::new(store.inner.clone(), path, 3, size));
-    let file_scheduler = scheduler.open_reader(object_reader);
+    let file_scheduler = match reader {
+        LeafReader::Small => {
+            let object_reader = Arc::new(SmallReader::new(store.inner.clone(), path, 3, size));
+            scheduler.open_reader(object_reader)
+        }
+        LeafReader::Range => {
+            scheduler
+                .open_file(&path, &CachedFileSize::new(size as u64))
+                .await?
+        }
+    };
     let cache = LanceCache::with_capacity(64 * 1024 * 1024);
-    let reader = FileReader::try_open(
+    let file_reader = FileReader::try_open(
         file_scheduler,
         None,
         Arc::<DecoderPlugins>::default(),
@@ -522,10 +610,10 @@ async fn read_lance(bytes: Bytes, columns: Option<&[&str]>) -> Result<RecordBatc
         Some(names) => {
             let projection = lance_file::versions::reader_projection_from_column_names(
                 FILE_VERSION,
-                reader.schema(),
+                file_reader.schema(),
                 names,
             )?;
-            reader
+            file_reader
                 .read_stream_projected(
                     ReadBatchParams::RangeFull,
                     16 * 1024,
@@ -536,7 +624,7 @@ async fn read_lance(bytes: Bytes, columns: Option<&[&str]>) -> Result<RecordBatc
                 .await?
         }
         None => {
-            reader
+            file_reader
                 .read_stream(
                     ReadBatchParams::RangeFull,
                     16 * 1024,
@@ -550,10 +638,13 @@ async fn read_lance(bytes: Bytes, columns: Option<&[&str]>) -> Result<RecordBatc
     while let Some(batch) = stream.try_next().await? {
         batches.push(batch);
     }
-    Ok(arrow::compute::concat_batches(
-        &batches[0].schema(),
-        &batches,
-    )?)
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
+    let stats = io.incremental_stats();
+    Ok(LeafRead {
+        batch,
+        read_bytes: stats.read_bytes,
+        read_iops: stats.read_iops,
+    })
 }
 
 fn decode_flat(batch: &RecordBatch, intern: bool) -> Vec<Fragment> {
@@ -734,30 +825,103 @@ async fn reconstruct(
     intern: bool,
 ) -> Result<(Vec<Fragment>, u128, usize)> {
     let started = Instant::now();
-    let batch = read_lance(bytes, None).await?;
+    let read = read_lance(bytes, None, LeafReader::Small).await?;
     let fragments = match spec.layout {
-        Layout::Flat => decode_flat(&batch, intern),
-        Layout::Nested => decode_nested(&batch, intern),
+        Layout::Flat => decode_flat(&read.batch, intern),
+        Layout::Nested => decode_nested(&read.batch, intern),
     };
     Ok((
         fragments,
         started.elapsed().as_nanos(),
-        batch_memory(&batch),
+        batch_memory(&read.batch),
     ))
 }
 
-async fn project(bytes: Bytes, spec: EncodeSpec) -> Result<(u128, usize, usize)> {
-    let columns: &[&str] = match spec.layout {
-        Layout::Flat => &["frag_id", "field_ids"],
-        Layout::Nested => &["files"],
-    };
+async fn project(bytes: Bytes, spec: EncodeSpec) -> Result<Projected> {
+    let columns = project_columns(spec.layout);
     let started = Instant::now();
-    let batch = read_lance(bytes, Some(columns)).await?;
+    let small = read_lance(bytes.clone(), Some(columns), LeafReader::Small).await?;
+    let ns = started.elapsed().as_nanos();
+    let started = Instant::now();
+    let range = read_lance(bytes, Some(columns), LeafReader::Range).await?;
+    Ok(Projected {
+        columns,
+        ns,
+        arrow_bytes: batch_memory(&small.batch),
+        rows: small.batch.num_rows(),
+        small_read_bytes: small.read_bytes,
+        small_read_iops: small.read_iops,
+        range_ns: started.elapsed().as_nanos(),
+        range_arrow_bytes: batch_memory(&range.batch),
+        range_read_bytes: range.read_bytes,
+        range_read_iops: range.read_iops,
+    })
+}
+
+/// Reconstruct one fragment after a full leaf read. This is not a smaller GET.
+/// Production `read_leaf` also streams `RangeFull`.
+async fn select_fragment(
+    bytes: Bytes,
+    spec: EncodeSpec,
+    frag_id: u64,
+) -> Result<(Fragment, u128, usize, usize)> {
+    let started = Instant::now();
+    let read = read_lance(bytes, None, LeafReader::Small).await?;
+    let batch = read.batch;
+    let ids = match spec.layout {
+        Layout::Flat => batch["frag_id"].as_primitive::<UInt64Type>(),
+        Layout::Nested => batch["id"].as_primitive::<UInt64Type>(),
+    };
+    let mask = BooleanArray::from(
+        (0..batch.num_rows())
+            .map(|row| ids.value(row) == frag_id)
+            .collect::<Vec<_>>(),
+    );
+    let selected = arrow::compute::filter_record_batch(&batch, &mask)?;
+    let fragments = match spec.layout {
+        Layout::Flat => decode_flat(&selected, true),
+        Layout::Nested => decode_nested(&selected, true),
+    };
+    let fragment = fragments
+        .into_iter()
+        .next()
+        .ok_or_else(|| lance_core::Error::internal("selected fragment missing after filter"))?;
     Ok((
+        fragment,
         started.elapsed().as_nanos(),
-        batch_memory(&batch),
-        batch.num_rows(),
+        batch_memory(&selected),
+        selected.num_rows(),
     ))
+}
+
+async fn fragments_near_leaf_budget(columns: u32, adds: u64, target: u64) -> Result<Vec<Fragment>> {
+    let spec = EncodeSpec {
+        layout: Layout::Flat,
+        mapping: Mapping::RepeatedList,
+        physical_dictionary: true,
+    };
+    let mut low = 1u64;
+    let mut high = 32u64;
+    loop {
+        let fragments = wide_fragments(high, columns, adds);
+        let (bytes, _, _) = encode_bytes(&fragments, spec).await?;
+        if bytes.len() as u64 >= target || high >= 100_000 {
+            break;
+        }
+        low = high;
+        high = high.saturating_mul(2);
+    }
+    while low + 1 < high {
+        let mid = low + (high - low) / 2;
+        let fragments = wide_fragments(mid, columns, adds);
+        let (bytes, _, _) = encode_bytes(&fragments, spec).await?;
+        if bytes.len() as u64 >= target {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    Ok(wide_fragments(high, columns, adds))
 }
 
 fn specs() -> Vec<EncodeSpec> {
@@ -836,8 +1000,11 @@ async fn measure_workload(name: &str, fragments: &[Fragment]) -> Result<()> {
         let bytes = write_lance(&batch).await?;
         let encode_ns = started.elapsed().as_nanos() + build_ns;
         let encoded_bytes = bytes.len();
-        let (project_ns, projected_arrow_bytes, projected_rows) =
-            project(bytes.clone(), spec).await?;
+        let projected = project(bytes.clone(), spec).await?;
+        let target_id = fragments[fragments.len() / 2].id;
+        let (selected, select_ns, selected_arrow_bytes, selected_rows) =
+            select_fragment(bytes.clone(), spec, target_id).await?;
+        assert_eq!(selected, fragments[fragments.len() / 2], "{}", spec.label());
         for intern in [false, true] {
             let (decoded, decode_ns, decoded_arrow_bytes) =
                 reconstruct(bytes.clone(), spec, intern).await?;
@@ -857,14 +1024,97 @@ async fn measure_workload(name: &str, fragments: &[Fragment]) -> Result<()> {
                     "decode_ns": decode_ns,
                     "decode_arrow_bytes": decoded_arrow_bytes,
                     "decoded_fragment_bytes": decoded.deep_size_of(),
-                    "project_ns": project_ns,
-                    "projected_arrow_bytes": projected_arrow_bytes,
-                    "projected_rows": projected_rows,
+                    "project_columns": projected.columns,
+                    "project_ns": projected.ns,
+                    "projected_arrow_bytes": projected.arrow_bytes,
+                    "projected_rows": projected.rows,
+                    "project_small_read_bytes": projected.small_read_bytes,
+                    "project_small_read_iops": projected.small_read_iops,
+                    "project_range_ns": projected.range_ns,
+                    "project_range_arrow_bytes": projected.range_arrow_bytes,
+                    "project_range_read_bytes": projected.range_read_bytes,
+                    "project_range_read_iops": projected.range_read_iops,
+                    "select_frag_id": target_id,
+                    "select_ns": select_ns,
+                    "selected_arrow_bytes": selected_arrow_bytes,
+                    "selected_rows": selected_rows,
+                    "select_io": "range_full_leaf",
                 })
             );
         }
     }
     Ok(())
+}
+
+fn nested_projected_field_ids(batch: &RecordBatch, row: usize) -> Vec<Vec<i32>> {
+    let files = batch["files"].as_list::<i32>();
+    let files_array = files.value(row);
+    let files_struct = files_array.as_struct();
+    assert_eq!(
+        files_struct.num_columns(),
+        1,
+        "nested projection must keep only files.item.field_ids"
+    );
+    let field_ids = files_struct
+        .column_by_name("field_ids")
+        .expect("files.item.field_ids");
+    (0..files_struct.len())
+        .map(|file_row| list_i32_at(field_ids, file_row))
+        .collect()
+}
+
+#[tokio::test]
+async fn projects_fragment_id_and_file_field_ids() {
+    let fragments = wide_fragments(3, 4, 1);
+    for spec in writable_specs() {
+        let (bytes, _, _) = encode_bytes(&fragments, spec).await.unwrap();
+        let columns = project_columns(spec.layout);
+        let read = read_lance(bytes, Some(columns), LeafReader::Small)
+            .await
+            .unwrap();
+        match spec.layout {
+            Layout::Flat => {
+                assert_eq!(read.batch.num_columns(), 2, "{}", spec.label());
+                let frag_ids = read.batch["frag_id"].as_primitive::<UInt64Type>();
+                let field_ids = read.batch["field_ids"].as_ref();
+                let mut row = 0;
+                for fragment in &fragments {
+                    assert_eq!(frag_ids.value(row), fragment.id, "{}", spec.label());
+                    assert!(
+                        list_i32_at(field_ids, row).is_empty(),
+                        "FRAGMENT rows carry an empty field_ids list"
+                    );
+                    row += 1;
+                    for file in &fragment.files {
+                        assert_eq!(frag_ids.value(row), fragment.id, "{}", spec.label());
+                        assert_eq!(
+                            list_i32_at(field_ids, row),
+                            file.fields.to_vec(),
+                            "{}",
+                            spec.label()
+                        );
+                        row += 1;
+                    }
+                }
+                assert_eq!(row, read.batch.num_rows(), "{}", spec.label());
+            }
+            Layout::Nested => {
+                assert_eq!(read.batch.num_columns(), 2, "{}", spec.label());
+                let ids = read.batch["id"].as_primitive::<UInt64Type>();
+                assert_eq!(read.batch.num_rows(), fragments.len(), "{}", spec.label());
+                for (row, fragment) in fragments.iter().enumerate() {
+                    assert_eq!(ids.value(row), fragment.id, "{}", spec.label());
+                    let decoded = nested_projected_field_ids(&read.batch, row);
+                    let expected: Vec<Vec<i32>> = fragment
+                        .files
+                        .iter()
+                        .map(|file| file.fields.to_vec())
+                        .collect();
+                    assert_eq!(decoded, expected, "{}", spec.label());
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -913,11 +1163,79 @@ async fn leaf_layouts_compare_encoded_size_and_decode() {
             "columns": columns,
             "adds": adds,
             "build": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "git_head": git_head(),
+            "project_columns_flat": project_columns(Layout::Flat),
+            "project_columns_nested": project_columns(Layout::Nested),
         })
     );
     measure_workload("homogeneous_base", &base).await.unwrap();
     measure_workload("after_adds", &after_adds).await.unwrap();
     measure_workload("timestamp_bump", &timestamp_bump)
+        .await
+        .unwrap();
+}
+
+#[ignore]
+#[tokio::test]
+async fn leaf_layouts_at_default_leaf_budget() {
+    let target = env_u64("LEAF_TARGET", DEFAULT_MAX_LEAF_BYTES);
+    let columns = env_u64("LEAF_C", 100) as u32;
+    let adds = env_u64("LEAF_ADDS", 5);
+    let after_adds = fragments_near_leaf_budget(columns, adds, target)
+        .await
+        .unwrap();
+    let fragment_count = after_adds.len() as u64;
+    let (sized, _, _) = encode_bytes(
+        &after_adds,
+        EncodeSpec {
+            layout: Layout::Flat,
+            mapping: Mapping::RepeatedList,
+            physical_dictionary: true,
+        },
+    )
+    .await
+    .unwrap();
+    let list_batch = encode_flat(
+        &after_adds,
+        EncodeSpec {
+            layout: Layout::Flat,
+            mapping: Mapping::RepeatedList,
+            physical_dictionary: true,
+        },
+    )
+    .unwrap();
+    let dict_batch = encode_flat(
+        &after_adds,
+        EncodeSpec {
+            layout: Layout::Flat,
+            mapping: Mapping::DictionaryList,
+            physical_dictionary: true,
+        },
+    )
+    .unwrap();
+    println!(
+        "LEAF_JSON {}",
+        json!({
+            "kind": "config",
+            "records": "synthetic",
+            "storage": "in-memory",
+            "leaf_budget_bytes": target,
+            "flat_list_encoded_bytes": sized.len(),
+            "fragments": fragment_count,
+            "columns": columns,
+            "adds": adds,
+            "read_batch_rows": 16 * 1024,
+            "dict_in_process_list_arrow_bytes": batch_memory(&list_batch),
+            "dict_in_process_dict_arrow_bytes": batch_memory(&dict_batch),
+            "build": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "git_head": git_head(),
+            "project_columns_flat": project_columns(Layout::Flat),
+            "project_columns_nested": project_columns(Layout::Nested),
+            "note": "select_fragment still RangeFull-reads the leaf. Dictionary-of-lists is in-process Arrow only. project_small_read_bytes is the production SmallReader GET. project_range_read_bytes is column-range IO through the generic opener.",
+        })
+    );
+    measure_workload("after_adds", &after_adds).await.unwrap();
+    measure_workload("timestamp_bump", &with_timestamp(&after_adds))
         .await
         .unwrap();
 }
