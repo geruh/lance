@@ -1072,18 +1072,14 @@ def test_blob_file_zipfile_reads_payload(tmp_path):
     payload = archive.getvalue()
 
     table = pa.table(
-        [pa.array([payload], pa.large_binary())],
-        schema=pa.schema(
-            [
-                pa.field(
-                    "blob",
-                    pa.large_binary(),
-                    metadata={"lance-encoding:blob": "true"},
-                )
-            ]
-        ),
+        {"blob": lance.blob_array([payload])},
+        schema=pa.schema([lance.blob_field("blob")]),
     )
-    ds = lance.write_dataset(table, tmp_path / "zip_blob")
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "zip_blob",
+        data_storage_version="2.2",
+    )
     blob = ds.take_blobs("blob", indices=[0])[0]
     with zipfile.ZipFile(blob) as zf:
         assert zf.read("hello.txt") == b"hello blob"
