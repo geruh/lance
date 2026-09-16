@@ -2231,6 +2231,25 @@ public class DatasetTest {
   }
 
   @Test
+  void testReadUpToFillsAcrossReadAheadBoundary(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testReadUpToFillsAcrossReadAheadBoundary").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 16L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(4);
+      assertEquals(4, first.length);
+      byte[] second = blobFile.readUpTo(20);
+      assertEquals(20, second.length);
+      assertEquals(24L, blobFile.tell());
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      assertArrayEquals(Arrays.copyOfRange(all, 0, 4), first);
+      assertArrayEquals(Arrays.copyOfRange(all, 4, 24), second);
+      blobFile.close();
+    }
+  }
+
+  @Test
   void testSetReadBufferSizeZeroStillReadsPayload(@TempDir Path tempDir) throws Exception {
     String base = tempDir.resolve("testSetReadBufferSizeZeroStillReadsPayload").toString();
     try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {

@@ -1090,8 +1090,8 @@ def test_take_blobs_read_fills_across_buffer_boundary(tmp_path):
 
     blob = ds.take_blobs("blob", indices=[0], buffer_size=16)[0]
     assert blob.read(4) == payload[:4]
-    assert blob.read1(20) == payload[4:16]
-    assert blob.tell() == 16
+    assert blob.read1(20) == payload[4:24]
+    assert blob.tell() == 24
 
 
 def test_take_blobs_text_wrapper_readline(tmp_path):

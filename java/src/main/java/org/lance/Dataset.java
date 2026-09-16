@@ -1942,10 +1942,23 @@ public class Dataset implements Closeable {
 
   private static void setBlobReadBufferSize(List<BlobFile> blobs, long bufferSize)
       throws IOException {
-    for (BlobFile blob : blobs) {
-      if (blob != null) {
-        blob.setReadBufferSize(bufferSize);
+    try {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          blob.setReadBufferSize(bufferSize);
+        }
       }
+    } catch (IOException e) {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          try {
+            blob.close();
+          } catch (IOException closeError) {
+            e.addSuppressed(closeError);
+          }
+        }
+      }
+      throw e;
     }
   }
 

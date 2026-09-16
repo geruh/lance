@@ -1858,23 +1858,27 @@ impl BlobFile {
                 }
                 let remaining = (self.size - *cursor) as usize;
                 let read_len = len.min(remaining);
-                if let Some(hit) = prefetch
+                let prefix = prefetch
                     .as_ref()
-                    .and_then(|p| p.slice_from(*cursor, read_len))
-                {
-                    *cursor += hit.len() as u64;
-                    return Ok(hit);
+                    .and_then(|p| p.slice_from(*cursor, read_len));
+                let prefix_len = prefix.as_ref().map(Bytes::len).unwrap_or(0);
+                if prefix_len == read_len {
+                    *cursor += read_len as u64;
+                    return Ok(prefix.unwrap_or_default());
                 }
 
+                let fetch_cursor = *cursor + prefix_len as u64;
+                let still_need = read_len - prefix_len;
+                let remaining = (self.size - fetch_cursor) as usize;
                 let fetch_len = if *buffer_size == 0 {
-                    read_len
+                    still_need
                 } else {
-                    remaining.min((*buffer_size).max(read_len))
+                    remaining.min((*buffer_size).max(still_need))
                 };
-                let start = self.position.checked_add(*cursor).ok_or_else(|| {
+                let start = self.position.checked_add(fetch_cursor).ok_or_else(|| {
                     Error::invalid_input(format!(
                         "Blob cursor overflowed physical position: base={} cursor={}",
-                        self.position, *cursor
+                        self.position, fetch_cursor
                     ))
                 })?;
                 let end = start.checked_add(fetch_len as u64).ok_or_else(|| {
@@ -1889,17 +1893,25 @@ impl BlobFile {
                     .await?
                     .pop()
                     .unwrap_or_default();
-                let result = data.slice(0..read_len.min(data.len()));
+                let result = data.slice(0..still_need.min(data.len()));
                 if *buffer_size > 0 {
                     *prefetch = Some(BlobPrefetch {
-                        start: *cursor,
+                        start: fetch_cursor,
                         bytes: data,
                     });
                 } else {
                     *prefetch = None;
                 }
-                *cursor += result.len() as u64;
-                Ok(result)
+                *cursor = fetch_cursor + result.len() as u64;
+                match prefix {
+                    Some(hit) => {
+                        let mut out = Vec::with_capacity(hit.len() + result.len());
+                        out.extend_from_slice(&hit);
+                        out.extend_from_slice(&result);
+                        Ok(Bytes::from(out))
+                    }
+                    None => Ok(result),
+                }
             }
         }
     }
@@ -9735,6 +9747,23 @@ mod tests {
         blob.set_buffer_size(8).await.unwrap();
         let next = blob.read_up_to(4).await.unwrap();
         assert_eq!(next.as_ref(), &payload[4..8]);
+        assert_eq!(blob.range_submission_count(), after_fill + 1);
+    }
+
+    #[tokio::test]
+    async fn read_up_to_fills_across_prefetch_boundary() {
+        let payload: Vec<u8> = (0..40).map(|i| i as u8).collect();
+        let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        blob.set_buffer_size(16).await.unwrap();
+
+        let first = blob.read_up_to(4).await.unwrap();
+        assert_eq!(first.as_ref(), &payload[..4]);
+        let after_fill = blob.range_submission_count();
+        let second = blob.read_up_to(20).await.unwrap();
+        assert_eq!(second.as_ref(), &payload[4..24]);
+        assert_eq!(blob.tell().await.unwrap(), 24);
         assert_eq!(blob.range_submission_count(), after_fill + 1);
     }
 
