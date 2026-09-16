@@ -2283,6 +2283,17 @@ public class DatasetTest {
   }
 
   @Test
+  void testSetReadBufferSizeFailureClosesOpenedHandles(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeFailureClosesOpenedHandles").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Arrays.asList(0L, 1L), "blobs");
+      blobs.get(1).close();
+      assertThrows(RuntimeException.class, () -> Dataset.setBlobReadBufferSize(blobs, 1024L));
+      assertThrows(RuntimeException.class, () -> blobs.get(0).readUpTo(1));
+    }
+  }
+
+  @Test
   public void testIndexStatistics(@TempDir Path tempDir) throws Exception {
     Path datasetPath = tempDir.resolve("testIndexStatistics");
 

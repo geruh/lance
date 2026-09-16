@@ -1022,7 +1022,7 @@ def test_take_blobs_sequential_small_reads_reuse_prefetch(tmp_path):
     blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
 
     assert _read_in_8k_chunks(blob) == payload
-    assert blob.inner.range_submission_count() == 2
+    assert blob.inner._range_submission_count() == 2
 
 
 def test_take_blobs_buffer_size_zero_fetches_each_sequential_read(tmp_path):
@@ -1035,7 +1035,7 @@ def test_take_blobs_buffer_size_zero_fetches_each_sequential_read(tmp_path):
     blob = ds.take_blobs("blob", indices=[0], buffer_size=0)[0]
 
     assert _read_in_8k_chunks(blob) == payload
-    assert blob.inner.range_submission_count() == 3
+    assert blob.inner._range_submission_count() == 3
 
 
 def test_take_blobs_seek_inside_prefetch_does_not_refetch(tmp_path):
@@ -1048,10 +1048,10 @@ def test_take_blobs_seek_inside_prefetch_does_not_refetch(tmp_path):
     blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
 
     assert blob.read(100) == payload[:100]
-    after_fill = blob.inner.range_submission_count()
+    after_fill = blob.inner._range_submission_count()
     blob.seek(1000)
     assert blob.read(100) == payload[1000:1100]
-    assert blob.inner.range_submission_count() == after_fill
+    assert blob.inner._range_submission_count() == after_fill
 
 
 def test_take_blobs_seek_outside_prefetch_issues_new_range_submission(tmp_path):
@@ -1064,10 +1064,10 @@ def test_take_blobs_seek_outside_prefetch_issues_new_range_submission(tmp_path):
     blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
 
     assert blob.read(100) == payload[:100]
-    after_fill = blob.inner.range_submission_count()
+    after_fill = blob.inner._range_submission_count()
     blob.seek(33 * 1024)
     assert blob.read(100) == payload[33 * 1024 : 33 * 1024 + 100]
-    assert blob.inner.range_submission_count() == after_fill + 1
+    assert blob.inner._range_submission_count() == after_fill + 1
 
 
 def test_take_blobs_read_fills_across_buffer_boundary(tmp_path):

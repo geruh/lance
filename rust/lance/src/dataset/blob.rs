@@ -1972,7 +1972,8 @@ impl BlobFile {
     /// Number of range-read submissions on this handle's backing object.
     ///
     /// Shared with other handles on the same object. Not a count of
-    /// object-store fetches.
+    /// object-store fetches. Test instrumentation, not a supported metric.
+    #[doc(hidden)]
     pub fn range_submission_count(&self) -> usize {
         self.source.range_submissions.load(Ordering::Relaxed)
     }

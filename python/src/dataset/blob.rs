@@ -134,6 +134,7 @@ impl LanceBlobFile {
             .infer_error()
     }
 
+    #[pyo3(name = "_range_submission_count")]
     pub fn range_submission_count(&self) -> usize {
         self.inner.range_submission_count()
     }
