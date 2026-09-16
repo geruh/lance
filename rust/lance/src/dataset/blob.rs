@@ -1957,9 +1957,9 @@ impl BlobFile {
         }
     }
 
-    /// Number of [`BlobSource::read_ranges`] calls on this handle's source.
+    /// Number of range-read submissions on this handle's backing object.
     ///
-    /// Shared with other handles on the same backing object. Not a count of
+    /// Shared with other handles on the same object. Not a count of
     /// object-store fetches.
     pub fn range_submission_count(&self) -> usize {
         self.source.range_submissions.load(Ordering::Relaxed)
