@@ -32,8 +32,8 @@ _BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
     b"lance-encoding:blob-pack-file-size-threshold"
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
+# Default sequential read-ahead size in bytes.
 DEFAULT_BLOB_BUFFER_SIZE = 4 * 1024 * 1024
-"""Default sequential read-ahead size in bytes."""
 
 
 @dataclass(frozen=True)
