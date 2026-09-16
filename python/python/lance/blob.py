@@ -33,6 +33,7 @@ _BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
 DEFAULT_BLOB_BUFFER_SIZE = 4 * 1024 * 1024
+"""Default sequential read-ahead size in bytes."""
 
 
 @dataclass(frozen=True)
@@ -389,8 +390,8 @@ class BlobColumn:
 class BlobFile(io.BufferedIOBase):
     """Represents a blob in a Lance dataset as a file-like object.
 
-    Sequential reads are buffered. ``read_range`` and ``read_ranges`` do not
-    use that buffer and do not change the sequential cursor.
+    ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+    do not change the sequential cursor.
 
     Obtain a handle from :py:meth:`lance.dataset.Dataset.take_blobs`.
     """
@@ -402,15 +403,11 @@ class BlobFile(io.BufferedIOBase):
     ):
         super().__init__()
         self.inner = inner
-        self._buffer_size = _validate_buffer_size(buffer_size)
+        self.inner.set_buffer_size(_validate_buffer_size(buffer_size))
         self._raw = _RawBlobFile(inner)
-        self._reader: Optional[io.BufferedReader] = None
 
     def close(self) -> None:
-        if self._reader is not None:
-            self._reader.close()
-        else:
-            self._raw.close()
+        self._raw.close()
 
     @property
     def closed(self) -> bool:
@@ -420,16 +417,12 @@ class BlobFile(io.BufferedIOBase):
         return True
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        if self._reader is not None:
-            return self._reader.seek(offset, whence)
         return self._raw.seek(offset, whence)
 
     def seekable(self) -> bool:
         return True
 
     def tell(self) -> int:
-        if self._reader is not None:
-            return self._reader.tell()
         return self._raw.tell()
 
     def size(self) -> int:
@@ -439,19 +432,50 @@ class BlobFile(io.BufferedIOBase):
         return self._raw.size()
 
     def read(self, size: int = -1) -> bytes:
-        return self._sequential_reader().read(size)
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            return self._raw.readall()
+        if size == 0:
+            return b""
+        buf = bytearray(size)
+        n = self.readinto(buf)
+        if n == size:
+            return bytes(buf)
+        return bytes(buf[:n])
 
     def read1(self, size: int = -1) -> bytes:
-        reader = self._sequential_reader()
-        if self._buffer_size == 0:
-            return reader.read(size)
-        return reader.read1(size)
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            size = io.DEFAULT_BUFFER_SIZE
+        return self._raw.read(size)
 
     def readall(self) -> bytes:
-        return self._sequential_reader().read(-1)
+        if self.closed:
+            raise ValueError("read of closed file")
+        return self._raw.readall()
 
     def readinto(self, b) -> int:
-        return self._sequential_reader().readinto(b)
+        if isinstance(b, bytearray):
+            if self.closed:
+                raise ValueError("readinto of closed file")
+            if not b:
+                return 0
+            n = self._raw.readinto(b)
+            if n == 0 or n == len(b):
+                return n
+            return n + self._refill_readinto(memoryview(b)[n:])
+
+        view = memoryview(b).cast("B")
+        if view.readonly:
+            raise TypeError(
+                "readinto() argument must be read-write bytes-like object, "
+                f"not {type(b).__name__}"
+            )
+        if self.closed:
+            raise ValueError("readinto of closed file")
+        return self._refill_readinto(view)
 
     def read_range(self, offset: int, length: int) -> bytes:
         """Read a blob-local byte range without changing the current cursor."""
@@ -482,16 +506,18 @@ class BlobFile(io.BufferedIOBase):
     def __repr__(self) -> str:
         return f"<BlobFile size={self.size()}>"
 
-    def _sequential_reader(self) -> Union[io.BufferedReader, "_RawBlobFile"]:
-        if self._buffer_size == 0:
-            return self._raw
-        if self._reader is None:
-            self._reader = io.BufferedReader(self._raw, buffer_size=self._buffer_size)
-        return self._reader
+    def _refill_readinto(self, view) -> int:
+        filled = 0
+        while filled < len(view):
+            n = self._raw.readinto(view[filled:])
+            if n == 0:
+                break
+            filled += n
+        return filled
 
 
 class _RawBlobFile(io.RawIOBase):
-    """Unbuffered blob stream wrapped by :class:`BlobFile`."""
+    """One inner ``read_up_to`` per ``read`` / ``readinto``."""
 
     def __init__(self, inner: LanceBlobFile):
         self.inner = inner
@@ -537,7 +563,7 @@ class _RawBlobFile(io.RawIOBase):
         return self.inner.read_ranges(ranges)
 
     def readinto(self, b) -> int:
-        # BufferedReader passes memoryview; the Rust binding requires bytearray.
+        # The Rust binding requires bytearray.
         if isinstance(b, bytearray):
             return self.inner.read_into(b)
         view = memoryview(b).cast("B")

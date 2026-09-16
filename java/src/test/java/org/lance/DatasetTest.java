@@ -2231,6 +2231,39 @@ public class DatasetTest {
   }
 
   @Test
+  void testSetReadBufferSizeZeroStillReadsPayload(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testSetReadBufferSizeZeroStillReadsPayload").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(2L), "blobs", 0L);
+      BlobFile blobFile = blobs.get(0);
+      byte[] first = blobFile.readUpTo(64);
+      byte[] rest = blobFile.read();
+      blobFile.seek(0);
+      byte[] all = blobFile.read();
+      byte[] combined = new byte[first.length + rest.length];
+      System.arraycopy(first, 0, combined, 0, first.length);
+      System.arraycopy(rest, 0, combined, first.length, rest.length);
+      assertArrayEquals(all, combined);
+      blobFile.close();
+    }
+  }
+
+  @Test
+  void testTakeBlobsRejectsNegativeBufferSizeForEmptySelection(@TempDir Path tempDir)
+      throws Exception {
+    String base =
+        tempDir.resolve("testTakeBlobsRejectsNegativeBufferSizeForEmptySelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 64, 4)) {
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobsByIndices(Collections.emptyList(), "blobs", -1L));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> ds.takeBlobs(Collections.emptyList(), "blobs", -1L));
+    }
+  }
+
+  @Test
   public void testIndexStatistics(@TempDir Path tempDir) throws Exception {
     Path datasetPath = tempDir.resolve("testIndexStatistics");
 

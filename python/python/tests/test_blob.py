@@ -965,61 +965,32 @@ def test_blob_file_read_middle(tmp_path, dataset_with_blobs):
         assert f.read(1) == b"r"
 
 
-def test_blob_file_coalesces_small_sequential_reads():
-    payload = bytes(range(256)) * 160
-    inner = _CountingBlobInner(payload)
+def test_blob_file_buffer_size_configures_inner():
+    inner = _CountingBlobInner(b"x")
     blob = BlobFile(inner, buffer_size=64 * 1024)
 
     assert isinstance(blob, io.BufferedIOBase)
-    assert _read_in_8k_chunks(blob) == payload
-    assert inner.read_sizes == [len(payload)]
+    assert inner.buffer_size == 64 * 1024
 
 
-def test_blob_file_unbuffered_issues_one_read_per_chunk():
-    payload = b"x" * (24 * 1024)
-    inner = _CountingBlobInner(payload)
-    blob = BlobFile(inner, buffer_size=0)
-
-    assert _read_in_8k_chunks(blob) == payload
-    assert inner.read_sizes == [8192, 8192, 8192]
+def test_blob_file_buffer_size_zero_configures_inner():
+    inner = _CountingBlobInner(b"x")
+    BlobFile(inner, buffer_size=0)
+    assert inner.buffer_size == 0
 
 
-def test_blob_file_does_not_buffer_until_sequential_read():
+def test_blob_file_read_range_does_not_issue_sequential_read():
     payload = bytes(range(256))
     inner = _CountingBlobInner(payload)
     blob = BlobFile(inner, buffer_size=64)
 
-    assert blob._reader is None
     assert blob.read_range(1, 3) == payload[1:4]
     assert blob.tell() == 0
-    assert blob._reader is None
+    assert inner.read_sizes == []
     assert blob.read(2) == payload[:2]
-    assert blob._reader is not None
 
 
-def test_blob_file_seek_inside_buffer_does_not_refetch():
-    payload = bytes((i * 31) % 256 for i in range(40 * 1024))
-    inner = _CountingBlobInner(payload)
-    blob = BlobFile(inner, buffer_size=32 * 1024)
-
-    assert blob.read(100) == payload[:100]
-    blob.seek(1000)
-    assert blob.read(100) == payload[1000:1100]
-    assert inner.read_sizes == [32 * 1024]
-
-
-def test_blob_file_seek_outside_buffer_issues_new_read():
-    payload = random.Random(0).randbytes(40 * 1024)
-    inner = _CountingBlobInner(payload)
-    blob = BlobFile(inner, buffer_size=32 * 1024)
-
-    assert blob.read(100) == payload[:100]
-    blob.seek(33 * 1024)
-    assert blob.read(100) == payload[33 * 1024 : 33 * 1024 + 100]
-    assert inner.read_sizes == [32 * 1024, 40 * 1024 - 33 * 1024]
-
-
-def test_blob_file_read_range_after_buffered_read_does_not_move_cursor():
+def test_blob_file_read_range_does_not_move_cursor():
     payload = bytes(range(256)) * 4
     inner = _CountingBlobInner(payload)
     blob = BlobFile(inner, buffer_size=64)
@@ -1039,6 +1010,122 @@ def test_blob_file_text_wrapper_readline(buffer_size):
 
     assert wrapper.readline() == "hello\n"
     assert wrapper.readline() == "world\n"
+
+
+def test_take_blobs_sequential_small_reads_reuse_prefetch(tmp_path):
+    payload = bytes(range(256)) * 160
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seq_prefetch",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
+
+    assert _read_in_8k_chunks(blob) == payload
+    assert blob.inner.range_submission_count() == 2
+
+
+def test_take_blobs_buffer_size_zero_fetches_each_sequential_read(tmp_path):
+    payload = b"x" * (24 * 1024)
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seq_unbuffered",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=0)[0]
+
+    assert _read_in_8k_chunks(blob) == payload
+    assert blob.inner.range_submission_count() == 3
+
+
+def test_take_blobs_seek_inside_prefetch_does_not_refetch(tmp_path):
+    payload = bytes((i * 31) % 256 for i in range(40 * 1024))
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seek_inside",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
+
+    assert blob.read(100) == payload[:100]
+    after_fill = blob.inner.range_submission_count()
+    blob.seek(1000)
+    assert blob.read(100) == payload[1000:1100]
+    assert blob.inner.range_submission_count() == after_fill
+
+
+def test_take_blobs_seek_outside_prefetch_issues_new_range_submission(tmp_path):
+    payload = random.Random(0).randbytes(40 * 1024)
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "seek_outside",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=32 * 1024)[0]
+
+    assert blob.read(100) == payload[:100]
+    after_fill = blob.inner.range_submission_count()
+    blob.seek(33 * 1024)
+    assert blob.read(100) == payload[33 * 1024 : 33 * 1024 + 100]
+    assert blob.inner.range_submission_count() == after_fill + 1
+
+
+def test_take_blobs_read_fills_across_buffer_boundary(tmp_path):
+    payload = bytes(range(40))
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "read_boundary",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=16)[0]
+    assert blob.read(4) == payload[:4]
+    assert blob.read(20) == payload[4:24]
+    assert blob.tell() == 24
+
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=16)[0]
+    assert blob.read(4) == payload[:4]
+    buf = bytearray(20)
+    assert blob.readinto(buf) == 20
+    assert bytes(buf) == payload[4:24]
+
+    blob = ds.take_blobs("blob", indices=[0], buffer_size=16)[0]
+    assert blob.read(4) == payload[:4]
+    assert blob.read1(20) == payload[4:16]
+    assert blob.tell() == 16
+
+
+def test_take_blobs_text_wrapper_readline(tmp_path):
+    payload = b"hello\nworld\n"
+    ds = lance.write_dataset(
+        _complete_blob_table([0], [payload]),
+        tmp_path / "text_wrapper",
+        data_storage_version="2.2",
+    )
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    wrapper = io.TextIOWrapper(blob, encoding="utf-8")
+
+    assert wrapper.readline() == "hello\n"
+    assert wrapper.readline() == "world\n"
+
+
+def test_blob_file_readinto_readonly_does_not_advance_cursor():
+    inner = _CountingBlobInner(b"abcdef")
+    blob = BlobFile(inner, buffer_size=0)
+
+    with pytest.raises(TypeError, match="read-write"):
+        blob.readinto(b"xx")
+    assert blob.tell() == 0
+    assert inner.read_sizes == []
+
+
+def test_blob_file_empty_read_after_close_raises():
+    blob = BlobFile(_CountingBlobInner(b"abcdef"), buffer_size=0)
+    blob.close()
+
+    with pytest.raises(ValueError, match="read of closed file"):
+        blob.read(0)
+    with pytest.raises(ValueError, match="readinto of closed file"):
+        blob.readinto(bytearray())
 
 
 @pytest.mark.parametrize(
@@ -2997,7 +3084,11 @@ class _CountingBlobInner:
         self._payload = payload
         self._pos = 0
         self._closed = False
+        self.buffer_size: int | None = None
         self.read_sizes: list[int] = []
+
+    def set_buffer_size(self, buffer_size: int) -> None:
+        self.buffer_size = buffer_size
 
     def close(self) -> None:
         self._closed = True

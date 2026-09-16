@@ -2347,9 +2347,8 @@ class LanceDataset(pa.dataset.Dataset):
         ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
         payloads with Lance's planned batched reader.
 
-        Sequential reads are buffered, 4 MiB by default. Pass
-        ``buffer_size=0`` for unbuffered reads. ``read_range`` and
-        ``read_ranges`` do not use the sequential buffer.
+        ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+        do not change the sequential cursor.
 
         Exactly one of ids, addresses, or indices must be specified.
 
@@ -2364,7 +2363,7 @@ class LanceDataset(pa.dataset.Dataset):
         indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
         buffer_size : int, default 4 MiB
-            Sequential read buffer size in bytes. ``0`` disables buffering.
+            Sequential read-ahead size in bytes. ``0`` disables read-ahead.
 
         Returns
         -------
