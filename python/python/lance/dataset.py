@@ -2362,7 +2362,7 @@ class LanceDataset(pa.dataset.Dataset):
             The (unstable) row addresses to select in the dataset.
         indices : Integer Array or array-like
             The offset / indices of the row in the dataset.
-        buffer_size : int, default 4 MiB
+        buffer_size : int, default 512 KiB
             Sequential read-ahead size in bytes. ``0`` disables read-ahead.
 
         Returns

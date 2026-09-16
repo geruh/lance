@@ -1597,7 +1597,7 @@ struct BlobReadLocation {
 
 impl BlobFile {
     /// Default sequential read-ahead size in bytes.
-    pub const DEFAULT_READ_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+    pub const DEFAULT_READ_BUFFER_SIZE: usize = 512 * 1024;
 
     fn with_source(
         source: Arc<BlobSource>,
@@ -9656,6 +9656,18 @@ mod tests {
             3,
             "write-param override should force one pack file per blob: {blob_ids:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn default_sequential_buffer_uses_512_kib_windows() {
+        let payload = vec![0xABu8; 1024 * 1024];
+        let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+
+        let got = read_up_to_chunks(blob, 8192).await;
+        assert_eq!(got.as_ref(), payload.as_slice());
+        assert_eq!(blob.range_submission_count(), 2);
     }
 
     #[tokio::test]

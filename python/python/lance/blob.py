@@ -33,7 +33,7 @@ _BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
 # Default sequential read-ahead size in bytes.
-DEFAULT_BLOB_BUFFER_SIZE = 4 * 1024 * 1024
+DEFAULT_BLOB_BUFFER_SIZE = 512 * 1024
 
 
 @dataclass(frozen=True)

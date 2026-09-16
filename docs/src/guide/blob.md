@@ -301,7 +301,7 @@ payloads = table.column("blob").to_pylist()
 
 ### Open file-like blob handles lazily
 
-Sequential reads are buffered, 4 MiB by default. Pass `buffer_size=0`
+Sequential reads are buffered, 512 KiB by default. Pass `buffer_size=0`
 for unbuffered reads. `read_range` and `read_ranges` do not use this
 buffer.
 

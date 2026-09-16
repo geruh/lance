@@ -42,7 +42,7 @@ public final class BlobFile implements Closeable {
   }
 
   /** Default sequential read-ahead size in bytes. */
-  public static final int DEFAULT_READ_BUFFER_SIZE = 4 * 1024 * 1024;
+  public static final int DEFAULT_READ_BUFFER_SIZE = 512 * 1024;
 
   /** Opaque native handle managed by lance-jni. */
   @SuppressWarnings("FieldCanBeLocal")
