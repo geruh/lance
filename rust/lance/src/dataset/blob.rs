@@ -1812,14 +1812,18 @@ impl BlobFile {
                     return Ok(Bytes::new());
                 }
                 let remaining = (self.size - *cursor) as usize;
-                let from_prefetch = prefetch
+                let held = prefetch
                     .as_ref()
-                    .and_then(|window| window.slice_from(*cursor, remaining))
-                    .unwrap_or_default();
-                let bytes = if from_prefetch.len() == remaining {
-                    from_prefetch
-                } else {
-                    self.fetch_remainder(*cursor, from_prefetch).await?
+                    .and_then(|w| w.slice_from(*cursor, remaining));
+                let bytes = match held {
+                    Some(held) if held.len() == remaining => held,
+                    // Joining copies the unread span while the tail is still
+                    // live, so only do it when the tail is no larger than the
+                    // bytes it saves re-fetching.
+                    Some(held) if remaining <= 2 * held.len() => {
+                        self.fetch_after(*cursor, held).await?
+                    }
+                    _ => self.fetch_after(*cursor, Bytes::new()).await?,
                 };
                 *cursor = self.size;
                 *prefetch = None;
@@ -1828,22 +1832,18 @@ impl BlobFile {
         }
     }
 
-    async fn fetch_remainder(&self, cursor: u64, from_prefetch: Bytes) -> Result<Bytes> {
-        let local_start = cursor + from_prefetch.len() as u64;
-        let physical = self.read_phys_range(local_start..self.size)?;
+    async fn fetch_after(&self, cursor: u64, held: Bytes) -> Result<Bytes> {
+        let physical = self.read_phys_range(cursor + held.len() as u64..self.size)?;
         let rest = self
             .source
             .read_ranges(vec![physical])
             .await?
             .pop()
             .unwrap();
-        if from_prefetch.is_empty() {
+        if held.is_empty() {
             return Ok(rest);
         }
-        let mut out = Vec::with_capacity(from_prefetch.len() + rest.len());
-        out.extend_from_slice(&from_prefetch);
-        out.extend_from_slice(&rest);
-        Ok(Bytes::from(out))
+        Ok([held, rest].concat().into())
     }
 
     /// Read up to `len` bytes from the current cursor position
@@ -2008,8 +2008,8 @@ impl BlobFile {
     }
 }
 
-/// Bytes fetched by a sequential [`BlobFile`] read. Valid until the cursor
-/// leaves this span.
+/// Bytes fetched by a sequential [`BlobFile`] read, still valid for later
+/// `read_up_to` calls until the cursor leaves this span.
 #[derive(Debug)]
 struct BlobPrefetch {
     start: u64,
@@ -9691,33 +9691,32 @@ mod tests {
         assert_eq!(blob.range_submission_count(), 2);
     }
 
+    #[rstest]
+    #[case::window_covers_the_rest(4 * 1024 * 1024, 0, 1)]
+    #[case::small_tail_is_appended(64 * 1024, 32 * 1024, 2)]
+    #[case::large_tail_is_read_from_cursor(16 * 1024, 95 * 1024, 2)]
     #[tokio::test]
-    async fn read_after_read_up_to_reuses_prefetch() {
+    async fn read_after_read_up_to_reuses_prefetch(
+        #[case] buffer_size: usize,
+        #[case] fetched: u64,
+        #[case] submissions: usize,
+    ) {
         let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
         let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         let blob = blobs[0].as_ref().unwrap();
-
-        let first = blob.read_up_to(1024).await.unwrap();
-        assert_eq!(first.as_ref(), &payload[..1024]);
-        let rest = blob.read().await.unwrap();
-        assert_eq!(rest.as_ref(), &payload[1024..]);
-        assert_eq!(blob.range_submission_count(), 1);
-        assert_eq!(blob.tell().await.unwrap(), payload.len() as u64);
-    }
-
-    #[tokio::test]
-    async fn read_after_read_up_to_fetches_remainder() {
-        let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 253) as u8).collect();
-        let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
-        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
-        let blob = blobs[0].as_ref().unwrap();
-        blob.set_buffer_size(16 * 1024).await.unwrap();
+        blob.set_buffer_size(buffer_size).await.unwrap();
 
         blob.read_up_to(1024).await.unwrap();
+        let _ = dataset.object_store.io_stats_incremental();
         let rest = blob.read().await.unwrap();
         assert_eq!(rest.as_ref(), &payload[1024..]);
-        assert_eq!(blob.range_submission_count(), 2);
+        assert_eq!(
+            dataset.object_store.io_stats_incremental().read_bytes,
+            fetched
+        );
+        assert_eq!(blob.range_submission_count(), submissions);
+        assert_eq!(blob.tell().await.unwrap(), payload.len() as u64);
     }
 
     #[tokio::test]
