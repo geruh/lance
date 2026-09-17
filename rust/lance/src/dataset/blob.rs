@@ -3,7 +3,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    future::Future,
     ops::{DerefMut, Range},
     panic::AssertUnwindSafe,
     sync::{
@@ -1729,26 +1728,6 @@ impl BlobFile {
         matches!(&*self.state.lock().await, BlobFileState::Closed)
     }
 
-    async fn do_with_cursor<T, Fut: Future<Output = Result<(u64, T)>>, Func: FnOnce(u64) -> Fut>(
-        &self,
-        func: Func,
-    ) -> Result<T> {
-        let mut state = self.state.lock().await;
-        match state.deref_mut() {
-            BlobFileState::Open {
-                cursor, prefetch, ..
-            } => {
-                let (new_cursor, data) = func(*cursor).await?;
-                *cursor = new_cursor;
-                *prefetch = None;
-                Ok(data)
-            }
-            BlobFileState::Closed => Err(Error::invalid_input(
-                "Blob file is already closed".to_string(),
-            )),
-        }
-    }
-
     async fn ensure_open(&self) -> Result<()> {
         let state = self.state.lock().await;
         match &*state {
@@ -1819,23 +1798,52 @@ impl BlobFile {
     /// After this call the cursor will be pointing to the end of
     /// the file.
     pub async fn read(&self) -> Result<bytes::Bytes> {
-        let size = self.size;
-        let source = self.source.clone();
-        let position = self.position;
-        self.do_with_cursor(move |cursor| {
-            let source = source.clone();
-            async move {
-                if cursor >= size {
-                    return Ok((size, Bytes::new()));
+        let mut state = self.state.lock().await;
+        match state.deref_mut() {
+            BlobFileState::Closed => Err(Error::invalid_input(
+                "Blob file is already closed".to_string(),
+            )),
+            BlobFileState::Open {
+                cursor, prefetch, ..
+            } => {
+                if *cursor >= self.size {
+                    *cursor = self.size;
+                    *prefetch = None;
+                    return Ok(Bytes::new());
                 }
-                let physical = (position + cursor)..(position + size);
-                Ok((
-                    size,
-                    source.read_ranges(vec![physical]).await?.pop().unwrap(),
-                ))
+                let remaining = (self.size - *cursor) as usize;
+                let from_prefetch = prefetch
+                    .as_ref()
+                    .and_then(|window| window.slice_from(*cursor, remaining))
+                    .unwrap_or_default();
+                let bytes = if from_prefetch.len() == remaining {
+                    from_prefetch
+                } else {
+                    self.fetch_remainder(*cursor, from_prefetch).await?
+                };
+                *cursor = self.size;
+                *prefetch = None;
+                Ok(bytes)
             }
-        })
-        .await
+        }
+    }
+
+    async fn fetch_remainder(&self, cursor: u64, from_prefetch: Bytes) -> Result<Bytes> {
+        let local_start = cursor + from_prefetch.len() as u64;
+        let physical = self.read_phys_range(local_start..self.size)?;
+        let rest = self
+            .source
+            .read_ranges(vec![physical])
+            .await?
+            .pop()
+            .unwrap();
+        if from_prefetch.is_empty() {
+            return Ok(rest);
+        }
+        let mut out = Vec::with_capacity(from_prefetch.len() + rest.len());
+        out.extend_from_slice(&from_prefetch);
+        out.extend_from_slice(&rest);
+        Ok(Bytes::from(out))
     }
 
     /// Read up to `len` bytes from the current cursor position
@@ -2000,8 +2008,8 @@ impl BlobFile {
     }
 }
 
-/// Bytes fetched by a sequential [`BlobFile`] read, still valid for later
-/// `read_up_to` calls until the cursor leaves this span.
+/// Bytes fetched by a sequential [`BlobFile`] read. Valid until the cursor
+/// leaves this span.
 #[derive(Debug)]
 struct BlobPrefetch {
     start: u64,
@@ -9668,6 +9676,35 @@ mod tests {
 
         let got = read_up_to_chunks(blob, 8192).await;
         assert_eq!(got.as_ref(), payload.as_slice());
+        assert_eq!(blob.range_submission_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn read_after_read_up_to_reuses_prefetch() {
+        let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+        let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+
+        let first = blob.read_up_to(1024).await.unwrap();
+        assert_eq!(first.as_ref(), &payload[..1024]);
+        let rest = blob.read().await.unwrap();
+        assert_eq!(rest.as_ref(), &payload[1024..]);
+        assert_eq!(blob.range_submission_count(), 1);
+        assert_eq!(blob.tell().await.unwrap(), payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn read_after_read_up_to_fetches_remainder() {
+        let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 253) as u8).collect();
+        let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        blob.set_buffer_size(16 * 1024).await.unwrap();
+
+        blob.read_up_to(1024).await.unwrap();
+        let rest = blob.read().await.unwrap();
+        assert_eq!(rest.as_ref(), &payload[1024..]);
         assert_eq!(blob.range_submission_count(), 2);
     }
 
