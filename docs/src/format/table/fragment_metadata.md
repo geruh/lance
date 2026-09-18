@@ -10,7 +10,7 @@
 Support for creating or reading tree tables is not yet available in released
 Lance versions.**
 
-!!! note "Tree tables require feature flag 512, `FLAG_FRAGMENT_METADATA`"
+!!! note "Tree tables require feature flag 4096, `FLAG_FRAGMENT_TREE`"
 
     A reader or writer that does not understand this layout must refuse the
     dataset. The flat `fragments` list is empty on a tree table, so a reader
@@ -20,8 +20,8 @@ In the flat format, each Version Manifest carries the complete fragment list.
 Committing a change and opening a dataset both process that whole list, even
 when the change touches only a few fragments.
 
-The fragment metadata tree stores those records in immutable Lance leaves
-keyed by fragment ID. Validated changes may remain above the leaves as
+The fragment metadata tree (fragment tree) stores those records in immutable
+Lance leaves keyed by fragment ID. Validated changes may remain above the leaves as
 mutations until enough work accumulates to rewrite them.
 
 The Version Manifest defines table-version state. Committing it makes that
@@ -41,7 +41,7 @@ the root and leaves.*
 | Publish | Write immutable tree objects first, then commit the Version Manifest. |
 
 Protobuf messages are in `protos/fragment_metadata.proto`.
-`Manifest.fragment_metadata` is declared in `protos/table.proto`. Operation
+`Manifest.fragment_tree` is declared in `protos/table.proto`. Operation
 semantics, conflict rules, and native validation stay with
 [transactions](transaction.md). A storage action is the result of a successful
 native transaction.
@@ -51,29 +51,32 @@ snapshot.
 
 ## Snapshot
 
-A tree table must set `Manifest.fragment_metadata`, leave `Manifest.fragments`
-empty, and set flag 512 in both `reader_feature_flags` and
-`writer_feature_flags`. These fields must agree. When `FLAG_FRAGMENT_METADATA`
-is set, `FragmentMetadata.layout` must select exactly one recognized layout.
+A tree table must set `Manifest.fragment_tree`, leave `Manifest.fragments`
+empty, and set flag 4096 in both `reader_feature_flags` and
+`writer_feature_flags`. These fields must agree. When `FLAG_FRAGMENT_TREE`
+is set, `FragmentTreeMetadata.layout` must select exactly one recognized layout.
 
 Each version stores fragment records either in the tree or in
 `Manifest.fragments`, never both. A writer may convert a flat table by
 publishing a new tree-backed version. Whether and when to convert is
 writer policy.
 
-A `FragmentMetadataTree` must contain exactly one of an inline root or a
-`root_path`.
+A `FragmentTree` must contain exactly one of an inline root or a
+`root_uuid`.
 
-An inline root carries the complete `FragmentMetadataRoot` in the Version
+An inline root carries the complete `FragmentTreeRoot` in the Version
 Manifest. `mutations_since_root` must be empty.
 
-An external root named by `root_path` belongs to the current dataset.
+An external root named by `root_uuid` belongs to the current dataset.
+`root_uuid` must contain exactly 16 bytes, in the order of the UUID's hexadecimal
+digits. Its path is `_bt/root/{uuid}.root`, with lowercase hexadecimal digits and
+hyphens after digits 8, 12, 16, and 20. Readers must reject any other byte length.
 `mutations_since_root` contains every mutation in this version that is not
 represented by that root. Readers must not follow a mutation chain.
 
 ```
 Version Manifest N
-├─ root_path ──────────► Root R
+├─ root_uuid ──────────► Root R
 └─ mutations_since_root
 
 fragment state N = Root R + mutations_since_root
@@ -94,35 +97,39 @@ and paths outside `_bt/`.
 ```
 {dataset_root}/
     _bt/
-        root/{uuid}.root     FragmentMetadataRoot protobuf
-        node/{uuid}.node     FragmentMetadataNode protobuf
+        root/{uuid}.root     FragmentTreeRoot protobuf
+        node/{uuid}.node     FragmentTreeNode protobuf
         leaf/{uuid}.lance    Lance file of complete fragment records
 ```
 
-A `.root` file is a raw `FragmentMetadataRoot` protobuf. A `.node` file is a
-raw `FragmentMetadataNode` protobuf. Neither has an extra header or footer.
+A `.root` file is a raw `FragmentTreeRoot` protobuf. A `.node` file is a
+raw `FragmentTreeNode` protobuf. Neither has an extra header or footer.
 
-`FragmentMetadataRoot` holds its children, buffer, and `next_action_sequence`.
+`FragmentTreeRoot` holds its children, buffer, and `next_action_sequence`.
 
-`FragmentMetadataNode` holds the child list and a mutation buffer for that
+`FragmentTreeNode` holds the child list and a mutation buffer for that
 subtree.
 
 Child `path` values must be non-empty. Resolved child locations within a child
-list must be unique.
+list must be unique. Equal paths in different datasets name different objects;
+different `base_id` values resolving to the same object do not make it unique.
 
 A leaf is a Lance file of complete fragment records for one fragment-ID range.
 
 ## Object references
 
 The Version Manifest root belongs to the current dataset. It is either an
-inline `FragmentMetadataRoot` or a `root_path` in the current dataset.
+inline `FragmentTreeRoot` or a `root_uuid` in the current dataset.
 
-A `FragmentMetadataChild` contains a `path` relative to its resolved dataset
+A `FragmentTreeChild` contains a `path` relative to its resolved dataset
 and an optional `base_id`.
 
 When `base_id` is set, it must identify a `BasePath` in the Version Manifest
 with `is_dataset_root` set to true. When `base_id` is absent, the reference
 inherits the resolved dataset of the containing tree object.
+Look up entries by `BasePath.id`, not their position in `base_paths`. Zero is a
+valid ID, distinct from an absent `base_id`. IDs must be unique within the
+manifest, and readers must reject an unknown ID.
 
 A child object resolves to `{resolved_dataset}/{path}`. Tree object paths must
 begin with `_bt/` and must not be resolved under `data/`.
@@ -139,6 +146,9 @@ subtrees may be referenced through `base_id`. The clone's `base_paths` must
 contain a `BasePath` for the source dataset root and preserve every `BasePath`
 entry referenced by a shared tree object at the same id. New base paths must
 use previously unused ids.
+If an ID already names a different base, the writer must copy the affected
+objects and remap their references, or reject the operation. It must not change
+the meaning of an ID used by a shared immutable object.
 
 When a tree object is copied into another dataset, references that inherited
 the source dataset must be rewritten with a `base_id` naming that dataset.
@@ -215,8 +225,8 @@ Lance stores the dictionaries. Keys are local to their dictionary array; compare
 decoded vectors, not keys, across arrays, columns, batches, or leaves.
 
 `file_size_bytes` of 0 means unknown. A null `base_id` inherits the leaf
-object's resolved dataset. A set `base_id` indexes this Version Manifest's
-`base_paths`. The same inheritance rule applies to deletion files, overlays,
+object's resolved dataset. A set `base_id` matches `BasePath.id` in this Version
+Manifest's `base_paths`. The same inheritance rule applies to deletion files, overlays,
 and other fragment-owned files. A null `base_id` in a buffered mutation
 inherits the resolved dataset of the structure containing that mutation.
 
@@ -224,7 +234,7 @@ Counts in a leaf are known. `physical_rows` of 0 is zero rows. A deletion file
 must carry `num_deleted_rows`, which must not exceed `physical_rows`.
 
 After decoding a leaf, readers must verify the following fields against its
-parent `FragmentMetadataChild`:
+parent `FragmentTreeChild`:
 
 - `num_keys` equals the number of rows
 - `total_rows` and `visible_rows` equal the counts recomputed from the
@@ -240,7 +250,7 @@ Routing and Sequence numbers, not by recomputing them from the leaf file.
 ## Routing
 
 A root may have zero or more children. With no children, mutations may remain
-in the root `buffer` or `FragmentMetadataTree.mutations_since_root`. Fragment
+in the root `buffer` or `FragmentTree.mutations_since_root`. Fragment
 resolution must not descend to a leaf. Once children exist, they route
 fragment IDs as follows.
 
@@ -299,7 +309,7 @@ checks do not require opening the rest of the tree.
 
 ## Mutations
 
-`FragmentMetadataMutation` wraps one `FragmentAction` with a sequence number
+`FragmentTreeMutation` wraps one `FragmentAction` with a sequence number
 and three count deltas. Every mutation must contain an action. The action must
 select exactly one recognized variant, and any message payload required by
 that variant must be present.
@@ -347,7 +357,7 @@ nothing if there is no leaf or the leaf has no record.
 
 Version fragment count, physical-row count, and visible-row count are derived
 from the root child summaries plus the root buffer deltas, then plus the
-`mutations_since_root` deltas. They are not stored on `FragmentMetadataTree`.
+`mutations_since_root` deltas. They are not stored on `FragmentTree`.
 Derived `visible_rows` must not exceed derived `total_rows`.
 
 ## Sequence numbers
@@ -356,12 +366,12 @@ Mutation sequences must be nonzero and unique.
 Each tree has one sequence namespace. Writers must not reuse a sequence number
 anywhere in the tree.
 
-- `FragmentMetadataRoot.next_action_sequence` is at least 1. Every sequence in
+- `FragmentTreeRoot.next_action_sequence` is at least 1. Every sequence in
   the root buffer, in every interior buffer below it, and every leaf watermark
   below it must be less than this value.
-- `FragmentMetadataTree.next_action_sequence` is at least the root's value.
+- `FragmentTree.next_action_sequence` is at least the root's value.
   Every `mutations_since_root` sequence must be at or above the root's value
-  and below `FragmentMetadataTree.next_action_sequence`.
+  and below `FragmentTree.next_action_sequence`.
 - A leaf watermark of 0 means the leaf has applied nothing, so every mutation
   routed to it replays.
 
@@ -407,12 +417,23 @@ not treat a corrupt snapshot as empty.
 
 | Object | Additional checks |
 |---|---|
-| Manifest | Feature flags set, `fragments` empty, `fragment_metadata` present, layout selected |
-| `FragmentMetadataTree` | Exactly one root representation, sequence range valid, tree object references valid, no target above `max_fragment_id` |
+| Manifest | Feature flags set, `fragments` empty, `fragment_tree` present, layout selected |
+| `FragmentTree` | Exactly one root representation, sequence range valid, tree object references valid, no target above `max_fragment_id` |
 | Root | Children and buffer valid, derived visible rows at most derived total rows |
 | Node / leaf | Fetched byte length equals parent `object_size`. Shape and aggregate fields that can be recomputed from the object agree with the parent child reference. Routing bounds and the leaf watermark follow Routing and Sequence numbers. |
 
 ## Publication and cleanup
+
+Writers compete for the next dataset version, even when changing different
+fragments. A writer that loses the version race must check intervening
+transactions and rebase compatible changes before retrying. Incompatible
+changes fail under the normal transaction rules.
+
+A retry may read the new manifest, transaction history, and affected tree
+objects, then write a transaction record, tree objects, and a new manifest.
+If changes fit in `mutations_since_root`, the external root can be reused without
+rewriting a leaf. Validation, flushing, splitting, or eager loading can require
+additional I/O.
 
 Every tree object reachable from a Version Manifest must be durable before that
 manifest is committed. The manifest commit is the visibility boundary.
@@ -427,9 +448,9 @@ the current dataset. Reused references must preserve their resolved dataset.
 
 Cleanup computes reachability from the fragment state of every
 retained manifest, applying buffers and `mutations_since_root`. The reachable
-set is the `root_path` if any, every `.node` and `.lance` reachable from that
-root after resolving child references, and every data file, deletion file, and
-related object that state names.
+set includes the external root named by `root_uuid`, if any, every `.node` and
+`.lance` reachable from that root after resolving child references, and every
+data file, deletion file, and related object that state names.
 A file named only by a pending mutation is reachable through that resolved
 state. A file named only by a mutation that a later mutation in the same
 snapshot supersedes is not. Objects under this dataset's `_bt/` outside the

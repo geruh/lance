@@ -314,32 +314,34 @@ message ExternalFile {
   uint64 size = 3;
 }
 
-// Fragment metadata layout for this version.
-message FragmentMetadata {
+// Fragment storage layout for this version.
+message FragmentTreeMetadata {
   oneof layout {
-    FragmentMetadataTree tree = 1;
+    FragmentTree tree = 1;
   }
 }
 
 // Fragment state for one Version Manifest.
-message FragmentMetadataTree {
+message FragmentTree {
   oneof root {
-    FragmentMetadataRoot inline_root = 1;
-    // External root path relative to this dataset.
-    string root_path = 2;
+    FragmentTreeRoot inline_root = 1;
+    /* Exactly 16 UUID bytes in display order. Resolves under this dataset as
+     * _bt/root/{lowercase hyphenated UUID}.root.
+     */
+    bytes root_uuid = 2;
   }
 
   // Mutations not represented by the selected root.
-  repeated FragmentMetadataMutation mutations_since_root = 3;
+  repeated FragmentTreeMutation mutations_since_root = 3;
 
   // Next unused action sequence for this version.
   uint64 next_action_sequence = 4;
 }
 
 // Inline or external root state.
-message FragmentMetadataRoot {
-  repeated FragmentMetadataChild children = 1;
-  repeated FragmentMetadataMutation buffer = 2;
+message FragmentTreeRoot {
+  repeated FragmentTreeChild children = 1;
+  repeated FragmentTreeMutation buffer = 2;
 
   // First action sequence not represented by this root.
   uint64 next_action_sequence = 3;
@@ -348,11 +350,13 @@ message FragmentMetadataRoot {
 /* Children are ordered by min_key. A child owns [min_key, next min_key);
  * the last child inherits its parent's upper bound.
  */
-message FragmentMetadataChild {
+message FragmentTreeChild {
   // Tree object path relative to its resolved dataset.
   string path = 1;
 
-  // Absent inherits the containing object's dataset. Otherwise indexes Manifest.base_paths.
+  /* Absent inherits the containing object's dataset. Otherwise matches BasePath.id
+   * in Manifest.base_paths; zero is a valid ID.
+   */
   optional uint32 base_id = 2;
 
   /* Inclusive lower bound of this child's fragment-ID range. It need not
@@ -386,13 +390,13 @@ message FragmentMetadataChild {
 }
 
 // Interior routing node.
-message FragmentMetadataNode {
-  repeated FragmentMetadataChild children = 1;
-  repeated FragmentMetadataMutation buffer = 2;
+message FragmentTreeNode {
+  repeated FragmentTreeChild children = 1;
+  repeated FragmentTreeMutation buffer = 2;
 }
 
 // Validated mutation with exact after-minus-before aggregate deltas.
-message FragmentMetadataMutation {
+message FragmentTreeMutation {
   uint64 action_sequence = 1;
   FragmentAction action = 2;
   sint64 fragment_count_delta = 3;
@@ -445,7 +449,7 @@ message ReplaceDataFile {
   string path = 3;
   uint64 file_size_bytes = 4;
   /* Absent inherits the resolved dataset of the tree object or Version Manifest
-   * containing this mutation. Otherwise indexes Manifest.base_paths.
+   * containing this mutation. Otherwise matches BasePath.id in Manifest.base_paths.
    */
   optional uint32 base_id = 5;
 }

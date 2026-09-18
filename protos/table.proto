@@ -44,10 +44,10 @@ message Manifest {
   // Fragments of the dataset.
   repeated DataFragment fragments = 2;
 
-  /* Tree tables set this, leave fragments empty, and set bit 9 on both flag
+  /* Tree tables set this, leave fragments empty, and set bit 12 on both flag
    * fields. Old readers skip unknown fields and would otherwise see an empty table.
    */
-  FragmentMetadata fragment_metadata = 22;
+  FragmentTreeMetadata fragment_tree = 22;
 
   // Snapshot version number.
   uint64 version = 3;
@@ -141,7 +141,7 @@ message Manifest {
    *   instead of treating data_format.version as a snapshot-wide identity.
    *   This bit is paired in the reader and writer feature words and is one-way.
    * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
-   * * 1 << 11: fragment records live in fragment_metadata. The fragments list
+   * * 1 << 12: fragment records live in fragment_tree. The fragments list
    *   must be empty. Readers that do not know this bit must refuse the dataset.
    */
   uint64 reader_feature_flags = 9;
