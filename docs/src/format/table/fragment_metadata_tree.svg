@@ -42,7 +42,7 @@
   <text class="sub" x="172" y="112">not in the referenced root yet</text>
 
   <line class="line" x1="350" y1="134" x2="350" y2="168" marker-end="url(#arrow)"/>
-  <text class="sub" x="362" y="156">root_path</text>
+  <text class="sub" x="362" y="156">root_uuid</text>
 
   <text class="rail" x="16" y="210">EXTERNAL</text>
   <text class="rail" x="16" y="226">ROOT</text>
