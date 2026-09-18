@@ -155,51 +155,70 @@ publication. The write must fail if any such reference cannot be preserved.
 
 ## Leaf format
 
-A leaf is a Lance file with this schema. The tree does not require a specific
-Lance file version.
+A leaf is a Lance file with one row per fragment and the following schema.
+Any Lance file version may be used.
 
 ```python
 import pyarrow as pa
 
-leaf_schema = pa.schema([
-    pa.field("row_kind", pa.uint8(), nullable=False),
-    pa.field("frag_id", pa.uint64(), nullable=False),
-    pa.field("fragment_meta", pa.binary(), nullable=True),
+mapping = pa.dictionary(pa.int32(), pa.binary())
+data_file = pa.struct([
     pa.field("path", pa.utf8(), nullable=False),
-    pa.field("field_ids", pa.list_(pa.field("item", pa.int32(), nullable=False)), nullable=False),
-    pa.field("column_indices", pa.list_(pa.field("item", pa.int32(), nullable=False)), nullable=False),
+    pa.field("field_ids", mapping, nullable=False),
+    pa.field("column_indices", mapping, nullable=False),
     pa.field("major_version", pa.uint32(), nullable=False),
     pa.field("minor_version", pa.uint32(), nullable=False),
     pa.field("file_size_bytes", pa.uint64(), nullable=False),
     pa.field("base_id", pa.uint32(), nullable=True),
 ])
+overlay = pa.struct([
+    pa.field("data_file", data_file, nullable=False),
+    pa.field("overlay_meta", pa.binary(), nullable=False),
+])
+leaf_schema = pa.schema([
+    pa.field("id", pa.uint64(), nullable=False),
+    pa.field("fragment_meta", pa.binary(), nullable=False),
+    pa.field("files", pa.list_(pa.field("item", data_file, nullable=False)), nullable=False),
+    pa.field("overlays", pa.list_(pa.field("item", overlay, nullable=False)), nullable=False),
+])
 ```
 
-The schema must match exactly. Readers must reject different fields, types, or
-nullability. Non-nullable columns and list elements must not hold nulls.
+The schema must match exactly, including field order, types, and nullability.
+Only `base_id` may be null; dictionary values must also be non-null. Empty lists
+represent no files or overlays.
 
-`row_kind` is 0 for a FRAGMENT row and 1 for a DATA_FILE row. Readers must
-reject an unknown `row_kind`.
+Rows must be ordered by strictly increasing `id`. Valid fragment IDs fit in
+`u32`. A fragment must not be split across leaves. Preserve file and overlay
+list order, including duplicate file paths and the overlay precedence defined
+in [Data Overlay Files](data_overlay_file.md).
 
-Rows are grouped by fragment. A group is one FRAGMENT row followed by its
-DATA_FILE rows, in file order. Every row in the group must carry that
-`frag_id`. The FRAGMENT row's `frag_id` must equal the `id` inside
-`fragment_meta`. A fragment with no files is a group of one FRAGMENT row.
-Groups must be ordered by strictly increasing `frag_id`. A fragment must not
-be split across leaves. `frag_id` is stored as `uint64`. Valid fragment IDs
-fit in `u32`.
+`fragment_meta` contains the `DataFragment` protobuf with `id` set to 0 and
+`files` and `overlays` cleared. Readers must reject a nonzero protobuf `id` or
+nonempty `files` or `overlays`, then restore these fields from the row.
+All other fragment fields keep their protobuf representation and semantics.
 
-A FRAGMENT row carries `fragment_meta`, the `DataFragment` protobuf with
-`files` cleared. Its remaining columns are sentinels: empty `path`, empty
-`field_ids` and `column_indices`, version and size 0, and a null `base_id`.
-A DATA_FILE row carries one `DataFile` across those columns and a null
-`fragment_meta`. `file_size_bytes` of 0 means unknown. A null `base_id`
-inherits the leaf object's resolved dataset. A set `base_id` indexes this
-Version Manifest's `base_paths`. The same rule applies to deletion files,
-overlays, and other fragment-owned files.
+Each file struct represents a `DataFile`: `field_ids` maps to `fields`, and
+`major_version` and `minor_version` map to `file_major_version` and
+`file_minor_version`. Other fields use their protobuf names.
 
-A null `base_id` in a buffered mutation inherits the resolved dataset of the
-structure containing that mutation.
+`overlay_meta` contains the `DataOverlayFile` protobuf with `data_file` absent.
+Readers must reject a populated `data_file`, then restore it from the sibling
+struct. Coverage and committed version retain their protobuf semantics.
+
+Each binary dictionary value stores a mapping vector as consecutive little-endian
+signed 32-bit integers, without a length prefix. Empty bytes mean an empty vector.
+Readers must reject lengths not divisible by 4 and out-of-bounds dictionary keys.
+Decoded vectors preserve element order and signed values, and must satisfy the
+`DataFile` mapping rules for that file version.
+
+Lance stores the dictionaries. Keys are local to their dictionary array; compare
+decoded vectors, not keys, across arrays, columns, batches, or leaves.
+
+`file_size_bytes` of 0 means unknown. A null `base_id` inherits the leaf
+object's resolved dataset. A set `base_id` indexes this Version Manifest's
+`base_paths`. The same inheritance rule applies to deletion files, overlays,
+and other fragment-owned files. A null `base_id` in a buffered mutation
+inherits the resolved dataset of the structure containing that mutation.
 
 Counts in a leaf are known. `physical_rows` of 0 is zero rows. A deletion file
 must carry `num_deleted_rows`, which must not exceed `physical_rows`.
@@ -207,7 +226,7 @@ must carry `num_deleted_rows`, which must not exceed `physical_rows`.
 After decoding a leaf, readers must verify the following fields against its
 parent `FragmentMetadataChild`:
 
-- `num_keys` equals the number of fragment groups
+- `num_keys` equals the number of rows
 - `total_rows` and `visible_rows` equal the counts recomputed from the
   fragment records
 - `height` is 0
@@ -252,7 +271,7 @@ readers must verify that this value equals `children.len()`.
 
 `num_keys` is the number of fragment records in the referenced subtree,
 including that object's own buffer. Mutations held by ancestors are excluded.
-After a leaf is decoded, it must equal the number of fragment groups. After an
+After a leaf is decoded, it must equal the number of rows. After an
 interior is decoded, it must equal the sum of the children's `num_keys` plus
 the buffer `fragment_count_delta`s.
 
@@ -297,7 +316,7 @@ leaf summaries from records. Writers must not publish a materialization whose
 recomputed summaries disagree with the derived version totals.
 
 File and deletion-file actions must leave all other `DataFragment` fields
-unchanged. Use `add_fragment` when no other action can represent the change.
+unchanged. Use `upsert_fragment` when no other action can represent the change.
 This includes changes to overlay files, version sequences, and row-ID state.
 It replaces the complete fragment record.
 
@@ -307,7 +326,7 @@ fragment require that fragment to exist.
 
 | Action | Precondition | Effect |
 |---|---|---|
-| `add_fragment` | None | Install the complete record, replacing anything at that id |
+| `upsert_fragment` | None | Install the complete record, replacing anything at that id |
 | `remove_fragment` | None | Remove the record at that id. An absent id is a no-op |
 | `add_data_file` | Record present, else reject | Append the file to the end of the ordered file list |
 | `remove_data_file` | Record present, else reject | Remove every file whose path matches, keeping survivor order. No match is a no-op |
@@ -348,6 +367,9 @@ anywhere in the tree.
 
 Readers must verify uniqueness across every mutation source decoded for the
 operation. Uniqueness across unread subtrees is a writer invariant.
+
+Mutations may be serialized in any order. Aggregate counts must not depend on
+serialization order; readers may apply checked deltas in action sequence order.
 
 `materialized_through_action_sequence` records how far a leaf has been
 materialized. It is not part of the leaf contents. The same leaf may
