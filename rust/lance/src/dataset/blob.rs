@@ -9710,16 +9710,15 @@ mod tests {
         let zero_at = 8 + hole;
         let second = 8 + 2 * hole;
         let file = patterned_file((second + 8) as usize);
-        let err = match try_preprocess_recorded_ingest(
+        let Err(err) = try_preprocess_recorded_ingest(
             file,
             external_slice_column(&[(uri, 0, 8), (uri, zero_at, 0), (uri, second, 8)]),
             blob_field("blob", true),
             ExternalBlobMode::Ingest,
         )
         .await
-        {
-            Err(err) => err,
-            Ok(_) => panic!("zero-size external ingest should fail"),
+        else {
+            panic!("zero-size external ingest should fail");
         };
         assert!(
             err.to_string().contains("size` must be greater than zero"),

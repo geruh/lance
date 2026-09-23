@@ -345,7 +345,8 @@ mod tests {
 
     #[test]
     fn test_plan_coalesced_windows_matches_explicit_spans() {
-        let cases: &[(&[(u64, u64)], u64, &[Range<u64>])] = &[
+        type SpanCase<'a> = (&'a [(u64, u64)], u64, &'a [Range<u64>]);
+        let cases: &[SpanCase] = &[
             (&[], 0, &[]),
             (&[(0, 3)], 0, &[0..3]),
             (&[(0, 2), (3, 5)], 0, &[0..2, 3..5]),
