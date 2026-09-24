@@ -4,8 +4,6 @@
 //! Range merge and bounded fetch for external blob ingest.
 //! Placement of each payload stays with the dataset writer.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -13,8 +11,10 @@ use futures::stream::{self, Stream};
 use lance_core::{Error, Result};
 use lance_io::traits::Reader;
 
-// Fetch planned windows separately to preserve the per-read byte limit.
+// Maximum span of one coalesced read. Larger slices stream separately.
 pub(super) const INGEST_COALESCE_BUDGET: u64 = 8 * 1024 * 1024;
+
+// Maximum number of coalesced fetches buffered at once.
 pub(super) const INGEST_FETCH_PARALLELISM: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub(super) struct FetchWindow {
     pub start: u64,
     pub end: u64,
     pub slices: Vec<ExternalSlice>,
-    pub open_reader: BoxFuture<'static, Result<Arc<dyn Reader>>>,
+    pub open_reader: BoxFuture<'static, Result<Box<dyn Reader>>>,
 }
 
 pub(super) struct FetchedWindow {
@@ -43,6 +43,7 @@ pub(super) struct FetchedWindow {
     pub slices: Vec<ExternalSlice>,
 }
 
+// Plan bounded windows so ingest can write each result without collecting all reads.
 pub(super) fn plan_coalesced_windows(
     mut slices: Vec<ExternalSlice>,
     hole: u64,
@@ -267,8 +268,9 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_coalesced_windows_merges_hole_equal_to_cloud_limit() {
+    fn test_plan_coalesced_windows_merges_a_gap_equal_to_the_cloud_hole() {
         let hole = object_store::OBJECT_STORE_COALESCE_DEFAULT;
+        let start = 100 + hole;
         let slices = vec![
             ExternalSlice {
                 row: 0,
@@ -277,19 +279,19 @@ mod tests {
             },
             ExternalSlice {
                 row: 1,
-                start: 100 + hole,
-                end: 100 + hole + 50,
+                start,
+                end: start + 50,
             },
         ];
         let windows = plan_coalesced_windows(slices, hole, INGEST_COALESCE_BUDGET);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].slices.len(), 2);
         assert_eq!(windows[0].start, 0);
-        assert_eq!(windows[0].end, 100 + hole + 50);
+        assert_eq!(windows[0].end, start + 50);
     }
 
     #[test]
-    fn test_plan_coalesced_windows_keeps_hole_past_cloud_limit_separate() {
+    fn test_plan_coalesced_windows_splits_a_gap_one_byte_past_the_cloud_hole() {
         let hole = object_store::OBJECT_STORE_COALESCE_DEFAULT;
         let start = 100 + hole + 1;
         let slices = vec![
