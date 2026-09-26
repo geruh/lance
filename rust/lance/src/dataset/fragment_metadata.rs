@@ -583,7 +583,11 @@ fn scheduler_for(object_store: &Arc<ObjectStore>) -> Arc<ScanScheduler> {
 #[cfg(test)]
 mod differential;
 #[cfg(test)]
+mod gate_tests;
+#[cfg(test)]
 mod publication_tests;
+#[cfg(test)]
+mod scan_tests;
 
 #[cfg(test)]
 mod tests {
