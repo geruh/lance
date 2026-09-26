@@ -910,13 +910,13 @@ impl Transaction {
                 frag_reuse_index,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
-                let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
                 Self::handle_rewrite_fragments(
                     &mut final_fragments,
                     groups,
                     &mut fragment_id,
-                    current_version,
-                    next_row_id.as_ref(),
+                    current_manifest
+                        .map(|manifest| manifest.version)
+                        .unwrap_or_default(),
                 )?;
 
                 if next_row_id.is_some() {
@@ -1375,6 +1375,14 @@ impl Transaction {
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
+        if let Some(fragment) = final_fragments.last()
+            && fragment.id > u64::from(u32::MAX)
+        {
+            return Err(Error::invalid_input(format!(
+                "Fragment ID {} exceeds Lance's u32 address space",
+                fragment.id
+            )));
+        }
 
         // Clean up data files that only contain tombstoned fields
         Self::remove_tombstoned_data_files(&mut final_fragments);
@@ -1695,7 +1703,17 @@ impl Transaction {
         }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
-            manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
+            manifest.max_fragment_id = Some(
+                manifest
+                    .max_fragment_id
+                    .unwrap_or(0)
+                    .checked_add(num_fragments)
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            "Fragment ID allocation exceeds Lance's u32 address space",
+                        )
+                    })?,
+            );
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());

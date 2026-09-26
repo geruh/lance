@@ -3,6 +3,8 @@
 
 pub mod feature_flags;
 pub mod format;
+/// Immutable fragment metadata with buffered updates.
+pub mod fragment_metadata;
 pub mod io;
 pub mod rowids;
 pub mod system_index;
