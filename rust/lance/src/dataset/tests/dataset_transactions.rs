@@ -357,7 +357,7 @@ async fn test_inline_transaction() {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
-    async fn create_dataset(rows: i32) -> Arc<Dataset> {
+    async fn create_dataset(rows: i32) -> (TempDir, Arc<Dataset>) {
         let dir = TempDir::default();
         let uri = dir.path_str();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -377,7 +377,7 @@ async fn test_inline_transaction() {
         )
         .await
         .unwrap();
-        Arc::new(ds)
+        (dir, Arc::new(ds))
     }
 
     fn make_tx(read_version: u64) -> Transaction {
@@ -398,7 +398,7 @@ async fn test_inline_transaction() {
     let session = Arc::new(Session::default());
 
     // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
-    let ds = create_dataset(5).await;
+    let (_dir, ds) = create_dataset(5).await;
     let read_version = ds.manifest().version;
     let tx = make_tx(read_version);
     let ds2 = CommitBuilder::new(ds.clone())
@@ -426,7 +426,7 @@ async fn test_inline_transaction() {
     assert_eq!(inline_tx, tx);
 
     // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
-    let ds = create_dataset(2).await;
+    let (_dir, ds) = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file = crate::io::commit::write_transaction_file(
         ds.object_store.as_ref(),

@@ -64,7 +64,11 @@ async fn apply_deletions(
     let mut updated_fragments = Vec::new();
     let mut removed_fragments = Vec::new();
 
-    let mut stream = futures::stream::iter(dataset.get_fragments())
+    // Only the fragments with matched rows change; fetch exactly those, which
+    // a lazily loaded fragment metadata table resolves through the tree.
+    let touched_ids: Vec<u64> = bitmaps.keys().map(|id| *id as u64).collect();
+    let touched_fragments = dataset.file_fragments_for_ids(&touched_ids).await?;
+    let mut stream = futures::stream::iter(touched_fragments)
         .map(move |fragment| {
             let bitmaps_ref = bitmaps.clone();
             async move {
@@ -295,13 +299,19 @@ impl RetryExecutor for DeleteJob {
                     filter_expr,
                     Expr::Literal(ScalarValue::Boolean(Some(true)), _)
                 ) {
-                    // Predicate evaluated to true - delete all fragments
-                    let fragments = self.dataset.get_fragments();
-                    let num_deleted_rows: u64 = fragments
-                        .iter()
-                        .map(|f| f.metadata.num_rows().unwrap_or(0) as u64)
-                        .sum();
-                    let deleted_fragment_ids = fragments.iter().map(|f| f.id() as u64).collect();
+                    // Predicate evaluated to true - delete all fragments.
+                    // Stream the source so a lazily loaded table never holds
+                    // the whole list.
+                    let (deleted_fragment_ids, num_deleted_rows) = self
+                        .dataset
+                        .fragment_source()
+                        .stream()
+                        .try_fold((Vec::new(), 0u64), |(mut ids, rows), fragment| async move {
+                            ids.push(fragment.id);
+                            let fragment_rows = fragment.num_rows().unwrap_or(0) as u64;
+                            Ok((ids, rows + fragment_rows))
+                        })
+                        .await?;
 
                     // When deleting everything, we don't have specific row addresses,
                     // so better not to emit affected rows.

@@ -44,6 +44,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
     Error, Result,
+    cache::LanceCache,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
         AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, TRACE_DATASET_EVENTS,
@@ -52,7 +53,7 @@ use lance_core::{
 };
 use lance_io::object_store::ObjectStore;
 use lance_table::{
-    format::{IndexMetadata, Manifest},
+    format::{Fragment, IndexMetadata, Manifest, pb},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -62,6 +63,7 @@ use lance_table::{
 use object_store::ObjectMeta;
 use object_store::path::Path;
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     future,
@@ -78,6 +80,7 @@ struct ReferencedFiles {
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
+    metadata_paths: HashSet<Path>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -153,6 +156,9 @@ pub enum CleanupFileKind {
     /// logs to match the long-standing cleanup behavior.  Their bytes
     /// are still included in `bytes_removed`.
     TemporaryManifest,
+    /// Tree metadata contributes to bytes removed, but not data-file or
+    /// version counts.
+    FragmentMetadata,
 }
 
 impl CleanupCandidateFile {
@@ -201,7 +207,7 @@ impl RemovalStats {
             CleanupFileKind::Transaction => self.transaction_files_removed += 1,
             CleanupFileKind::Index => self.index_files_removed += 1,
             CleanupFileKind::Deletion => self.deletion_files_removed += 1,
-            CleanupFileKind::TemporaryManifest => {}
+            CleanupFileKind::TemporaryManifest | CleanupFileKind::FragmentMetadata => {}
         }
     }
 
@@ -301,6 +307,10 @@ struct CleanupTask<'a> {
     ignored_manifests: HashSet<Path>,
     track_removed_manifests: bool,
     include_referenced_branches: bool,
+    /// Versions share most leaves, so a run reuses each checked leaf instead
+    /// of reading it again for every manifest that names it. See
+    /// [`tree_leaf_cache_for`].
+    tree_leaves: LanceCache,
 }
 
 /// A manifest that has aged out and is queued for deletion.
@@ -440,6 +450,7 @@ impl<'a> CleanupTask<'a> {
             HashSet::new(),
             track_removed_manifests,
             include_referenced_branches,
+            tree_leaf_cache_for(dataset),
         )
     }
 
@@ -450,6 +461,7 @@ impl<'a> CleanupTask<'a> {
         ignored_manifests: HashSet<Path>,
         track_removed_manifests: bool,
         include_referenced_branches: bool,
+        tree_leaves: LanceCache,
     ) -> Self {
         Self {
             dataset,
@@ -459,6 +471,7 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
+            tree_leaves,
         }
     }
 
@@ -595,6 +608,7 @@ impl<'a> CleanupTask<'a> {
             }
             Err(error) => return Err(error),
         };
+        let tree_files = self.inspect_tree(&manifest).await?;
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
         // version.  These are either in-progress or newly added since we started.
@@ -602,6 +616,14 @@ impl<'a> CleanupTask<'a> {
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
         let mut inspection = inspection.lock().unwrap();
+        let files = if in_working_set {
+            &mut inspection.referenced_files
+        } else {
+            &mut inspection.verified_files
+        };
+        files.data_paths.extend(tree_files.data_paths);
+        files.delete_paths.extend(tree_files.delete_paths);
+        files.metadata_paths.extend(tree_files.metadata_paths);
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -639,6 +661,50 @@ impl<'a> CleanupTask<'a> {
         Ok(())
     }
 
+    async fn inspect_tree(&self, manifest: &Manifest) -> Result<ReferencedFiles> {
+        let mut files = ReferencedFiles::default();
+        let Some(snapshot) = &manifest.fragment_tree else {
+            return Ok(files);
+        };
+        let mut tree = super::fragment_metadata::tree_from_manifest(
+            self.dataset.object_store.clone(),
+            self.dataset.session.store_registry(),
+            self.dataset.base.clone(),
+            manifest,
+        )
+        .await?;
+        tree.set_foreign_bases(self.dataset.tree_foreign_bases_for(manifest).await?);
+        tree.set_leaf_cache(self.tree_leaves.clone());
+        let tree = Arc::new(tree);
+        let mut paths = tree.local_node_paths().await?;
+        if let Some(pb::fragment_tree::Root::RootUuid(path)) = &snapshot.root {
+            paths.push(lance_table::fragment_metadata::store::root_path(path)?);
+        }
+        for path in paths {
+            files.metadata_paths.insert(Path::from(path));
+        }
+        let mut fragments = tree.fragment_stream();
+        while let Some(fragment) = fragments.try_next().await? {
+            self.record_fragment(&fragment, &mut files);
+        }
+        Ok(files)
+    }
+
+    fn record_fragment(&self, fragment: &Fragment, referenced_files: &mut ReferencedFiles) {
+        for file in fragment.referenced_lance_files() {
+            let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
+            referenced_files
+                .data_paths
+                .insert(remove_prefix(&full_data_path, &self.dataset.base));
+        }
+        if let Some(deletion_file) = &fragment.deletion_file {
+            let path = deletion_file_path(&self.dataset.base, fragment.id, deletion_file);
+            referenced_files
+                .delete_paths
+                .insert(remove_prefix(&path, &self.dataset.base));
+        }
+    }
+
     fn process_manifest(
         &self,
         manifest: &Manifest,
@@ -655,19 +721,7 @@ impl<'a> CleanupTask<'a> {
         };
 
         for fragment in manifest.fragments.iter() {
-            for file in fragment.referenced_lance_files() {
-                let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
-                let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
-                referenced_files.data_paths.insert(relative_data_path);
-            }
-            let delpath = fragment
-                .deletion_file
-                .as_ref()
-                .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
-            if let Some(delpath) = delpath {
-                let relative_path = remove_prefix(&delpath, &self.dataset.base);
-                referenced_files.delete_paths.insert(relative_path);
-            }
+            self.record_fragment(fragment, referenced_files);
         }
         if let Some(relative_tx_path) = &manifest.transaction_file {
             referenced_files
@@ -776,6 +830,7 @@ impl<'a> CleanupTask<'a> {
             // the proof when the old manifests are removed by this cleanup pass.
             build_listing_stream(self.dataset.indices_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
+            build_listing_stream(self.dataset.base.clone().join("_bt"), None),
         ];
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
@@ -818,7 +873,7 @@ impl<'a> CleanupTask<'a> {
                     CleanupFileKind::Index => {
                         info!(target: TRACE_FILE_AUDIT, mode=mode, r#type=AUDIT_TYPE_INDEX, path = path_str);
                     }
-                    CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest => {}
+                    CleanupFileKind::Transaction | CleanupFileKind::TemporaryManifest | CleanupFileKind::FragmentMetadata => {}
                 }
             }
             if deletes_files && removes_empty_dirs && matches!(file.kind, CleanupFileKind::Index) {
@@ -981,6 +1036,38 @@ impl<'a> CleanupTask<'a> {
         let path = obj_meta.location;
         let relative_path = remove_prefix(&path, &self.dataset.base);
         let size_bytes = obj_meta.size;
+        if inspection
+            .referenced_files
+            .metadata_paths
+            .contains(&relative_path)
+        {
+            return Ok(None);
+        }
+        let maybe_in_progress = maybe_in_progress
+            && !inspection
+                .verified_files
+                .metadata_paths
+                .contains(&relative_path);
+        if relative_path.as_ref().starts_with("_bt/") {
+            let referenced = inspection
+                .referenced_files
+                .metadata_paths
+                .contains(&relative_path);
+            let verified = inspection
+                .verified_files
+                .metadata_paths
+                .contains(&relative_path);
+            return Ok(if !referenced && (!maybe_in_progress || verified) {
+                cleanup_file(
+                    path,
+                    CleanupFileKind::FragmentMetadata,
+                    !verified,
+                    size_bytes,
+                )
+            } else {
+                None
+            });
+        }
         if relative_path.as_ref().starts_with("_versions/.tmp") {
             // This is a temporary manifest file.
             //
@@ -1273,6 +1360,7 @@ impl<'a> CleanupTask<'a> {
                             branch_dataset.manifest.as_ref(),
                             action,
                             ignored_manifests,
+                            self.tree_leaves.clone(),
                         )
                         .await?
                         {
@@ -1304,6 +1392,8 @@ impl<'a> CleanupTask<'a> {
             // This avoids creating a dataset instance and prevents manifest deletion
             // during the retain operation.
             let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
+            let was_scheduled_for_removal =
+                Self::schedules_removal_of(&inspection, *root_version_number);
             self.dataset
                 .commit_handler
                 .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
@@ -1313,29 +1403,104 @@ impl<'a> CleanupTask<'a> {
                 .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                     self.process_branch_referenced_manifests(
                         location,
+                        &branch_location.path,
                         *root_version_number,
                         &inspection,
                     )
                 })
                 .await?;
+            // The retained fork may name files and indices that no surviving
+            // branch version uses. Keep everything it needs to remain readable.
+            if was_scheduled_for_removal
+                && !Self::schedules_removal_of(&inspection, *root_version_number)
+            {
+                self.retain_fork_manifest_files(*root_version_number, &inspection)
+                    .await?;
+            }
         }
         Ok(inspection.into_inner().unwrap())
+    }
+
+    fn schedules_removal_of(inspection: &Mutex<CleanupInspection>, version: u64) -> bool {
+        inspection
+            .lock()
+            .unwrap()
+            .old_manifests
+            .values()
+            .any(|scheduled| scheduled.version == version)
+    }
+
+    async fn retain_fork_manifest_files(
+        &self,
+        version: u64,
+        inspection: &Mutex<CleanupInspection>,
+    ) -> Result<()> {
+        let location = self
+            .dataset
+            .commit_handler
+            .resolve_version_location(
+                &self.dataset.base,
+                version,
+                &self.dataset.object_store.inner,
+            )
+            .await?;
+        let manifest =
+            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        if manifest.fragment_tree.is_none() {
+            return Ok(());
+        }
+        let tree_files = self.inspect_tree(&manifest).await?;
+        let indexes =
+            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+        let mut inspection = inspection.lock().unwrap();
+        let files = &mut inspection.referenced_files;
+        files.data_paths.extend(tree_files.data_paths);
+        files.delete_paths.extend(tree_files.delete_paths);
+        files.metadata_paths.extend(tree_files.metadata_paths);
+        self.process_manifest(&manifest, &indexes, true, &mut inspection)
     }
 
     async fn process_branch_referenced_manifests(
         &self,
         location: ManifestLocation,
+        branch_base: &Path,
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
     ) -> Result<()> {
         let manifest =
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+        // A branch created from this dataset copies only the tree root. Its
+        // leaves and interior nodes stay here, reached through a base id that
+        // resolves back to this dataset, so they are live for as long as the
+        // branch manifest is. Nodes owned by any other dataset are not ours
+        // to retain or remove.
+        let (mut fragments, inherited_nodes) = if manifest.fragment_tree.is_some() {
+            let mut tree = super::fragment_metadata::tree_from_manifest(
+                self.dataset.object_store.clone(),
+                self.dataset.session.store_registry(),
+                branch_base.clone(),
+                &manifest,
+            )
+            .await?;
+            tree.set_foreign_bases(self.dataset.tree_foreign_bases_for(&manifest).await?);
+            tree.set_leaf_cache(self.tree_leaves.clone());
+            let inherited_nodes = tree
+                .node_paths_owned_by(&self.dataset.object_store, &self.dataset.base)
+                .await?;
+            (Arc::new(tree).fragment_stream(), inherited_nodes)
+        } else {
+            (
+                futures::stream::iter(manifest.fragments.as_ref().clone().into_iter().map(Ok))
+                    .boxed(),
+                Vec::new(),
+            )
+        };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-        let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
 
-        for fragment in manifest.fragments.iter() {
+        while let Some(fragment) = fragments.try_next().await? {
+            let mut inspection = inspection.lock().unwrap();
             for file in fragment.referenced_lance_files() {
                 if let Some(base_id) = file.base_id {
                     let base_path = manifest.base_paths.get(&base_id);
@@ -1382,6 +1547,19 @@ impl<'a> CleanupTask<'a> {
                     }
                 }
             }
+        }
+        let mut inspection = inspection.lock().unwrap();
+        // Nodes are owned by their resolved location, while the data files,
+        // deletion files and index ids in this function compare the base
+        // path string with this dataset's uri. A branch that spells the parent
+        // uri differently keeps its nodes here but not the data files those
+        // leaves point at. The two rules still have to converge on the
+        // resolved identity.
+        for node_path in inherited_nodes {
+            let node_path = Path::from(node_path);
+            inspection.verified_files.metadata_paths.remove(&node_path);
+            inspection.referenced_files.metadata_paths.insert(node_path);
+            is_referenced = true;
         }
         for index in indexes {
             if let Some(base_id) = index.base_id {
@@ -1641,11 +1819,33 @@ pub async fn cleanup_cascade_branch(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    Ok(
-        cleanup_cascade_branch_run(dataset, manifest, CleanupAction::Execute, HashSet::new())
-            .await?
-            .map(|result| result.stats),
+    Ok(cleanup_cascade_branch_run(
+        dataset,
+        manifest,
+        CleanupAction::Execute,
+        HashSet::new(),
+        tree_leaf_cache_for(dataset),
     )
+    .await?
+    .map(|result| result.stats))
+}
+
+/// Checked leaves shared by one cleanup run and the branch runs it cascades
+/// into, which may inspect the same inherited leaves concurrently. The budget
+/// follows the session's metadata cache, so a session that caches nothing
+/// reads every leaf once per manifest as before. It is dropped with the run.
+fn tree_leaf_cache_for(dataset: &Dataset) -> LanceCache {
+    let capacity = dataset
+        .session
+        .file_metadata_cache()
+        .capacity_bytes()
+        .unwrap_or(super::DEFAULT_METADATA_CACHE_SIZE)
+        .min(super::DEFAULT_METADATA_CACHE_SIZE);
+    if capacity == 0 {
+        LanceCache::no_cache()
+    } else {
+        LanceCache::with_capacity(capacity)
+    }
 }
 
 async fn cleanup_cascade_branch_run(
@@ -1653,6 +1853,7 @@ async fn cleanup_cascade_branch_run(
     manifest: &Manifest,
     action: CleanupAction,
     ignored_manifests: HashSet<Path>,
+    tree_leaves: LanceCache,
 ) -> Result<Option<CleanupRunResult>> {
     let policy = build_cleanup_policy(dataset, manifest).await?;
     if let Some(mut policy) = policy {
@@ -1668,6 +1869,7 @@ async fn cleanup_cascade_branch_run(
             ignored_manifests,
             true,
             false,
+            tree_leaves,
         );
         Ok(Some(cleanup.run().await?))
     } else {
@@ -1799,6 +2001,7 @@ mod tests {
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::index::DatasetIndexExt;
+    use crate::session::{CacheSpec, Session};
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
@@ -1811,16 +2014,23 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
+    use lance_core::cache::{LanceCache, MokaCacheBackend};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::tracking_store::IOTracker;
     use lance_linalg::distance::MetricType;
+    use lance_table::format::BasePath;
+    use lance_table::fragment_metadata::support::make_fragment;
+    use lance_table::fragment_metadata::{FragmentTree, FragmentTreeConfig, SnapshotPolicy};
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
+    use object_store::ObjectStoreExt;
     use rstest::rstest;
     use uuid::Uuid;
 
@@ -2311,6 +2521,223 @@ mod tests {
         assert_gt!(after_count.num_data_files, 0);
         // We should keep referenced tx files
         assert_gt!(after_count.num_tx_files, 0);
+    }
+
+    /// One manifest at a time, a leaf is read once to be sighted and once to
+    /// be kept. Concurrent inspection can read a shared leaf more often before
+    /// its first admission lands, so this bound holds only for this sequence.
+    #[rstest]
+    #[case::session_cache(crate::dataset::DEFAULT_METADATA_CACHE_SIZE)]
+    #[case::smaller_session_cache(1024 * 1024)]
+    #[case::larger_session_cache(2 * crate::dataset::DEFAULT_METADATA_CACHE_SIZE)]
+    #[case::no_session_cache(0)]
+    #[tokio::test]
+    async fn sequential_tree_inspection_reads_each_shared_leaf_at_most_twice(
+        #[case] metadata_cache_bytes: usize,
+        #[values(false, true)] custom_backend: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut tree = FragmentTreeConfig::default();
+        tree.max_node_bytes = 1024;
+        tree.max_leaf_bytes = 512;
+        tree.semantic_buffer_bytes = 512;
+        let config = crate::dataset::fragment_metadata::FragmentMetadataOptions {
+            tree,
+            ..Default::default()
+        }
+        .into_table_config()
+        .unwrap();
+        let schema = lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]))
+        .unwrap();
+        let mut dataset = crate::dataset::write::CommitBuilder::new(uri)
+            .execute(Transaction::new_from_version(
+                0,
+                Operation::Overwrite {
+                    fragments: (0..16).map(make_fragment).collect(),
+                    schema,
+                    config_upsert_values: Some(config),
+                    initial_bases: None,
+                },
+            ))
+            .await
+            .unwrap();
+        for id in 16..24 {
+            let version = dataset.version().version;
+            dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new_from_version(
+                    version,
+                    Operation::Append {
+                        fragments: vec![make_fragment(id)],
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let io = IOTracker::default();
+        let session = if custom_backend {
+            Session::with_cache_backends(
+                CacheSpec::Size(0),
+                CacheSpec::Backend(Arc::new(MokaCacheBackend::with_capacity(
+                    metadata_cache_bytes,
+                ))),
+                Arc::new(ObjectStoreRegistry::default()),
+            )
+        } else {
+            Session::new(
+                0,
+                metadata_cache_bytes,
+                Arc::new(ObjectStoreRegistry::default()),
+            )
+        };
+        let dataset = DatasetBuilder::from_uri(uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(io.clone())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .with_session(Arc::new(session))
+            .load()
+            .await
+            .unwrap();
+        let locations: Vec<_> = dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false)
+            .try_collect()
+            .await
+            .unwrap();
+        let mut manifests = Vec::new();
+        for location in locations {
+            manifests.push(
+                read_manifest(&dataset.object_store, &location.path, location.size)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default().build(),
+            CleanupAction::Execute,
+        );
+        assert_eq!(
+            task.tree_leaves.capacity_bytes(),
+            Some(metadata_cache_bytes.min(crate::dataset::DEFAULT_METADATA_CACHE_SIZE))
+        );
+        let leaf_reads = || {
+            io.incremental_stats()
+                .requests
+                .iter()
+                .filter(|request| {
+                    request.method.starts_with("get") && request.path.as_ref().contains("_bt/leaf/")
+                })
+                .count()
+        };
+        let is_leaf = |path: &&Path| path.as_ref().starts_with("_bt/leaf/");
+
+        leaf_reads();
+        let mut inspected = Vec::new();
+        for manifest in &manifests {
+            inspected.push(task.inspect_tree(manifest).await.unwrap());
+        }
+        let named: usize = inspected
+            .iter()
+            .map(|files| files.metadata_paths.iter().filter(is_leaf).count())
+            .sum();
+        let distinct: HashSet<_> = inspected
+            .iter()
+            .flat_map(|files| files.metadata_paths.iter().filter(is_leaf))
+            .collect();
+        // Without reuse, every version would read every leaf it names.
+        assert_gt!(named, 2 * distinct.len());
+        let mut reads = leaf_reads();
+        for (manifest, files) in manifests.iter().zip(&inspected) {
+            let again = task.inspect_tree(manifest).await.unwrap();
+            assert_eq!(again.data_paths, files.data_paths);
+            assert_eq!(again.delete_paths, files.delete_paths);
+            assert_eq!(again.metadata_paths, files.metadata_paths);
+        }
+        reads += leaf_reads();
+        if metadata_cache_bytes == 0 {
+            // No budget means no reuse, so every pass reads every named leaf.
+            assert_eq!(reads, 2 * named);
+        } else {
+            assert!(
+                reads <= 2 * distinct.len(),
+                "{reads} leaf reads for {} distinct leaves",
+                distinct.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_tree_nodes_do_not_verify_recent_local_files() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let source_base = dataset.base.clone().join("source");
+        let (_, mut snapshot, _) = FragmentTree::bootstrap_snapshot(
+            dataset.object_store.clone(),
+            source_base,
+            ScanScheduler::new(
+                dataset.object_store.clone(),
+                SchedulerConfig::default_for_testing(),
+            ),
+            Arc::new(LanceCache::with_capacity(0)),
+            FragmentTreeConfig::default(),
+            dataset.manifest.fragments.as_ref().clone(),
+            1,
+            SnapshotPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let Some(pb::fragment_tree::Root::InlineRoot(root)) = snapshot.root.as_mut() else {
+            panic!("the small fixture must have an inline root")
+        };
+        assert_eq!(root.children.len(), 1);
+        root.children[0].base_id = Some(1);
+        let relative_path = root.children[0].path.clone();
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest.fragment_tree = Some(Arc::new(snapshot));
+        manifest.base_paths.insert(
+            1,
+            BasePath::new(1, format!("{}/source", dataset.uri()), None, true),
+        );
+
+        let local_path = Path::from(format!("{}/{}", dataset.base, relative_path));
+        dataset
+            .object_store
+            .put(&local_path, b"unpublished")
+            .await
+            .unwrap();
+        let object = dataset.object_store.inner.head(&local_path).await.unwrap();
+        let task = CleanupTask::new(
+            &dataset,
+            CleanupPolicyBuilder::default().build(),
+            CleanupAction::Execute,
+        );
+        // A retired foreign reference cannot prove that a same-name local
+        // object is from an old commit rather than an in-progress writer.
+        let inspection = CleanupInspection {
+            verified_files: task.inspect_tree(&manifest).await.unwrap(),
+            ..Default::default()
+        };
+        assert!(
+            task.cleanup_file_if_not_referenced(object, true, &inspection)
+                .unwrap()
+                .is_none(),
+            "foreign ownership must not bypass in-progress file protection"
+        );
+        assert!(
+            !inspection
+                .verified_files
+                .metadata_paths
+                .contains(&Path::from(relative_path))
+        );
     }
 
     #[tokio::test]
@@ -3118,6 +3545,7 @@ mod tests {
         }
         task.process_branch_referenced_manifests(
             branch.manifest_location.clone(),
+            &branch.base,
             root_version,
             &inspection,
         )

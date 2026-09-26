@@ -414,16 +414,18 @@ async fn read_spilled_column(
 mod tests {
     use super::*;
     use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
+    use crate::dataset::fragment_metadata::FragmentMetadataOptions;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::transaction::Operation;
+    use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
     use arrow_array::{Int32Array, RecordBatchIterator};
     use arrow_schema::Field;
     use chrono::Utc;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::LanceFileVersion;
-    use lance_table::feature_flags::FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+    use lance_table::feature_flags::{FLAG_FRAGMENT_TREE, FLAG_UNSTABLE_SPILLED_ROW_LINEAGE};
 
     /// A sequence with no runs to exploit, which is what a globally shuffled
     /// table produces and what forces the spill path.
@@ -617,7 +619,12 @@ mod tests {
     }
     /// A stable-row-id dataset built from `chunks` separate appends, so
     /// compacting it has several sequences to concatenate.
-    async fn appended_dataset(uri: &str, chunks: i32, rows_per_chunk: i32) -> Dataset {
+    async fn appended_dataset(
+        uri: &str,
+        chunks: i32,
+        rows_per_chunk: i32,
+        is_tree: bool,
+    ) -> Dataset {
         let schema = test_schema();
         let mut dataset: Option<Dataset> = None;
         for chunk in 0..chunks {
@@ -628,6 +635,36 @@ mod tests {
                 ))],
             )
             .unwrap();
+            if chunk == 0 && is_tree {
+                let mut transaction = InsertBuilder::new(uri)
+                    .with_params(&WriteParams {
+                        enable_stable_row_ids: true,
+                        ..Default::default()
+                    })
+                    .execute_uncommitted(vec![batch])
+                    .await
+                    .unwrap();
+                let Operation::Overwrite {
+                    config_upsert_values,
+                    ..
+                } = &mut transaction.operation
+                else {
+                    panic!("dataset creation must produce an overwrite transaction");
+                };
+                *config_upsert_values = Some(
+                    FragmentMetadataOptions::default()
+                        .into_table_config()
+                        .unwrap(),
+                );
+                dataset = Some(
+                    CommitBuilder::new(uri)
+                        .use_stable_row_ids(true)
+                        .execute(transaction)
+                        .await
+                        .unwrap(),
+                );
+                continue;
+            }
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
             dataset = Some(
                 Dataset::write(
@@ -681,11 +718,15 @@ mod tests {
         )
     }
 
+    #[rstest::rstest]
+    #[case::flat(false)]
+    #[case::tree(true)]
     #[tokio::test]
-    async fn compaction_spills_and_reads_back_row_lineage() {
+    async fn compaction_spills_and_reads_back_row_lineage(#[case] is_tree: bool) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let mut dataset = appended_dataset(uri, 4, 250).await;
+        let mut dataset = appended_dataset(uri, 4, 250, is_tree).await;
+        assert_eq!(dataset.manifest.fragment_tree.is_some(), is_tree);
         spill_everything(&mut dataset).await;
         // Four appends at four versions, so the compacted created-at sequence
         // has four runs rather than one.
@@ -757,6 +798,21 @@ mod tests {
 
         // Re-opened cold, so nothing is served from this process's caches.
         let reopened = Dataset::open(uri).await.unwrap();
+        let required_features =
+            FLAG_UNSTABLE_SPILLED_ROW_LINEAGE | if is_tree { FLAG_FRAGMENT_TREE } else { 0 };
+        for manifest in [dataset.manifest.as_ref(), reopened.manifest.as_ref()] {
+            assert_eq!(manifest.fragment_tree.is_some(), is_tree);
+            assert_eq!(
+                manifest.reader_feature_flags
+                    & (FLAG_UNSTABLE_SPILLED_ROW_LINEAGE | FLAG_FRAGMENT_TREE),
+                required_features
+            );
+            assert_eq!(
+                manifest.writer_feature_flags
+                    & (FLAG_UNSTABLE_SPILLED_ROW_LINEAGE | FLAG_FRAGMENT_TREE),
+                required_features
+            );
+        }
         assert_eq!(collect_lineage(&reopened).await, before);
         let fragment = &reopened.get_fragments()[0];
         let row_ids = load_row_id_sequence(&reopened, fragment.metadata())
@@ -775,11 +831,12 @@ mod tests {
     /// [`Fragment::referenced_lance_files`], so a spilled sequence has to be
     /// reachable from there. If it were not, an ordinary cleanup would delete a
     /// live file and leave the fragment claiming row ids it can no longer read.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn cleanup_keeps_a_live_spilled_file() {
+    async fn cleanup_keeps_a_live_spilled_file(#[values(false, true)] is_tree: bool) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
-        let mut dataset = appended_dataset(uri, 4, 250).await;
+        let mut dataset = appended_dataset(uri, 4, 250, is_tree).await;
         spill_everything(&mut dataset).await;
         let before = collect_lineage(&dataset).await;
 

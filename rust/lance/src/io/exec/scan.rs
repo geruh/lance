@@ -26,18 +26,17 @@ use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{
-    Error, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD,
-    ROW_LAST_UPDATED_AT_VERSION_FIELD,
+    ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::ConcreteFileVersion;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_table::format::Fragment;
 use log::debug;
 use tracing::Instrument;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig, FragmentReader};
+use crate::dataset::fragment_source::FragmentSource;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
     LEGACY_DEFAULT_FRAGMENT_READAHEAD,
@@ -162,7 +161,7 @@ impl LanceStream {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         dataset: Arc<Dataset>,
-        fragments: Arc<Vec<Fragment>>,
+        fragments: impl Into<FragmentSource>,
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
@@ -178,13 +177,14 @@ impl LanceStream {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_v2(
         dataset: Arc<Dataset>,
-        fragments: Arc<Vec<Fragment>>,
+        fragments: impl Into<FragmentSource>,
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<Self> {
+        let fragments = fragments.into();
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
         let materialize_blob_v2_binary =
@@ -241,55 +241,41 @@ impl LanceStream {
             frag_parallelism
         );
 
+        // Fragments arrive as a stream so a lazily loaded table starts
+        // reading after its first leaf, not after its last. An offset range
+        // is resolved by walking that same stream in order.
+        let fragment_dataset = dataset.clone();
         let mut file_fragments = fragments
-            .iter()
-            .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
-            .map(|fragment| FragmentWithRange {
-                fragment,
+            .stream()
+            .map_ok(move |fragment| FragmentWithRange {
+                fragment: FileFragment::new(fragment_dataset.clone(), fragment),
                 range: None,
             })
-            .collect::<Vec<_>>();
+            .map_err(DataFusionError::from)
+            .boxed();
 
         if let Some(offsets) = offsets {
-            let mut rows_to_skip = offsets.start;
-            let mut rows_to_take = offsets.end - offsets.start;
-            let mut filtered_fragments = Vec::with_capacity(file_fragments.len());
-
-            let mut frags_iter = file_fragments.into_iter();
-            while rows_to_take > 0 {
-                if let Some(next_frag) = frags_iter.next() {
-                    let num_rows_in_frag = next_frag
-                        .fragment
-                        .count_rows(None)
-                        // count_rows should be a fast operation in v2 files
-                        .now_or_never()
-                        .ok_or(Error::internal(
-                            "Encountered fragment without row count metadata in v2 file"
-                                .to_string(),
-                        ))??;
-                    if rows_to_skip >= num_rows_in_frag as u64 {
-                        rows_to_skip -= num_rows_in_frag as u64;
-                    } else {
-                        let rows_to_take_in_frag =
-                            (num_rows_in_frag as u64 - rows_to_skip).min(rows_to_take);
-                        let range =
-                            Some(rows_to_skip as u32..(rows_to_skip + rows_to_take_in_frag) as u32);
-                        filtered_fragments.push(FragmentWithRange {
-                            fragment: next_frag.fragment,
-                            range,
-                        });
-                        rows_to_skip = 0;
-                        rows_to_take -= rows_to_take_in_frag;
+            file_fragments = stream::try_unfold(
+                (file_fragments, offsets.start, offsets.end - offsets.start),
+                |(mut fragments, mut skip, mut remaining)| async move {
+                    while remaining > 0 {
+                        let Some(mut fragment) = fragments.try_next().await? else {
+                            return Ok(None);
+                        };
+                        let rows = fragment.fragment.count_rows(None).await? as u64;
+                        if skip >= rows {
+                            skip -= rows;
+                            continue;
+                        }
+                        let take = (rows - skip).min(remaining);
+                        fragment.range = Some(skip as u32..(skip + take) as u32);
+                        remaining -= take;
+                        return Ok(Some((fragment, (fragments, 0, remaining))));
                     }
-                } else {
-                    log::warn!(
-                        "Ran out of fragments before we were done scanning for range: {:?}",
-                        offsets
-                    );
-                    rows_to_take = 0;
-                }
-            }
-            file_fragments = filtered_fragments;
+                    Ok(None)
+                },
+            )
+            .boxed();
         }
 
         let scan_scheduler = ScanScheduler::new(
@@ -308,8 +294,10 @@ impl LanceStream {
             config.materialization_readahead_bytes,
         );
         let config_for_stream = config.clone();
-        let batches = stream::iter(file_fragments.into_iter().enumerate())
+        let batches = file_fragments
+            .enumerate()
             .map(move |(priority, file_fragment)| {
+                let file_fragment = file_fragment?;
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
                 let base_schedulers = base_schedulers.clone();
@@ -437,13 +425,14 @@ impl LanceStream {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_v1(
         dataset: Arc<Dataset>,
-        fragments: Arc<Vec<Fragment>>,
+        fragments: impl Into<FragmentSource>,
         _offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<Self> {
+        let fragments = fragments.into();
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
         let project_schema = projection.clone();
@@ -460,30 +449,31 @@ impl LanceStream {
         );
 
         let file_fragments = fragments
-            .iter()
-            .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
-            .collect::<Vec<_>>();
+            .stream()
+            .map_ok(move |fragment| FileFragment::new(dataset.clone(), fragment))
+            .map_err(DataFusionError::from);
 
         let batches = if config.ordered_output {
-            let readers = buffered_fragment_opens(
-                stream::iter(file_fragments),
-                fragment_readahead,
-                move |file_fragment| {
-                    open_file(
-                        file_fragment,
-                        project_schema.clone(),
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
-                            )
-                            .with_row_created_at_version(config.with_row_created_at_version),
-                        config.with_make_deletions_null,
-                        None,
-                    )
-                },
-            );
+            let readers =
+                buffered_fragment_opens(file_fragments, fragment_readahead, move |file_fragment| {
+                    let project_schema = project_schema.clone();
+                    async move {
+                        open_file(
+                            file_fragment?,
+                            project_schema,
+                            FragReadConfig::default()
+                                .with_row_id(config.with_row_id)
+                                .with_row_address(config.with_row_address)
+                                .with_row_last_updated_at_version(
+                                    config.with_row_last_updated_at_version,
+                                )
+                                .with_row_created_at_version(config.with_row_created_at_version),
+                            config.with_make_deletions_null,
+                            None,
+                        )
+                        .await
+                    }
+                });
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -499,25 +489,26 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            let readers = buffered_fragment_opens(
-                stream::iter(file_fragments),
-                fragment_readahead,
-                move |file_fragment| {
-                    open_file(
-                        file_fragment,
-                        project_schema.clone(),
-                        FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
-                            )
-                            .with_row_created_at_version(config.with_row_created_at_version),
-                        config.with_make_deletions_null,
-                        None,
-                    )
-                },
-            );
+            let readers =
+                buffered_fragment_opens(file_fragments, fragment_readahead, move |file_fragment| {
+                    let project_schema = project_schema.clone();
+                    async move {
+                        open_file(
+                            file_fragment?,
+                            project_schema,
+                            FragReadConfig::default()
+                                .with_row_id(config.with_row_id)
+                                .with_row_address(config.with_row_address)
+                                .with_row_last_updated_at_version(
+                                    config.with_row_last_updated_at_version,
+                                )
+                                .with_row_created_at_version(config.with_row_created_at_version),
+                            config.with_make_deletions_null,
+                            None,
+                        )
+                        .await
+                    }
+                });
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -629,7 +620,7 @@ impl Default for LanceScanConfig {
 #[derive(Debug)]
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
-    fragments: Arc<Vec<Fragment>>,
+    fragments: FragmentSource,
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
     output_schema: Arc<ArrowSchema>,
@@ -680,7 +671,7 @@ impl LanceScanExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Arc<Dataset>,
-        fragments: Arc<Vec<Fragment>>,
+        fragments: impl Into<FragmentSource>,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
@@ -717,7 +708,7 @@ impl LanceScanExec {
         ));
         Self {
             dataset,
-            fragments,
+            fragments: fragments.into(),
             range,
             projection,
             output_schema,
@@ -732,8 +723,8 @@ impl LanceScanExec {
         &self.dataset
     }
 
-    /// Get the fragments for this scan.
-    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
+    /// Where this scan gets its fragments.
+    pub fn fragments(&self) -> &FragmentSource {
         &self.fragments
     }
 
@@ -809,17 +800,11 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        // Some fragments from older datasets might have the row count stats missing.
-        let (row_count, is_exact) =
-            self.fragments
-                .iter()
-                .fold(
-                    (0, true),
-                    |(row_count, is_exact), fragment| match fragment.num_rows() {
-                        Some(num_rows) => (row_count + num_rows, is_exact),
-                        None => (row_count, false),
-                    },
-                );
+        // Visible counts are not the output cardinality when deleted rows are
+        // retained with null row IDs. Do not advertise an exact smaller count.
+        if self.config.with_make_deletions_null {
+            return Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())));
+        }
         // Only the v2 scan honors `range`. `LanceStream::try_new_v1` takes `_offsets`
         // and reads every fragment, leaving the limit to a node above it.
         let honors_range = !matches!(
@@ -829,20 +814,20 @@ impl ExecutionPlan for LanceScanExec {
                 .lance_file_format(),
             ConcreteFileVersion::V1
         );
-
-        let num_rows = match is_exact {
-            true => Precision::Exact(match self.range.as_ref().filter(|_| honors_range) {
-                // The range slices the fragments concatenated end to end, so the scan
-                // emits the part of it overlapping rows that exist. A range reaching
-                // past the last row yields the rows up to it, not its full width.
-                Some(range) => {
-                    let end = range.end.min(row_count as u64);
-                    end.saturating_sub(range.start) as usize
-                }
-                None => row_count,
-            }),
-            false => Precision::Absent,
-        };
+        let num_rows = self
+            .fragments
+            .row_count()
+            .map(|row_count| {
+                Precision::Exact(match self.range.as_ref().filter(|_| honors_range) {
+                    // A range reaching past the last row emits only existing rows.
+                    Some(range) => {
+                        let end = range.end.min(row_count as u64);
+                        end.saturating_sub(range.start) as usize
+                    }
+                    None => row_count,
+                })
+            })
+            .unwrap_or(Precision::Absent);
 
         Ok(Arc::new(Statistics {
             num_rows,
@@ -869,11 +854,14 @@ mod tests {
     use datafusion::execution::TaskContext;
     use datafusion::prelude::SessionConfig;
     use futures::TryStreamExt;
+    use lance_core::cache::LanceCache;
     use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
+    use lance_table::fragment_metadata::{FragmentTree, FragmentTreeConfig, SnapshotPolicy};
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
+    use crate::dataset::fragment_source::LazyFragments;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture};
 
     use super::*;
@@ -917,6 +905,28 @@ mod tests {
         Arc::new(dataset)
     }
 
+    async fn scan_fragment_source(dataset: &Dataset, is_lazy: bool) -> FragmentSource {
+        if !is_lazy {
+            return dataset.fragment_source();
+        }
+        let (tree, _, _) = FragmentTree::bootstrap_snapshot(
+            dataset.object_store.clone(),
+            dataset.base.clone(),
+            ScanScheduler::new(
+                dataset.object_store.clone(),
+                SchedulerConfig::default_for_testing(),
+            ),
+            Arc::new(LanceCache::no_cache()),
+            FragmentTreeConfig::default(),
+            dataset.fragments().as_ref().clone(),
+            dataset.version().version,
+            SnapshotPolicy::default(),
+        )
+        .await
+        .unwrap();
+        FragmentSource::Lazy(Arc::new(LazyFragments::new(Arc::new(tree))))
+    }
+
     async fn scanned_rows(scan: &LanceScanExec) -> usize {
         let batches = scan
             .execute(0, Arc::new(TaskContext::default()))
@@ -941,11 +951,13 @@ mod tests {
     async fn statistics_follow_the_scan_range(
         #[case] range: Option<Range<u64>>,
         #[case] expected_rows: usize,
+        #[values(false, true)] is_lazy: bool,
     ) {
         let dataset = ranged_scan_dataset(LanceFileVersion::Stable).await;
+        let fragments = scan_fragment_source(&dataset, is_lazy).await;
         let scan = LanceScanExec::new(
             dataset.clone(),
-            dataset.fragments().clone(),
+            fragments,
             range,
             Arc::new(dataset.schema().clone()),
             LanceScanConfig::default(),
@@ -979,6 +991,56 @@ mod tests {
 
         let stats = scan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(TOTAL_ROWS));
+        assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
+    }
+
+    #[rstest]
+    #[case::no_range(None)]
+    #[case::empty_range(Some(0..0))]
+    #[tokio::test]
+    async fn missing_row_count_statistics_are_unknown(#[case] range: Option<Range<u64>>) {
+        let dataset = ranged_scan_dataset(LanceFileVersion::Stable).await;
+        let mut fragments = dataset.fragments().as_ref().clone();
+        fragments[0].physical_rows = None;
+        let scan = LanceScanExec::new(
+            dataset.clone(),
+            fragments,
+            range,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig::default(),
+        );
+        assert_eq!(
+            scan.partition_statistics(None).unwrap().num_rows,
+            Precision::Absent
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn deletion_null_statistics_are_unknown(#[values(false, true)] is_lazy: bool) {
+        let mut dataset = ranged_scan_dataset(LanceFileVersion::Stable)
+            .await
+            .as_ref()
+            .clone();
+        dataset.delete("x = 0").await.unwrap();
+        let fragments = scan_fragment_source(&dataset, is_lazy).await;
+        let dataset = Arc::new(dataset);
+        let scan = LanceScanExec::new(
+            dataset.clone(),
+            fragments,
+            None,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig {
+                with_row_id: true,
+                with_make_deletions_null: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            scan.partition_statistics(None).unwrap().num_rows,
+            Precision::Absent
+        );
         assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
     }
 

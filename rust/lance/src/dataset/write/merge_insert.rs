@@ -49,6 +49,7 @@ use super::{
 };
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::dataset::updater::OutputSchema;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
 use crate::{
@@ -134,7 +135,7 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     iter::Peekable,
     sync::{
         Arc, Mutex,
@@ -1808,7 +1809,10 @@ impl MergeInsertJob {
                     let mut updater = fragment
                         .updater_with_version(
                             Some(&read_columns),
-                            Some((write_schema, dataset.schema().clone())),
+                            OutputSchema::Known {
+                                write: write_schema,
+                                complete: dataset.schema().clone(),
+                            },
                             None,
                             None,
                             write_version,
@@ -1974,7 +1978,7 @@ impl MergeInsertJob {
             match frag_id.first() {
                 Some(ScalarValue::UInt64(Some(frag_id))) => {
                     let frag_id = *frag_id;
-                    let Some(fragment) = dataset.get_fragment(frag_id as usize) else {
+                    let Some(fragment) = dataset.get_fragment_async(frag_id as usize).await? else {
                         error!(
                             fragment_id = frag_id,
                             dataset_uri = %dataset.uri(),
@@ -2837,7 +2841,7 @@ impl MergeInsertJob {
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec);
 
             let (updated_fragments, removed_fragment_ids) =
-                Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
+                crate::dataset::utils::apply_deletions(&self.dataset, &removed_row_addrs).await?;
 
             let operation = Operation::Update {
                 removed_fragment_ids,
@@ -2973,7 +2977,8 @@ impl MergeInsertJob {
                 }
             };
 
-            let deletions_result = Self::apply_deletions(&self.dataset, &removed_row_addrs).await;
+            let deletions_result =
+                crate::dataset::utils::apply_deletions(&self.dataset, &removed_row_addrs).await;
             let (old_fragments, removed_fragment_ids) = match deletions_result {
                 Ok(v) => v,
                 Err(e) => {
@@ -3023,53 +3028,6 @@ impl MergeInsertJob {
             stats,
             inserted_rows_filter: None, // not implemented for v1
         })
-    }
-
-    // Delete a batch of rows by id, returns the fragments modified and the fragments removed
-    async fn apply_deletions(
-        dataset: &Dataset,
-        removed_row_ids: &RoaringTreemap,
-    ) -> Result<(Vec<Fragment>, Vec<u64>)> {
-        let bitmaps = Arc::new(removed_row_ids.bitmaps().collect::<BTreeMap<_, _>>());
-
-        enum FragmentChange {
-            Unchanged,
-            Modified(Box<Fragment>),
-            Removed(u64),
-        }
-
-        let mut updated_fragments = Vec::new();
-        let mut removed_fragments = Vec::new();
-
-        let mut stream = futures::stream::iter(dataset.get_fragments())
-            .map(move |fragment| {
-                let bitmaps_ref = bitmaps.clone();
-                async move {
-                    let fragment_id = fragment.id();
-                    if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
-                        match fragment.extend_deletions(*bitmap).await {
-                            Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
-                            }
-                            Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok(FragmentChange::Unchanged)
-                    }
-                }
-            })
-            .buffer_unordered(dataset.object_store.io_parallelism());
-
-        while let Some(res) = stream.next().await.transpose()? {
-            match res {
-                FragmentChange::Unchanged => {}
-                FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
-                FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
-            }
-        }
-
-        Ok((updated_fragments, removed_fragments))
     }
 
     /// Generate the execution plan and return it as a formatted string for debugging.
@@ -13376,7 +13334,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     /// Tests that apply_deletions correctly handles an error when applying the row deletions.
     #[tokio::test]
     async fn test_apply_deletions_invalid_row_address() {
-        use super::exec::apply_deletions;
+        use crate::dataset::utils::apply_deletions;
         use roaring::RoaringTreemap;
 
         let test_uri = "memory://test_apply_deletions_error.lance";

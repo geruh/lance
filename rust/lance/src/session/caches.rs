@@ -99,14 +99,17 @@ impl CacheKey for ManifestKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct TransactionKey {
+pub struct TransactionKey<'a> {
     pub version: u64,
+    /// Distinguishes datasets recreated at the same URI with matching versions.
+    /// Callers without an ETag must bypass the shared transaction cache.
+    pub e_tag: Option<&'a str>,
 }
 
-impl CacheKey for TransactionKey {
+impl CacheKey for TransactionKey<'_> {
     type ValueType = Transaction;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("txn/{}", self.version))
+        Cow::Owned(format!("txn/{}/{}", self.version, self.e_tag.unwrap_or("")))
     }
     fn type_name() -> &'static str {
         "Transaction"
@@ -118,6 +121,12 @@ impl CacheKey for TransactionKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
     }
 }
 
@@ -356,6 +365,7 @@ mod tests {
     use std::sync::Arc;
 
     use lance_table::rowids::write_row_ids;
+    use lance_table::transaction::{Operation, TransactionBuilder};
 
     use super::*;
 
@@ -417,6 +427,38 @@ mod tests {
                     fragment_id: 0,
                     row_id_meta: &second_generation,
                     lineage_file: None,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_key_separates_manifest_generations() {
+        let cache = LanceCache::with_capacity(4096);
+        let key = TransactionKey {
+            version: 3,
+            e_tag: Some("first-etag"),
+        };
+        let txn = TransactionBuilder::new(0, Operation::Append { fragments: vec![] }).build();
+        cache.insert_with_key(&key, Arc::new(txn)).await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        assert!(
+            cache
+                .get_with_key(&TransactionKey {
+                    version: 3,
+                    e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
+        // No e-tag (unknown/opaque store) must not alias a real one either.
+        assert!(
+            cache
+                .get_with_key(&TransactionKey {
+                    version: 3,
+                    e_tag: None,
                 })
                 .await
                 .is_none()

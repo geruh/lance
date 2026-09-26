@@ -2320,7 +2320,7 @@ async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
 
     let mut unsupported_manifest = source.manifest.as_ref().clone();
     unsupported_manifest.version += 1;
-    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    unsupported_manifest.writer_feature_flags |= 1u64 << 63; // An unassigned writer capability.
     write_manifest_file(
         source.object_store.as_ref(),
         source.commit_handler.as_ref(),
@@ -2368,7 +2368,7 @@ async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
 
     let mut unsupported_manifest = source.manifest.as_ref().clone();
     unsupported_manifest.version += 1;
-    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    unsupported_manifest.writer_feature_flags |= 1u64 << 63; // An unassigned writer capability.
     write_manifest_file(
         source.object_store.as_ref(),
         source.commit_handler.as_ref(),
@@ -3648,6 +3648,24 @@ async fn test_get_fragment_by_id() {
         let fragment = dataset.get_fragment(id).unwrap();
         assert_eq!(fragment.id(), id);
     }
+    let selected = dataset
+        .file_fragments_for_ids(&[3, 1, 0, 3, 4, u64::MAX])
+        .await
+        .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|fragment| fragment.id())
+            .collect::<Vec<_>>(),
+        vec![0, 3]
+    );
+    assert!(
+        dataset
+            .file_fragments_for_ids(&[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Replace the manifest fragments, rebuilding the derived state exactly as
@@ -3672,10 +3690,13 @@ fn install_fragments(dataset: &mut Dataset, fragments: Vec<Fragment>) {
 /// are still readable -- neither is rejected on open. A lookup that trusted the
 /// sorted-by-id invariant would hand back a different fragment's data.
 #[rstest]
-#[case::unsorted(vec![3, 1, 2, 0])]
-#[case::duplicate_ids(vec![0, 0, 2, 3])]
+#[case::unsorted(vec![3, 1, 2, 0], vec![3, 0])]
+#[case::duplicate_ids(vec![0, 0, 2, 3], vec![0, 0, 3])]
 #[tokio::test]
-async fn test_get_fragment_on_legacy_manifest(#[case] ids: Vec<u64>) {
+async fn test_get_fragment_on_legacy_manifest(
+    #[case] ids: Vec<u64>,
+    #[case] selected_ids: Vec<usize>,
+) {
     let data = gen_batch()
         .col("i", array::step::<Int32Type>())
         .into_reader_rows(RowCount::from(10), BatchCount::from(4));
@@ -3713,6 +3734,17 @@ async fn test_get_fragment_on_legacy_manifest(#[case] ids: Vec<u64>) {
         );
     }
     assert!(dataset.get_fragment(4).is_none());
+    let selected = dataset
+        .file_fragments_for_ids(&[0, 3, 0, 99, u64::MAX])
+        .await
+        .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|fragment| fragment.id())
+            .collect::<Vec<_>>(),
+        selected_ids
+    );
 }
 
 async fn write_tiny_dataset(uri: &str) -> Dataset {

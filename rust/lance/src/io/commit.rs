@@ -173,7 +173,7 @@ pub(crate) async fn read_transaction_file(
 /// have NOT landed (see [`verify_commit_outcome`]): a landed manifest
 /// references its transaction file by path, so deleting it would corrupt the
 /// version.
-async fn cleanup_transaction_file(
+pub(crate) async fn cleanup_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction_file: &str,
@@ -206,7 +206,7 @@ async fn cleanup_transaction_file(
 
 /// Who owns the manifest at a version, checked after a failed commit attempt.
 #[derive(Debug)]
-enum CommitOutcome {
+pub(crate) enum CommitOutcome {
     /// The manifest at the version is the one this attempt wrote: the commit
     /// actually landed even though the store reported a failure (e.g. the
     /// response to a successful conditional PUT was lost and an internal
@@ -236,7 +236,7 @@ const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 ///
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
-async fn verify_commit_outcome(
+pub(crate) async fn verify_commit_outcome(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
@@ -307,7 +307,7 @@ async fn verify_commit_outcome(
     }
 }
 
-async fn read_manifest_transaction(
+pub(crate) async fn read_manifest_transaction(
     object_store: &ObjectStore,
     base_path: &Path,
     manifest: &Manifest,
@@ -411,7 +411,7 @@ async fn do_commit_new_dataset(
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
-            ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
+            ObjectStore::extract_path_from_uri(store_registry.clone(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
@@ -429,7 +429,12 @@ async fn do_commit_new_dataset(
             &source_manifest,
         )
         .await?;
-        Some((source_store, source_manifest_location, source_manifest))
+        Some((
+            source_store,
+            source_manifest_location,
+            source_manifest,
+            source_base_path,
+        ))
     } else {
         None
     };
@@ -448,23 +453,34 @@ async fn do_commit_new_dataset(
             branch_name,
             ..
         },
-        Some((source_store, source_manifest_location, source_manifest)),
+        Some((source_store, source_manifest_location, source_manifest, source_base_path)),
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
-            let new_base_id = source_manifest
-                .base_paths
-                .keys()
-                .max()
-                .map(|id| *id + 1)
-                .unwrap_or(0);
-            let new_manifest = source_manifest.shallow_clone(
+            let new_base_id = match source_manifest.base_paths.keys().max() {
+                Some(id) => id.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input(format!("cannot allocate clone base ID after {id}"))
+                })?,
+                None => 0,
+            };
+            let mut new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
                 new_base_id,
                 branch_name.clone(),
                 transaction_file.clone(),
             );
+            if new_manifest.fragment_tree.is_some() {
+                crate::dataset::fragment_metadata::clone_fragment_metadata(
+                    Arc::new(object_store.clone()),
+                    base_path.clone(),
+                    Arc::new(source_store.clone()),
+                    source_base_path,
+                    new_base_id,
+                    &mut new_manifest,
+                )
+                .await?;
+            }
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
                 let reader = source_store.open(&source_manifest_location.path).await?;
@@ -512,6 +528,32 @@ async fn do_commit_new_dataset(
                 }
             }
             new_manifest.fragments = Arc::new(new_frags);
+
+            if new_manifest.fragment_tree.is_some() {
+                let tree = crate::dataset::fragment_metadata::tree_from_manifest(
+                    Arc::new(source_store.clone()),
+                    store_registry,
+                    source_base_path.clone(),
+                    &source_manifest,
+                )
+                .await?;
+                let mut fragments = tree.materialize().await?;
+                for fragment in &mut fragments {
+                    for file in fragment.referenced_lance_files_mut() {
+                        file.base_id = None;
+                    }
+                    if let Some(deletion) = fragment.deletion_file.as_mut() {
+                        deletion.base_id = None;
+                    }
+                }
+                new_manifest.set_fragments(fragments);
+                crate::dataset::fragment_metadata::rebuild_fragment_metadata(
+                    Arc::new(object_store.clone()),
+                    base_path.clone(),
+                    &mut new_manifest,
+                )
+                .await?;
+            }
 
             // Indices: keep metadata but normalize base to local
             let mut updated_indices = Vec::new();
@@ -657,12 +699,15 @@ async fn record_new_dataset_commit(
     manifest: &Manifest,
     location: &ManifestLocation,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-    };
-    metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(e_tag) = location.e_tag.as_deref() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+            e_tag: Some(e_tag),
+        };
+        metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
@@ -725,7 +770,7 @@ pub fn manifest_needs_migration(manifest: &Manifest, indices: &[IndexMetadata]) 
 ///
 /// Fields such as `physical_rows` and `num_deleted_rows` may not have been
 /// in older datasets. To bring these old manifests up-to-date, we add them here.
-async fn migrate_manifest(
+pub(crate) async fn migrate_manifest(
     dataset: &Dataset,
     manifest: &mut Manifest,
     recompute_stats: bool,
@@ -757,7 +802,7 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
 /// Runs after the legacy fixups above, so a dataset that needs a rollback for some
 /// other reason is diagnosed with that first. Relies on `build_manifest` leaving
 /// the fragments sorted by id.
-fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
+pub(crate) fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
     if let Some(pair) = manifest.fragments.windows(2).find(|p| p[0].id == p[1].id) {
         return Err(Error::invalid_input(format!(
             "The commit would produce two fragments with id {}. Fragment ids must be \
@@ -778,7 +823,7 @@ fn check_column_indices(manifest: &Manifest) -> Result<()> {
 /// Fix schema in case of duplicate field ids.
 ///
 /// See test dataset v0.10.5/corrupt_schema
-fn fix_schema(manifest: &mut Manifest) -> Result<()> {
+pub(crate) fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We can short-circuit if there is only one file per fragment or no fragments.
     if manifest.fragments.iter().all(|f| f.files.len() <= 1) {
         return Ok(());
@@ -992,7 +1037,10 @@ fn must_recalculate_fragment_bitmap(
 /// the only changes here that alter what an index covers, and the caller has to
 /// withdraw MemWAL catch-up for them: this runs after the coverage derivation,
 /// and it keeps the segment's UUID.
-async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<Vec<String>> {
+pub(crate) async fn migrate_indices(
+    dataset: &Dataset,
+    indices: &mut [IndexMetadata],
+) -> Result<Vec<String>> {
     infer_missing_vector_details(dataset, indices).await;
     let mut recovered_coverage = Vec::new();
     let needs_recalculating = match detect_overlapping_fragments(indices) {
@@ -1399,13 +1447,16 @@ async fn record_successful_commit(
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-    };
-    dataset
-        .metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(e_tag) = location.e_tag.as_deref() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+            e_tag: Some(e_tag),
+        };
+        dataset
+            .metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
@@ -1455,7 +1506,11 @@ pub(crate) async fn commit_transaction(
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
-    let mut target_version = read_version + 1;
+    let mut target_version = read_version.checked_add(1).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Transaction read version {read_version} cannot have a next version"
+        ))
+    })?;
     let original_dataset = dataset.clone();
 
     // read_version sometimes defaults to zero for overwrite.
@@ -1463,15 +1518,36 @@ pub(crate) async fn commit_transaction(
     // Strict overwrites are not subject to any sort of automatic conflict resolution.
     let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0;
-    let mut dataset =
-        if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
-            // If the dataset version is not the same as the read version, we need to
-            // checkout the read version.
-            dataset.checkout_version(read_version).await?
-        } else {
-            // If the dataset version is the same as the read version, we can use it directly.
-            dataset.clone()
-        };
+    let mut dataset = if strict_overwrite {
+        let mut latest = dataset.clone();
+        latest.checkout_latest().await?;
+        if read_version > latest.manifest.version {
+            return Err(Error::invalid_input(format!(
+                "Transaction read version {read_version} exceeds current version {}",
+                latest.manifest.version
+            )));
+        }
+        if latest.manifest.version != read_version {
+            return Err(Error::commit_conflict_source(
+                read_version + 1,
+                format!(
+                    "Strict overwrite expected version {read_version}, but current version is {}",
+                    latest.manifest.version
+                )
+                .into(),
+            ));
+        }
+        if latest.manifest.fragment_tree.is_some() != dataset.manifest.fragment_tree.is_some() {
+            return Err(Error::invalid_input(
+                "Dataset metadata layout changed since this handle was opened",
+            ));
+        }
+        latest
+    } else if dataset.manifest.version != read_version && read_version != 0 {
+        dataset.checkout_version(read_version).await?
+    } else {
+        dataset.clone()
+    };
 
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index

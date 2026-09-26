@@ -51,7 +51,7 @@ use crate::{
     },
 };
 
-use super::apply_deletions;
+use crate::dataset::utils::apply_deletions;
 
 /// Shared state for merge insert operations to simplify lock management
 struct MergeState {
