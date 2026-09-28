@@ -133,7 +133,9 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_io::object_store::uri_to_url;
 use lance_table::format::{Fragment, IndexMetadata, RowDatasetVersionSequence};
+use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -1488,8 +1490,25 @@ async fn descriptor_to_logical_blob_array(
                             field_name, base_id
                         ))
                     })?;
-                    let absolute_uri = format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
-                    uri_builder.append_value(&absolute_uri);
+                    let key = Path::parse(uri_val).map_err(|e| {
+                        Error::internal(format!(
+                            "External blob in column '{}' has invalid relative path '{}': {}",
+                            field_name, uri_val, e
+                        ))
+                    })?;
+                    // Appending encoded segments keeps '#', '?' and '%' part of the key.
+                    let mut absolute_url = uri_to_url(&base.path)?;
+                    absolute_url
+                        .path_segments_mut()
+                        .map_err(|_| {
+                            Error::internal(format!(
+                                "Base path '{}' of base_id {} cannot hold a relative path",
+                                base.path, base_id
+                            ))
+                        })?
+                        .pop_if_empty()
+                        .extend(key.parts());
+                    uri_builder.append_value(absolute_url.as_str());
                 }
                 let position =
                     (!descriptor.position_col.is_null(i)).then(|| descriptor.position_col.value(i));
@@ -9815,6 +9834,88 @@ mod tests {
                 (1, Some(b"inline-data".to_vec()))
             ]
         );
+    }
+
+    #[rstest]
+    #[case::fragment_delimiter("a%23b", "a#b", "a")]
+    #[case::escaped_percent("p%2541", "p%41", "pA")]
+    // '?' is not allowed in Windows file names.
+    #[cfg_attr(unix, case::query_delimiter("x%3Fy", "x?y", "x"))]
+    #[tokio::test]
+    async fn test_rewrite_blob_v2_preserves_external_keys_with_reserved_url_chars(
+        #[case] encoded_key: &str,
+        #[case] key: &str,
+        #[case] misparsed_key: &str,
+    ) {
+        use crate::BlobArrayBuilder;
+        use crate::dataset::UpdateBuilder;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        std::fs::write(external_dir.std_path().join(key), b"referenced-object").unwrap();
+        // The decoy makes a wrong reference read wrong bytes instead of failing with NotFound.
+        std::fs::write(external_dir.std_path().join(misparsed_key), b"other-object").unwrap();
+        let base_uri = format!("file://{}", external_dir.std_path().display());
+
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        blob_builder
+            .push_uri(format!("{base_uri}/{encoded_key}"))
+            .unwrap();
+        blob_builder.push_bytes(b"inline-data").unwrap();
+        blob_builder.push_null().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    path: base_uri,
+                    is_dataset_root: false,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Updating the external row rebuilds its URI the same way compaction does.
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 0")
+            .unwrap()
+            .set("id", "id")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_compaction_preserves_blob_values(
+            Arc::unwrap_or_clone(updated.new_dataset),
+            &[
+                (0, Some(b"referenced-object".to_vec())),
+                (1, Some(b"inline-data".to_vec())),
+                (2, None),
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]
