@@ -581,7 +581,9 @@ impl BlobDescriptorColumn {
 /// Builds the writer-prepared representation for one blob v2 column.
 ///
 /// This builder only produces the writer-prepared struct array. It does not allocate blob ids,
-/// choose sidecar paths, write blob objects, or commit data files.
+/// choose sidecar paths, write blob objects, or commit data files. Packed and dedicated rows name
+/// sidecars of a specific data file, so writers that choose their own data file key, such as
+/// [`crate::Dataset::write`], reject them.
 pub struct BlobDescriptorArrayBuilder {
     field: Field,
     values: Vec<BlobDescriptor>,

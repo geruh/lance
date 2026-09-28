@@ -978,6 +978,28 @@ impl BlobPreprocessor {
                         .await;
                 }
                 validate_prepared_blob_array(field.as_ref(), &array)?;
+                let values = array.as_struct();
+                let kinds = values
+                    .column_by_name("kind")
+                    .expect("validated prepared Blob has kind")
+                    .as_primitive::<UInt8Type>();
+                let blob_ids = values
+                    .column_by_name("blob_id")
+                    .expect("validated prepared Blob has blob_id")
+                    .as_primitive::<UInt32Type>();
+                for row in 0..values.len() {
+                    if values.is_null(row) {
+                        continue;
+                    }
+                    let kind = BlobKind::try_from(kinds.value(row))?;
+                    if matches!(kind, BlobKind::Packed | BlobKind::Dedicated) {
+                        return Err(Error::invalid_input(format!(
+                            "Prepared Blob v2 field '{}' row {row} is {kind:?} with Blob ID {}; this writer picks its own data file key, so write managed Blobs with Dataset::write_data_file_part",
+                            field.name(),
+                            blob_ids.value(row)
+                        )));
+                    }
+                }
                 return Ok((array, field.clone()));
             }
 
@@ -4784,7 +4806,8 @@ mod tests {
     use crate::{
         Dataset,
         blob::{
-            BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobRange, PackedBlobWriter, blob_field,
+            BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange,
+            PackedBlobWriter, blob_field,
         },
         dataset::{
             CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
@@ -6555,6 +6578,41 @@ mod tests {
         assert_eq!(
             blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"prepared-inline"
+        );
+    }
+
+    #[rstest]
+    #[case::packed(BlobDescriptor::Packed { blob_id: 1, offset: 0, size: 8 }, "Packed")]
+    #[case::dedicated(BlobDescriptor::Dedicated { blob_id: 1, size: 8 }, "Dedicated")]
+    #[tokio::test]
+    async fn test_write_rejects_prepared_managed_blob_column(
+        #[case] descriptor: BlobDescriptor,
+        #[case] kind: &str,
+    ) {
+        let test_dir = TempStrDir::default();
+        let mut prepared_writer = BlobDescriptorArrayBuilder::new("blob");
+        prepared_writer.push(descriptor).unwrap();
+        let (prepared_field, prepared_array) = prepared_writer.finish().unwrap().into_parts();
+        let schema = Arc::new(Schema::new(vec![prepared_field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![prepared_array]).unwrap();
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("field 'blob' row 0 is {kind} with Blob ID 1")),
+            "{error}"
         );
     }
 
