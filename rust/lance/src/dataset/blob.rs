@@ -3575,7 +3575,9 @@ async fn collect_blob_selection_for_selection(
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     let files = match blob_version_from_descriptions(descriptions)? {
-        BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
+        BlobVersion::V1 => {
+            collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs).await
+        }
         BlobVersion::V2 => {
             collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
         }
@@ -3713,7 +3715,7 @@ impl<'a> BlobV2DescriptorColumns<'a> {
 }
 
 /// Resolve blob v1 descriptors without dropping null selection slots.
-fn collect_blob_files_v1(
+async fn collect_blob_files_v1(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
     descriptions: &StructArray,
@@ -3762,13 +3764,12 @@ fn collect_blob_files_v1(
                 blob_field_id, frag_id, row_addr
             ))
         })?;
-        let data_file_path = dataset.data_dir().join(data_file.path.as_str());
+        let data_file_path = dataset
+            .data_file_dir(data_file)?
+            .join(data_file.path.as_str());
+        let object_store = dataset.object_store_for_data_file(data_file).await?;
         files.push(Some(BlobFile::with_source(
-            shared_blob_source(
-                &mut source_cache,
-                dataset.object_store.clone(),
-                &data_file_path,
-            ),
+            shared_blob_source(&mut source_cache, object_store, &data_file_path),
             position,
             size,
             BlobKind::Inline,
@@ -5726,6 +5727,7 @@ mod tests {
         let row_addrs = UInt64Array::from(vec![(999_u64 << 32) | 7]);
 
         let err = collect_blob_files_v1(&fixture.dataset, blob_field_id, &descriptions, &row_addrs)
+            .await
             .unwrap_err();
 
         assert!(err.to_string().contains("references missing fragment"));
@@ -7820,7 +7822,9 @@ mod tests {
         )
         .unwrap();
         let row_addrs = UInt64Array::from(vec![u64::MAX]);
-        let files = collect_blob_files_v1(&dataset, u32::MAX, &descriptions, &row_addrs).unwrap();
+        let files = collect_blob_files_v1(&dataset, u32::MAX, &descriptions, &row_addrs)
+            .await
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].is_none());
     }
@@ -8430,6 +8434,81 @@ mod tests {
             blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_blob_reads_from_shallow_clone() {
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(blob_meta),
+        ]));
+        let payloads = [
+            b"abc".as_slice(),
+            b"defgh".as_slice(),
+            b"ijklmnop".as_slice(),
+        ];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef,
+                Arc::new(LargeBinaryArray::from_iter_values(payloads)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        // 2.1 keeps the column as a v1 blob; 2.2+ would promote it to blob v2.
+        let mut source = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &source_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.fragments().len(), 2);
+
+        let version = source.version().version;
+        let clone = Arc::new(
+            source
+                .shallow_clone(clone_dir.as_str(), version, None)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            clone
+                .fragments()
+                .iter()
+                .all(|frag| frag.files.iter().all(|file| file.base_id.is_some()))
+        );
+
+        let blobs = clone
+            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), payloads.len());
+        for (blob, expected) in blobs.iter().zip(payloads) {
+            assert_eq!(
+                blob.as_ref().unwrap().read().await.unwrap().as_ref(),
+                expected
+            );
+        }
+
+        let read_blobs = clone
+            .read_blobs("blob")
+            .unwrap()
+            .with_row_indices(vec![0, 1, 2])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(read_blobs.len(), payloads.len());
+        for (read_blob, expected) in read_blobs.iter().zip(payloads) {
+            assert_eq!(read_blob.data.as_deref(), Some(expected));
+        }
     }
 
     #[tokio::test]
