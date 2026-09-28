@@ -1477,9 +1477,9 @@ struct PendingBlobRead {
 
 /// Submit one grouped batch of pending blob reads to Lance's [`FileScheduler`].
 ///
-/// The function flattens all logical requests into one range list, preserves the
-/// caller-visible order for each request, and fans the bytes back out after the
-/// scheduler completes its own merge / split logic.
+/// The function flattens all logical requests into one range list, submits
+/// their union as disjoint physical ranges, and slices each caller's bytes back
+/// out in the caller-visible order.
 async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<PendingBlobRead>) {
     let total_ranges = batch
         .iter()
@@ -1500,29 +1500,36 @@ async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<Pendin
         }
     }
 
-    let result = if request_ranges.is_empty() {
+    let (physical_ranges, slices) =
+        plan_disjoint_blob_reads(request_ranges.iter().map(|(range, _, _)| range.clone()));
+    let result = if physical_ranges.is_empty() {
         Ok(())
     } else {
-        request_ranges.sort_by_key(|(range, _, _)| (range.start, range.end));
-        let priority = request_ranges[0].0.start;
-        match scheduler
-            .submit_request(
-                request_ranges
-                    .iter()
-                    .map(|(range, _, _)| range.clone())
-                    .collect::<Vec<_>>(),
-                priority,
-            )
-            .await
-        {
-            Ok(bytes_vec) => {
-                for ((_, request_idx, range_idx), bytes) in
-                    request_ranges.into_iter().zip(bytes_vec)
-                {
-                    response[request_idx][range_idx] = bytes;
-                }
-                Ok(())
+        let priority = physical_ranges[0].start;
+        let physical_range_count = physical_ranges.len();
+        match scheduler.submit_request(physical_ranges, priority).await {
+            Ok(bytes_vec) if bytes_vec.len() != physical_range_count => {
+                Err(Error::internal(format!(
+                    "Blob read scheduler returned {} ranges for {} disjoint physical ranges",
+                    bytes_vec.len(),
+                    physical_range_count
+                )))
             }
+            Ok(bytes_vec) => slices.into_iter().try_for_each(|slice| {
+                let data = &bytes_vec[slice.physical_range_index];
+                if slice.relative_range.end > data.len() as u64 {
+                    return Err(Error::internal(format!(
+                        "Blob read slice {:?} exceeds the {} bytes returned for physical range {}",
+                        slice.relative_range,
+                        data.len(),
+                        slice.physical_range_index
+                    )));
+                }
+                let (_, request_idx, range_idx) = request_ranges[slice.read_index];
+                response[request_idx][range_idx] = data
+                    .slice(slice.relative_range.start as usize..slice.relative_range.end as usize);
+                Ok(())
+            }),
             Err(err) => Err(err),
         }
     };
@@ -1793,9 +1800,9 @@ impl BlobFile {
 
     /// Read multiple ranges relative to the beginning of this blob without changing the cursor.
     ///
-    /// Empty ranges are allowed and yield empty buffers. The result order always
-    /// matches the input order, even though the underlying physical requests may
-    /// be reordered, coalesced, or split for efficiency.
+    /// Ranges may overlap. Empty ranges are allowed and yield empty buffers. The
+    /// result order always matches the input order, even though the underlying
+    /// physical requests may be reordered, coalesced, or split for efficiency.
     pub async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         self.ensure_open().await?;
         let physical_ranges = ranges
@@ -3278,13 +3285,12 @@ fn plan_blob_read_plans(entries: Vec<BlobEntry>) -> Result<Vec<BlobReadPlan>> {
 /// not advance past the start of a later nested range while reconstructing the
 /// caller's buffers.
 fn plan_disjoint_blob_reads(
-    reads: &[PlannedBlobRead],
+    ranges: impl IntoIterator<Item = Range<u64>>,
 ) -> (Vec<Range<u64>>, Vec<PlannedBlobReadSlice>) {
-    let mut non_empty_ranges = reads
-        .iter()
+    let mut non_empty_ranges = ranges
+        .into_iter()
         .enumerate()
-        .filter(|(_, read)| !read.physical_range.is_empty())
-        .map(|(read_index, read)| (read_index, read.physical_range.clone()))
+        .filter(|(_, range)| !range.is_empty())
         .collect::<Vec<_>>();
     non_empty_ranges.sort_by_key(|(read_index, range)| (range.start, range.end, *read_index));
 
@@ -3317,7 +3323,8 @@ async fn execute_blob_read_plan(
     task: BlobReadPlan,
     execution: Arc<ReadBlobsExecution>,
 ) -> Result<Vec<IndexedReadBlob>> {
-    let (physical_ranges, slices) = plan_disjoint_blob_reads(&task.reads);
+    let (physical_ranges, slices) =
+        plan_disjoint_blob_reads(task.reads.iter().map(|read| read.physical_range.clone()));
     let mut bytes = vec![Bytes::new(); task.reads.len()];
     if let Some(first_range) = physical_ranges.first() {
         let scheduler = execution.scheduler_for(&task.source);
@@ -7305,6 +7312,41 @@ mod tests {
         assert!(chunks[3].is_empty());
         assert_eq!(inner.requested_ranges(), vec![1..7]);
         assert_eq!(inner.head_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case::nested(&[(0, 8), (2, 4)])]
+    #[case::duplicate(&[(0, 8), (0, 8)])]
+    #[case::straddling_out_of_order(&[(2, 8), (0, 6)])]
+    #[tokio::test]
+    async fn test_blob_file_read_ranges_handles_overlaps_across_scheduler_splits(
+        #[case] eighths: &[(u64, u64)],
+    ) {
+        // Larger than one I/O request, so the scheduler splits the full read.
+        let value_size = *lance_io::object_store::DEFAULT_MAX_IOP_SIZE + 12;
+        let pattern = (0..=250u8).collect::<Vec<_>>();
+        let mut data = pattern.repeat((value_size as usize).div_ceil(pattern.len()));
+        data.truncate(value_size as usize);
+        let data = Bytes::from(data);
+        let (store, _) = recording_range_store(data.clone());
+        let blob = BlobFile::new_dedicated(store, Path::from("blobs/overlapping.bin"), value_size);
+        let ranges = eighths
+            .iter()
+            .map(|&(start, end)| value_size * start / 8..value_size * end / 8)
+            .collect::<Vec<_>>();
+
+        let chunks = blob.read_ranges(&ranges).await.unwrap();
+
+        assert_eq!(chunks.len(), ranges.len());
+        for (range, chunk) in ranges.iter().zip(&chunks) {
+            let expected = &data[range.start as usize..range.end as usize];
+            assert!(
+                chunk.as_ref() == expected,
+                "wrong bytes for {range:?}: got {} of {} bytes",
+                chunk.len(),
+                expected.len()
+            );
+        }
     }
 
     #[tokio::test]
