@@ -6,15 +6,17 @@ use std::{collections::HashMap, fs, ops::Range, sync::Arc};
 use arrow::array::AsArray;
 use arrow_array::{
     ArrayRef, LargeBinaryArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
-    UInt64Array, types::Int32Type,
+    UInt8Array, UInt32Array, UInt64Array,
+    types::{Int32Type, UInt32Type, UInt64Type},
 };
+use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::{TryStreamExt, stream};
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
 use lance_core::{
     Error,
-    datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling},
+    datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BlobHandling, BlobKind},
     utils::{blob::blob_path, tempfile::TempDir},
 };
 use lance_file::concat::EncodedFileInput;
@@ -778,6 +780,73 @@ async fn complete_logical_blob_schema_and_external_range_survive_assembly() {
     let batch = scanner.try_into_batch().await.unwrap();
     let values = batch["blob"].as_binary::<i64>();
     assert_eq!(values.value(0), b"selected");
+}
+
+#[tokio::test]
+async fn prepared_external_part_stores_null_range_and_base_id_as_zero() {
+    let test_dir = TempDir::default();
+    let external_path = test_dir.std_path().join("blob.bin");
+    fs::write(&external_path, b"prefix-selected-suffix").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
+    let mut blobs = BlobArrayBuilder::new(1);
+    blobs.push_bytes(b"old").unwrap();
+    let original = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
+    let dataset = dataset_of(original, LanceFileVersion::V2_2).await;
+    let target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        dataset.manifest.data_storage_format.lance_file_format(),
+    )
+    .unwrap();
+
+    // Arrow leaves the values under null slots unspecified, so they must not be read.
+    let nulls = NullBuffer::new_null(1);
+    let prepared = StructArray::try_new(
+        BLOB_V2_PREPARED_FIELDS.clone(),
+        vec![
+            Arc::new(UInt8Array::from(vec![BlobKind::External as u8])) as ArrayRef,
+            Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>])) as ArrayRef,
+            Arc::new(StringArray::from(vec![external_uri.as_str()])) as ArrayRef,
+            Arc::new(UInt32Array::new(vec![1_u32].into(), Some(nulls.clone()))) as ArrayRef,
+            Arc::new(UInt64Array::new(vec![8_u64].into(), Some(nulls.clone()))) as ArrayRef,
+            Arc::new(UInt64Array::new(vec![7_u64].into(), Some(nulls))) as ArrayRef,
+        ],
+        None,
+    )
+    .unwrap();
+    let prepared_field = BlobDescriptorArrayBuilder::new("blob").field().clone();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![prepared_field])),
+        vec![Arc::new(prepared)],
+    )
+    .unwrap();
+
+    let part = write_part(&dataset, &target, Some(1..10), batch).await;
+    let data_file = dataset
+        .concat_data_file_parts(&target, &[part])
+        .await
+        .unwrap();
+    let replacement = DataReplacementGroup(only_fragment(&dataset).id() as u64, data_file);
+    let dataset = commit(&dataset, replacement).await.unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    let descriptor = batch["blob"].as_struct();
+    let positions = descriptor["position"].as_primitive::<UInt64Type>();
+    let sizes = descriptor["size"].as_primitive::<UInt64Type>();
+    let blob_ids = descriptor["blob_id"].as_primitive::<UInt32Type>();
+    assert_eq!(
+        (positions.value(0), sizes.value(0), blob_ids.value(0)),
+        (0, 0, 0)
+    );
+
+    let mut scanner = dataset.scan();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["blob"].as_binary::<i64>().value(0),
+        b"prefix-selected-suffix"
+    );
 }
 
 #[tokio::test]

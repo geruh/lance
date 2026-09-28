@@ -814,11 +814,26 @@ impl BlobPreprocessor {
                     output.push_dedicated(blob_ids.value(row), sizes.value(row))?;
                 }
                 BlobKind::External => {
+                    let base_id = if blob_ids.is_null(row) {
+                        0
+                    } else {
+                        blob_ids.value(row)
+                    };
+                    let offset = if positions.is_null(row) {
+                        0
+                    } else {
+                        positions.value(row)
+                    };
+                    let size = if sizes.is_null(row) {
+                        0
+                    } else {
+                        sizes.value(row)
+                    };
                     output.push(BlobDescriptor::External {
-                        base_id: blob_ids.value(row),
+                        base_id,
                         uri: uris.value(row).to_string(),
-                        offset: positions.value(row),
-                        size: sizes.value(row),
+                        offset,
+                        size,
                     })?;
                 }
             }
