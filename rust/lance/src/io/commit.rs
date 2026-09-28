@@ -516,9 +516,11 @@ async fn do_commit_new_dataset(
             };
             (new_manifest, updated_indices)
         } else {
-            // Deep clone: build a manifest that references local files (no external bases)
+            // Deep clone: files are local now, but external blobs still need non-root bases
             let mut new_manifest = source_manifest.clone();
-            new_manifest.base_paths.clear();
+            new_manifest
+                .base_paths
+                .retain(|_, base_path| !base_path.is_dataset_root);
             new_manifest.branch = None;
             new_manifest.tag = None;
             new_manifest.index_section = None; // will be rewritten below

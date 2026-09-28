@@ -3293,7 +3293,9 @@ impl Dataset {
 
     /// Deep clone the target version into a new dataset at target_path.
     /// This copies all relevant dataset files (data files, deletion files, and
-    /// index files) into the target dataset with bounded memory use.
+    /// index files) into the target dataset with bounded memory use. External blob
+    /// payloads are not copied; the clone keeps the source's non-dataset-root
+    /// `base_paths` so they still resolve.
     ///
     /// The source files are read through this dataset's own object store while the
     /// copies are written through the target object store built from `store_params`.

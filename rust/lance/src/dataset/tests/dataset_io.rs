@@ -2304,6 +2304,83 @@ async fn test_deep_clone_copies_blob_v2_sidecars() {
 }
 
 #[tokio::test]
+async fn test_deep_clone_keeps_external_blob_v2_references() {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use lance_core::datatypes::BlobKind;
+
+    async fn take_blob_values(dataset: &Dataset) -> Vec<(BlobKind, Vec<u8>)> {
+        let blobs = Arc::new(dataset.clone())
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        let mut values = Vec::with_capacity(blobs.len());
+        for blob in blobs {
+            let blob = blob.unwrap();
+            values.push((blob.kind(), blob.read().await.unwrap().to_vec()));
+        }
+        values
+    }
+
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("blob_source");
+    let clone_dir = test_dir.join("blob_clone");
+    let external_dir = test_dir.join("external_base");
+    std::fs::create_dir_all(&external_dir).unwrap();
+    std::fs::write(external_dir.join("a.bin"), b"external payload").unwrap();
+    let base_uri = format!("file://{}", external_dir.display());
+    let expected_blobs = vec![
+        (BlobKind::External, b"external payload".to_vec()),
+        (BlobKind::Inline, b"inline".to_vec()),
+    ];
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        crate::blob_field("blob", true),
+    ]));
+    let mut blobs = BlobArrayBuilder::new(2);
+    blobs.push_uri(format!("{base_uri}/a.bin")).unwrap();
+    blobs.push_bytes(b"inline").unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            blobs.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        source_dir.to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![BasePath {
+                id: 1,
+                name: Some("external".to_string()),
+                path: base_uri,
+                is_dataset_root: false,
+            }]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut cloned = source
+        .deep_clone(clone_dir.to_str().unwrap(), source.version().version, None)
+        .await
+        .unwrap();
+    assert_eq!(take_blob_values(&cloned).await, expected_blobs);
+
+    compact_files(&mut cloned, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(cloned.count_fragments(), 1);
+    assert_eq!(take_blob_values(&cloned).await, expected_blobs);
+}
+
+#[tokio::test]
 async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
     let test_dir = TempStdDir::default();
     let source_dir = test_dir.join("source");
