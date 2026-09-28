@@ -53,7 +53,12 @@ public final class BlobFile implements Closeable {
   /** Default no-arg constructor used by JNI to attach native handle. */
   public BlobFile() {}
 
-  /** Read all remaining bytes from current cursor to end. */
+  /**
+   * Read all remaining bytes from current cursor to end.
+   *
+   * @throws IllegalArgumentException if more than {@link Integer#MAX_VALUE} bytes remain; the
+   *     cursor is not moved. Use {@link #readUpTo} or {@link #readRange} instead.
+   */
   public byte[] read() throws IOException {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       return nativeRead();

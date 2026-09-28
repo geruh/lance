@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::traits::{FromJString, IntoJava};
 use crate::{JNIEnvExt, block_on};
 use jni::JNIEnv;
@@ -143,6 +143,17 @@ pub extern "system" fn Java_org_lance_BlobFile_nativeRead(
 fn inner_blob_read<'local>(env: &mut JNIEnv<'local>, jblob: JObject) -> Result<JByteArray<'local>> {
     let bytes = {
         let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
+        // Check before read(), which fetches the whole tail and moves the cursor to the end.
+        let size = blob.inner.size();
+        let cursor = block_on(blob.inner.tell())?;
+        let remaining = size.saturating_sub(cursor);
+        if remaining > i32::MAX as u64 {
+            return Err(Error::input_error(format!(
+                "Cannot read {remaining} remaining blob bytes (size={size}, cursor={cursor}), \
+                 exceeding the Java array limit of {}; use readUpTo or readRange",
+                i32::MAX
+            )));
+        }
         block_on(blob.inner.read())?
     };
     let arr = env.new_byte_array(bytes.len() as jint)?;

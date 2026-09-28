@@ -42,8 +42,12 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -54,11 +58,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.ClosedChannelException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -2205,6 +2213,69 @@ public class DatasetTest {
       assertArrayEquals(Arrays.copyOfRange(all, 0, 256), data1);
       assertArrayEquals(Arrays.copyOfRange(all, 512, 768), range);
       blobFile.close();
+    }
+  }
+
+  @Test
+  void testReadRejectsRemainingBytesOverJavaArrayLimit(@TempDir Path tempDir) throws Exception {
+    long size = Integer.MAX_VALUE + 1L;
+    Path payload = tempDir.resolve("payload.bin");
+    try (RandomAccessFile file = new RandomAccessFile(payload.toFile(), "rw")) {
+      file.setLength(size);
+    }
+    Field blobField =
+        new Field(
+            "blob",
+            new FieldType(
+                true,
+                new ArrowType.Struct(),
+                null,
+                Collections.singletonMap("ARROW:extension:name", "lance.blob.v2")),
+            Arrays.asList(
+                Field.nullable("data", ArrowType.LargeBinary.INSTANCE),
+                Field.nullable("uri", ArrowType.Utf8.INSTANCE)));
+    Schema schema = new Schema(Collections.singletonList(blobField), null);
+
+    try (RootAllocator allocator = new RootAllocator();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      StructVector blob = (StructVector) root.getVector("blob");
+      VarCharVector uri = (VarCharVector) blob.getChild("uri");
+      blob.setIndexDefined(0);
+      uri.setSafe(0, payload.toUri().toString().getBytes(StandardCharsets.UTF_8));
+      root.setRowCount(1);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      }
+
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
+          Dataset ds =
+              Dataset.write()
+                  .reader(reader)
+                  .uri(tempDir.resolve("dataset").toString())
+                  .allocator(allocator)
+                  .allowExternalBlobOutsideBases(true)
+                  .execute();
+          BlobFile blobFile = ds.takeBlobsByIndices(Collections.singletonList(0L), "blob").get(0)) {
+        assertEquals(size, blobFile.size());
+        blobFile.seek(size - 10);
+        assertArrayEquals(new byte[10], blobFile.read());
+
+        // A fetch from the truncated object fails fast with IOException instead of pulling 2 GiB.
+        try (RandomAccessFile file = new RandomAccessFile(payload.toFile(), "rw")) {
+          file.setLength(10);
+        }
+        blobFile.seek(0);
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, blobFile::read);
+        assertTrue(ex.getMessage().contains("2147483648 remaining"), ex.getMessage());
+        assertTrue(ex.getMessage().contains("Java array limit"), ex.getMessage());
+        assertEquals(0L, blobFile.tell());
+      }
     }
   }
 
