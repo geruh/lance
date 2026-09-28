@@ -4720,7 +4720,9 @@ mod tests {
         BLOB_V2_EXT_NAME, DataTypeExt,
     };
     use lance_core::{
-        datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling, BlobKind, OnMissing},
+        datatypes::{
+            BLOB_V2_LOGICAL_FIELDS, BLOB_V2_PREPARED_FIELDS, BlobHandling, BlobKind, OnMissing,
+        },
         utils::blob::blob_path,
     };
     use lance_io::object_store::{
@@ -9156,6 +9158,52 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[rstest]
+    #[case::zero_size(Some(0))]
+    #[case::null_size(None)]
+    #[tokio::test]
+    async fn test_prepared_blob_v2_external_rejects_position_without_size(
+        #[case] blob_size: Option<u64>,
+    ) {
+        let dataset_dir = TempDir::default();
+        let field = BlobDescriptorArrayBuilder::new("blob").field().clone();
+        let array = Arc::new(
+            StructArray::try_new(
+                BLOB_V2_PREPARED_FIELDS.clone(),
+                vec![
+                    Arc::new(UInt8Array::from(vec![BlobKind::External as u8])) as ArrayRef,
+                    Arc::new(LargeBinaryArray::from_iter([None::<&[u8]>])),
+                    Arc::new(StringArray::from(vec!["file:///source.bin"])),
+                    Arc::new(UInt32Array::from(vec![0])),
+                    Arc::new(UInt64Array::from(vec![blob_size])),
+                    Arc::new(UInt64Array::from(vec![10])),
+                ],
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("means the whole object"),
+            "{error}"
+        );
     }
 
     #[rstest]

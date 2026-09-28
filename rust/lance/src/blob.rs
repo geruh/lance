@@ -484,6 +484,12 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                         "Prepared external blob row {row} range overflows u64: offset={offset}, size={size}"
                     ))
                 })?;
+                if size == 0 && offset != 0 {
+                    return Err(Error::invalid_input(format!(
+                        "Prepared external blob row {row} sets position={offset} without a `blob_size`; a zero size means the whole object at '{}' and needs position 0",
+                        uri_col.value(row)
+                    )));
+                }
             }
         }
     }
@@ -536,6 +542,8 @@ pub enum BlobDescriptor {
     /// Payload bytes stored as the full contents of a dedicated sidecar blob.
     Dedicated { blob_id: u32, size: u64 },
     /// Payload bytes referenced from an external object or registered base.
+    ///
+    /// A zero `size` selects the whole object and requires a zero `offset`.
     External {
         base_id: u32,
         uri: String,
@@ -645,6 +653,8 @@ impl BlobDescriptorArrayBuilder {
     }
 
     /// Append an external blob reference.
+    ///
+    /// `None`, like a range of `size` 0, selects the whole object; such a range needs `offset` 0.
     pub fn push_external(
         &mut self,
         uri: impl Into<String>,
@@ -789,6 +799,11 @@ fn validate_blob_descriptor(value: &BlobDescriptor) -> Result<()> {
                     "External blob range overflows u64: offset={offset}, size={size}"
                 ))
             })?;
+            if *size == 0 && *offset != 0 {
+                return Err(Error::invalid_input(format!(
+                    "External blob range sets offset={offset} with size 0; a zero size means the whole object at '{uri}' and needs offset 0"
+                )));
+            }
             Ok(())
         }
     }
@@ -1405,6 +1420,22 @@ mod tests {
             let err = validate_prepared_blob_array(&field, &array).unwrap_err();
             assert!(err.to_string().contains("range overflows u64"));
         }
+    }
+
+    #[test]
+    fn test_external_blob_descriptor_rejects_offset_with_zero_size() {
+        let mut builder = BlobDescriptorArrayBuilder::new("blob");
+        let err = builder
+            .push_external(
+                "file:///external.bin",
+                Some(BlobRange {
+                    offset: 10,
+                    size: 0,
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("means the whole object"), "{err}");
     }
 
     #[derive(Clone, Copy)]

@@ -92,7 +92,7 @@ pub static BLOB_V2_LOGICAL_TYPE: LazyLock<DataType> =
 ///   `position` is zero.
 /// - [`BlobKind::External`] carries `uri`, optional `blob_id`, `position`, and
 ///   `blob_size`. A zero `blob_size` is resolved to the complete external object
-///   length when read.
+///   length when read, so it requires a zero `position`.
 ///
 /// `blob_size` is distinct from the logical `size`, which is only an optional
 /// external-object range before preparation. For external blobs, `uri` is
