@@ -2510,8 +2510,13 @@ impl FileFragment {
                 .collect_with_fallback(&batch, index_column, self.dataset())
                 .await?;
             if let Some(resolver) = external_base_resolver.as_deref() {
-                super::blob::validate_external_blob_references(resolver, &updated_batch, &matched)
-                    .await?;
+                super::blob::validate_external_blob_references(
+                    resolver,
+                    updated_batch.schema_ref().fields(),
+                    updated_batch.columns(),
+                    &matched,
+                )
+                .await?;
             }
             updater.update(updated_batch).await?;
         }

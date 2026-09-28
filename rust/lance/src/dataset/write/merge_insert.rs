@@ -2463,6 +2463,7 @@ impl MergeInsertJob {
         // already hold the matched rows, so the missing columns keep their
         // stored values and must not be filled here. Skipping the fill is also
         // what keeps them out of the target scan's projection.
+        let mut carried_over_columns = HashSet::new();
         if write_sink == WriteSink::RewriteRows {
             for field in dataset_schema.fields() {
                 if !source_field_names.contains(field.name()) {
@@ -2470,6 +2471,7 @@ impl MergeInsertJob {
                         field.name(),
                         logical_expr::col(format!("target.\"{}\"", field.name())),
                     )?;
+                    carried_over_columns.insert(field.name().clone());
                 }
             }
         }
@@ -2482,6 +2484,7 @@ impl MergeInsertJob {
             self.params.clone(),
             source_skipped_duplicates,
             write_sink,
+            carried_over_columns,
         );
         let logical_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(write_node),
@@ -15235,6 +15238,153 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_partial_schema_keeps_external_blob_outside_bases() {
+        use crate::{BlobArrayBuilder, blob_field};
+        use arrow_array::types::UInt8Type;
+        use lance_core::datatypes::{BLOB_V2_LOGICAL_MINIMAL_FIELDS, BlobKind};
+        use lance_core::utils::tempfile::TempDir;
+
+        async fn blob_descriptor(dataset: &Dataset) -> StructArray {
+            let batch = dataset
+                .scan()
+                .project(&["blob"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            batch.column(0).as_struct().clone()
+        }
+
+        let test_dir = TempStrDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"outside").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let external_blob = || {
+            let mut blobs = BlobArrayBuilder::new(1);
+            blobs.push_uri(external_uri.clone()).unwrap();
+            blobs.finish().unwrap()
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            blob_field("blob", true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                external_blob(),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![10_i64])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let stored = blob_descriptor(&dataset).await;
+        assert_eq!(
+            stored
+                .column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(0),
+            BlobKind::External as u8
+        );
+        assert_eq!(
+            stored
+                .column_by_name("blob_id")
+                .unwrap()
+                .as_primitive::<UInt32Type>()
+                .value(0),
+            0
+        );
+
+        // The source omits the blob column, so the matched row keeps its stored reference.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let source = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![5_i64])),
+            ],
+        )
+        .unwrap();
+        let (updated, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source)],
+                    source_schema,
+                )))
+                .await
+                .unwrap();
+        assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (1, 0));
+        assert_eq!(blob_descriptor(&updated).await, stored);
+        let blobs = updated.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"outside"
+        );
+
+        // A partial source that supplies the blob column still has its URIs checked, even when
+        // its field lacks the blob extension metadata.
+        for blob_source_field in [
+            blob_field("blob", true),
+            Field::new(
+                "blob",
+                DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
+                true,
+            ),
+        ] {
+            let blob_source_schema = Arc::new(Schema::new(vec![
+                blob_source_field,
+                Field::new("id", DataType::Int64, true),
+            ]));
+            let blob_source = RecordBatch::try_new(
+                blob_source_schema.clone(),
+                vec![external_blob(), Arc::new(Int64Array::from(vec![0_i64]))],
+            )
+            .unwrap();
+            let error = MergeInsertBuilder::try_new(updated.clone(), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(blob_source)],
+                    blob_source_schema,
+                )))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside registered external bases"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]

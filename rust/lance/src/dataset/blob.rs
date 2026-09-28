@@ -18,7 +18,7 @@ use arrow_array::{
 };
 use arrow_buffer::{ArrowNativeType, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
+    DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
 };
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -313,13 +313,17 @@ fn collect_external_blob_uris(
 /// Existing rows can contain trusted absolute references that were accepted by an earlier write.
 /// Update paths use this check before allowing those fallback values through the writer, so newly
 /// matched values must still resolve beneath a registered external base.
+///
+/// `fields` describe `columns` position by position. Pass dataset fields when the columns come
+/// from a caller's batch, whose metadata may not mark the blob columns.
 pub(super) async fn validate_external_blob_references(
     resolver: &ExternalBaseResolver,
-    batch: &RecordBatch,
+    fields: &[FieldRef],
+    columns: &[ArrayRef],
     selected_rows: &[bool],
 ) -> Result<()> {
     let mut external_uris = Vec::new();
-    for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
+    for (field, array) in fields.iter().zip(columns) {
         collect_external_blob_uris(
             field,
             array,

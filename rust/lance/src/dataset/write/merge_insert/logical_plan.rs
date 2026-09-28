@@ -13,6 +13,7 @@ use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNod
 use lance_core::{ROW_ADDR, ROW_ID};
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     sync::{Arc, atomic::AtomicU64},
 };
 
@@ -57,6 +58,8 @@ pub struct MergeInsertWriteNode {
     pub(crate) params: MergeInsertParams,
     pub(crate) source_skipped_duplicates: Arc<AtomicU64>,
     pub(crate) write_sink: WriteSink,
+    /// Dataset columns the source omits, filled from the matched target row.
+    pub(crate) carried_over_columns: HashSet<String>,
     schema: Arc<DFSchema>,
 }
 
@@ -99,6 +102,7 @@ impl MergeInsertWriteNode {
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
         write_sink: WriteSink,
+        carried_over_columns: HashSet<String>,
     ) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
@@ -108,6 +112,7 @@ impl MergeInsertWriteNode {
             params,
             source_skipped_duplicates,
             write_sink,
+            carried_over_columns,
             schema,
         }
     }
@@ -183,6 +188,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             self.params.clone(),
             self.source_skipped_duplicates.clone(),
             self.write_sink,
+            self.carried_over_columns.clone(),
         ))
     }
 
@@ -303,6 +309,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
+                        write_node.carried_over_columns.clone(),
                     )?)
                 };
                 Some(exec)

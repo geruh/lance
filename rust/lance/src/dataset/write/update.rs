@@ -443,7 +443,8 @@ impl UpdateJob {
                         let selected_rows = vec![true; batch.num_rows()];
                         crate::dataset::blob::validate_external_blob_references(
                             resolver,
-                            &updated_blob_batch,
+                            updated_blob_batch.schema_ref().fields(),
+                            updated_blob_batch.columns(),
                             &selected_rows,
                         )
                         .await
