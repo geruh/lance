@@ -2610,6 +2610,9 @@ impl FileFragment {
     /// deletion vector is applied on the way in. Batches are pulled one at a
     /// time, so the full column need not be held in memory.
     ///
+    /// External blob URIs must map to a registered base, as when
+    /// [`WriteParams::allow_external_blob_outside_bases`] is false.
+    ///
     /// Callers should take care to set the read version correctly. If this is
     /// not done then multiple replacements to the same field will not be
     /// detected as a conflict.
@@ -2686,16 +2689,12 @@ impl FileFragment {
         // The update writer, not a raw file writer: that boundary carries the
         // version's write policies (blob v2 columns arrive logical and must be
         // prepared for the encoders) and returns a populated `DataFile`.
-        // Blob v2 descriptors land under the dataset root, outside any
-        // registered external base, as on the other update paths.
-        let has_blob_v2 = writer_schema
-            .fields_pre_order()
-            .any(|field| field.is_blob_v2());
+        // Every row is new caller data, so none may skip the registered-base check.
         let mut writer = versions::open_update_writer(
             write_version,
             self.dataset.as_ref(),
             &writer_schema,
-            has_blob_v2,
+            false,
         )
         .await?;
         let staged_path = {

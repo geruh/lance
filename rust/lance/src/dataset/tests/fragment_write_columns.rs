@@ -781,6 +781,38 @@ async fn test_stages_blob_column() {
     );
 }
 
+/// Staged blob rows are new caller data, so an External URI outside every
+/// registered base is rejected as a default `Dataset::write` rejects it.
+#[tokio::test]
+async fn test_rejects_blob_uri_outside_registered_bases() {
+    use crate::blob::{BlobArrayBuilder, blob_field};
+
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
+    let mut builder = BlobArrayBuilder::new(2);
+    builder.push_bytes(b"one").unwrap();
+    builder.push_bytes(b"two").unwrap();
+    let existing =
+        RecordBatch::try_new(arrow_schema.clone(), vec![builder.finish().unwrap()]).unwrap();
+    let dataset = dataset_of(existing, Some(LanceFileVersion::V2_2)).await;
+
+    // A referenced URI is resolved but never opened, so it need not exist.
+    let mut builder = BlobArrayBuilder::new(2);
+    builder.push_bytes(b"three").unwrap();
+    builder
+        .push_uri("file:///outside-registered-bases/four.bin")
+        .unwrap();
+    let replacement = RecordBatch::try_new(arrow_schema, vec![builder.finish().unwrap()]).unwrap();
+
+    let schema = dataset.schema().clone();
+    let err = stage(&dataset, replacement, &schema).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "got: {err}");
+    assert!(
+        err.to_string()
+            .contains("outside registered external bases"),
+        "got: {err}"
+    );
+}
+
 /// The computed-column lifecycle: declare all null, backfill, compact, and
 /// refresh again. The refresh after compaction is the case that previously
 /// failed with "no changes were made".
