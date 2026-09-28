@@ -81,9 +81,10 @@ schemas must account for the extended structure. Interpret `position` together
 with `kind` and the object reference. See [the schema-transition discussion](https://github.com/lance-format/lance/issues/9458).
 
 The dataset's default file version remains unchanged. Select `2.2` or newer
-explicitly when writing Blob v2 structs or compacting the mixed column into
-Blob v2 files. Compaction rewrites the selected fragments; it is not required
-to enable new Blob v2 writes.
+explicitly when appending Blob v2 structs. Compaction, update, and merge insert
+write the mixed column as Blob v2 files at `2.2` unless another version is
+selected. Compaction rewrites the selected fragments; it is not required to
+enable new Blob v2 writes.
 
 ## Blob v2: Write Patterns
 
@@ -460,7 +461,7 @@ This section contains commonly noticed issues or errors, and explains how to add
 
 ### Blob v2 requires file version >= 2.2
 **Cause**: You are writing blob v2 values into a dataset/file format below `2.2`.  
-**Fix**: Write to a dataset created with `data_storage_version="2.2"` (or newer).
+**Fix**: Pass `data_storage_version="2.2"` (or newer) to the operation. Existing `2.0` and `2.1` datasets accept it without being recreated.
 
 ### Legacy blob columns ... are not supported for file version >= 2.2
 **Cause**: A lower-level file writer received legacy blob metadata instead of prepared Blob v2 input.

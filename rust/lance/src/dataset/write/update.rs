@@ -217,7 +217,8 @@ impl UpdateBuilder {
 
     /// Set the exact V2 data file version for rewritten rows.
     ///
-    /// If omitted, the dataset's default write version is used. The default
+    /// If omitted, the dataset's default write version is used, or 2.2 when
+    /// that default cannot write a column promoted to Blob v2. The default
     /// remains unchanged. Targets cannot cross the V1/V2 boundary.
     ///
     /// ```
@@ -249,7 +250,7 @@ impl UpdateBuilder {
         let write_version = self
             .data_storage_version
             .map(LanceFileVersion::resolve)
-            .unwrap_or(default_version);
+            .unwrap_or_else(|| super::super::versions::default_rewrite_version(&self.dataset));
         super::super::versions::validate_write_version(default_version, write_version)?;
         let mut updates = HashMap::new();
 

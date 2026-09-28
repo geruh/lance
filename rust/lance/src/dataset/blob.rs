@@ -6330,6 +6330,128 @@ mod tests {
         assert_eq!(std::fs::read(&old_path).unwrap(), old_file_bytes);
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum MixedBlobRewrite {
+        Compaction,
+        Update,
+        MergeInsert,
+    }
+
+    #[rstest]
+    #[case::compaction(MixedBlobRewrite::Compaction)]
+    #[case::update(MixedBlobRewrite::Update)]
+    #[case::merge_insert(MixedBlobRewrite::MergeInsert)]
+    #[tokio::test]
+    async fn test_mixed_blob_versions_rewrite_without_explicit_version(
+        #[case] rewrite: MixedBlobRewrite,
+        #[values("v2.0.lance", "v2.1.lance")] fixture: &str,
+    ) {
+        let test_dir =
+            crate::utils::test::copy_test_data_to_tmp(&format!("v8.0.0/blobs/{fixture}")).unwrap();
+        let dir = test_dir.path_str();
+        let dataset = Dataset::open(&dir).await.unwrap();
+        let default_version = dataset.manifest.data_storage_format.lance_file_format();
+        let schema = Arc::new(Schema::from(dataset.schema()));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![3])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"appended".as_slice())])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            &dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
+
+        let mut expected: HashMap<u32, Option<&[u8]>> = HashMap::from([
+            (0, Some(b"legacy bytes".as_slice())),
+            (1, None),
+            (2, Some(b"".as_slice())),
+            (3, Some(b"appended".as_slice())),
+        ]);
+        let dataset = match rewrite {
+            MixedBlobRewrite::Compaction => {
+                crate::dataset::optimize::compact_files(&mut dataset, Default::default(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(dataset.manifest.fragments.len(), 1);
+                Arc::new(dataset)
+            }
+            MixedBlobRewrite::Update => {
+                let result = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+                    .update_where("id = 0")
+                    .unwrap()
+                    .set("id", "100")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .execute()
+                    .await
+                    .unwrap();
+                assert_eq!(result.rows_updated, 1);
+                let value = expected.remove(&0).unwrap();
+                expected.insert(100, value);
+                result.new_dataset
+            }
+            MixedBlobRewrite::MergeInsert => {
+                // A key-only source makes the merge copy the stored blob into the new row.
+                let source_schema = Arc::new(schema.project(&[0]).unwrap());
+                let source = RecordBatch::try_new(
+                    source_schema.clone(),
+                    vec![Arc::new(UInt32Array::from(vec![0]))],
+                )
+                .unwrap();
+                let mut merge = crate::dataset::MergeInsertBuilder::try_new(
+                    Arc::new(dataset),
+                    vec!["id".to_string()],
+                )
+                .unwrap();
+                merge
+                    .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                    .when_not_matched(crate::dataset::WhenNotMatched::DoNothing);
+                let (dataset, stats) = merge
+                    .try_build()
+                    .unwrap()
+                    .execute_reader(RecordBatchIterator::new([Ok(source)], source_schema))
+                    .await
+                    .unwrap();
+                assert_eq!(stats.num_updated_rows, 1);
+                dataset
+            }
+        };
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            default_version
+        );
+        let rewritten = dataset.manifest.fragments.last().unwrap();
+        assert_eq!(
+            rewritten.files[0].file_version().unwrap(),
+            lance_file::version::ConcreteFileVersion::V2_2
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let actual = batch["id"]
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(batch["blob"].as_binary::<i64>().iter())
+            .collect::<HashMap<_, _>>();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn test_data_file_key_from_path() {
         assert_eq!(data_file_key_from_path("data/abc.lance"), "abc");

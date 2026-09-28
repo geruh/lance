@@ -530,7 +530,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
     def data_storage_version(self, version: str) -> "MergeInsertBuilder":
         """Set the exact data storage version for files written by this operation.
 
-        If omitted, use the dataset's default write version without changing it.
+        If omitted, use the dataset's default write version without changing it,
+        or 2.2 when that default cannot write a column promoted to Blob v2.
         Accepts "2.0", "2.1", "2.2", "2.3", "stable", or "next" for V2
         datasets. Release selectors are resolved by the engine; V1/V2
         cross-family targets are rejected.
@@ -3116,7 +3117,8 @@ class LanceDataset(pa.dataset.Dataset):
             cancelled once this timeout is reached. Default is 30 seconds.
         data_storage_version : str, optional
             Output data file version, such as "2.2", "stable", or "next". If
-            omitted, use the dataset's default write version without changing it.
+            omitted, use the dataset's default write version without changing it,
+            or 2.2 when that default cannot write a column promoted to Blob v2.
             V1/V2 cross-family targets are rejected.
 
         Returns
@@ -7717,7 +7719,8 @@ class DatasetOptimizer:
         data_storage_version: str, optional
             Output data file version, such as "2.2", "stable", or "next".
             Uses the compaction config target when set, otherwise the dataset's
-            default write version. Does not change that default or the versions
+            default write version, or 2.2 when that default cannot write a column
+            promoted to Blob v2. Does not change that default or the versions
             of unselected files. V1/V2 cross-family targets are rejected.
 
         Returns

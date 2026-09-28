@@ -613,7 +613,7 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
-    // Exact output data file version. The manifest default is used when absent.
+    // Exact output data file version. `versions::default_rewrite_version` when absent.
     data_storage_version: Option<PlanFileVersion>,
 }
 
@@ -621,7 +621,7 @@ impl MergeInsertParams {
     fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
         self.data_storage_version
             .map(|version| version.0)
-            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+            .unwrap_or_else(|| versions::default_rewrite_version(dataset))
     }
 }
 
@@ -936,7 +936,8 @@ impl MergeInsertBuilder {
 
     /// Set the exact V2 data file version for rows written by this merge.
     ///
-    /// If omitted, the dataset's default write version is used. The default
+    /// If omitted, the dataset's default write version is used, or 2.2 when
+    /// that default cannot write a column promoted to Blob v2. The default
     /// remains unchanged. Targets cannot cross the V1/V2 boundary.
     ///
     /// ```

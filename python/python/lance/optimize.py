@@ -125,7 +125,8 @@ class CompactionOptions(TypedDict, total=False):
     """
     Output data file version, such as "2.2", "stable", or "next". If omitted,
     compaction uses the compaction config target when set, otherwise the dataset's
-    default write version. It does not change that default.
+    default write version, or 2.2 when that default cannot write a column promoted
+    to Blob v2. It does not change that default.
     The planner fixes release selectors to exact versions before distributing
     tasks. V1/V2 cross-family targets are rejected. Binary copy requires matching
     input versions and no overlays; TryBinaryCopy reencodes ineligible inputs,

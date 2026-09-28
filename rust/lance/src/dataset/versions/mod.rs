@@ -68,6 +68,22 @@ pub fn validate_write_version(
     Ok(())
 }
 
+/// Target for compaction, update and merge insert when the caller names no version.
+///
+/// A 2.2+ append promotes a legacy blob column without changing a 2.0/2.1
+/// default, and only 2.2+ files can encode the promoted column.
+pub fn default_rewrite_version(dataset: &Dataset) -> ConcreteFileVersion {
+    let default_version = dataset.manifest.data_storage_format.lance_file_format();
+    match default_version {
+        ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
+            if dataset.schema().fields_pre_order().any(Field::is_blob_v2) =>
+        {
+            ConcreteFileVersion::V2_2
+        }
+        _ => default_version,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_scan_stream(
     version: ConcreteFileVersion,

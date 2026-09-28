@@ -314,7 +314,8 @@ pub struct CompactionOptions {
     pub max_overlays_per_fragment: Option<usize>,
     /// Exact data file version for compacted output.
     ///
-    /// If omitted, use the dataset's default write version without changing it.
+    /// If omitted, use the dataset's default write version without changing it,
+    /// or 2.2 when that default cannot write a column promoted to Blob v2.
     /// The planner resolves release selectors before distributing tasks.
     /// Targets cannot cross the V1/V2 boundary.
     ///
@@ -594,7 +595,7 @@ impl CompactionOptions {
     fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
         self.data_storage_version
             .map(LanceFileVersion::resolve)
-            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
+            .unwrap_or_else(|| versions::default_rewrite_version(dataset))
     }
 }
 

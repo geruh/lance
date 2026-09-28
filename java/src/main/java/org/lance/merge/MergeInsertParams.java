@@ -250,8 +250,9 @@ public class MergeInsertParams {
   /**
    * Set the exact data storage version for files written by this operation.
    *
-   * <p>If omitted, the dataset's default write version is used without changing it. Release
-   * selectors are resolved by the engine. V1/V2 cross-family targets are rejected.
+   * <p>If omitted, the dataset's default write version is used without changing it, or 2.2 when
+   * that default cannot write a column promoted to Blob v2. Release selectors are resolved by the
+   * engine. V1/V2 cross-family targets are rejected.
    */
   public MergeInsertParams withDataStorageVersion(DataStorageVersion version) {
     this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
