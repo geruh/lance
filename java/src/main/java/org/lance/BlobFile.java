@@ -48,31 +48,41 @@ public final class BlobFile implements Closeable {
   @SuppressWarnings("FieldCanBeLocal")
   private long nativeBlobHandle;
 
+  private final LockManager lockManager = new LockManager();
+
   /** Default no-arg constructor used by JNI to attach native handle. */
   public BlobFile() {}
 
   /** Read all remaining bytes from current cursor to end. */
   public byte[] read() throws IOException {
-    return nativeRead();
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      return nativeRead();
+    }
   }
 
   /** Read up to len bytes from the current cursor. */
   public byte[] readUpTo(int len) throws IOException {
     if (len < 0) throw new IllegalArgumentException("len must be non-negative");
-    return nativeReadUpTo(len);
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      return nativeReadUpTo(len);
+    }
   }
 
   /** Read a blob-local range without changing the current cursor. */
   public byte[] readRange(long offset, int len) throws IOException {
     if (offset < 0) throw new IllegalArgumentException("offset must be non-negative");
     if (len < 0) throw new IllegalArgumentException("len must be non-negative");
-    return nativeReadRange(offset, len);
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      return nativeReadRange(offset, len);
+    }
   }
 
   /** Seek to a new cursor position. */
   public void seek(long newCursor) throws IOException {
     if (newCursor < 0) throw new IllegalArgumentException("newCursor must be non-negative");
-    nativeSeek(newCursor);
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      nativeSeek(newCursor);
+    }
   }
 
   /**
@@ -83,23 +93,36 @@ public final class BlobFile implements Closeable {
     if (bufferSize < 0) {
       throw new IllegalArgumentException("bufferSize must be non-negative");
     }
-    nativeSetReadBufferSize(bufferSize);
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      nativeSetReadBufferSize(bufferSize);
+    }
   }
 
   /** Return current cursor position. */
   public long tell() throws IOException {
-    return nativeTell();
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      return nativeTell();
+    }
   }
 
   /** Return blob size in bytes. */
   public long size() {
-    return nativeSize();
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      return nativeSize();
+    }
   }
 
-  /** Close BlobFile and release associated resources. */
+  /**
+   * Close BlobFile and release associated resources. Waits for calls in progress on other threads
+   * to finish. If the BlobFile is already closed, then invoking this method has no effect.
+   */
   @Override
   public void close() throws IOException {
-    nativeClose();
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      if (nativeBlobHandle != 0) {
+        nativeClose();
+      }
+    }
   }
 
   // ===== JNI bindings =====

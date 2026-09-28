@@ -51,6 +51,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -72,6 +73,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -2290,6 +2293,34 @@ public class DatasetTest {
       blobs.get(1).close();
       assertThrows(RuntimeException.class, () -> Dataset.setBlobReadBufferSize(blobs, 1024L));
       assertThrows(RuntimeException.class, () -> blobs.get(0).readUpTo(1));
+    }
+  }
+
+  @Test
+  @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  void testBlobCloseWaitsForInFlightRead(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testBlobCloseWaitsForInFlightRead").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 16, 1)) {
+      BlobFile blob = ds.takeBlobsByIndices(Collections.singletonList(1L), "blobs").get(0);
+      FutureTask<byte[]> read = new FutureTask<>(blob::read);
+      Thread reader = new Thread(read);
+      // jni locks the native handle inside this object's monitor, so a reader that got past the
+      // monitor owns the handle before close() can reach it.
+      synchronized (blob) {
+        reader.start();
+        while (reader.getState() != Thread.State.BLOCKED) {
+          Thread.yield();
+        }
+      }
+      while (reader.getState() == Thread.State.BLOCKED) {
+        Thread.yield();
+      }
+
+      blob.close();
+      byte[] expected = new byte[1024 * 1024];
+      Arrays.fill(expected, (byte) 0xAB);
+      assertArrayEquals(expected, read.get());
+      blob.close();
     }
   }
 
