@@ -1286,6 +1286,15 @@ impl BlobPreprocessor {
                     }
 
                     let data = source.read_all().await?;
+                    // Object stores return a short read for a range past the end of the object.
+                    if data.len() as u64 != data_len {
+                        return Err(Error::invalid_input(format!(
+                            "Blob v2 field '{}' row {i} declares {data_len} bytes at position {} of '{uri_val}', but only {} exist",
+                            field.name(),
+                            source.start,
+                            data.len()
+                        )));
+                    }
                     blob_writer.push_inline(data)?;
                     continue;
                 }
@@ -8740,6 +8749,56 @@ mod tests {
         let blob = blobs[0].as_ref().unwrap();
         assert_eq!(blob.kind(), BlobKind::Inline);
         assert_eq!(blob.read().await.unwrap().as_ref(), b"inline");
+    }
+
+    #[tokio::test]
+    async fn test_blob_v2_external_ingest_rejects_inline_range_past_source_end() {
+        let session = Arc::new(crate::session::Session::default());
+        let store_params = ObjectStoreParams::default();
+        let source_uri = "memory://sources/short.bin";
+        // The registry holds memory stores weakly; keep this one alive for the write.
+        let (source_store, source_path) =
+            ObjectStore::from_uri_and_params(session.store_registry(), source_uri, &store_params)
+                .await
+                .unwrap();
+        source_store.put(&source_path, b"0123456789").await.unwrap();
+
+        let dataset_dir = TempDir::default();
+        let schema = Arc::new(Schema::new(vec![complete_blob_v2_field("blob", true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![complete_blob_v2_array(
+                vec![None],
+                vec![Some(source_uri.to_string())],
+                vec![Some(4)],
+                vec![Some(100)],
+                None,
+            )],
+        )
+        .unwrap();
+
+        let error = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                external_blob_mode: ExternalBlobMode::Ingest,
+                session: Some(session),
+                store_params: Some(store_params),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "row 0 declares 100 bytes at position 4 of 'memory://sources/short.bin', but only 6 exist"
+            ),
+            "{message}"
+        );
     }
 
     #[tokio::test]
