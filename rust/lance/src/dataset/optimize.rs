@@ -111,11 +111,13 @@ use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::{
-    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, StructArray, UInt32Array,
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, RecordBatchIterator,
+    RecordBatchReader, StructArray, UInt32Array, new_null_array,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, FieldRef, Fields,
+    Schema as ArrowSchema, SchemaRef,
 };
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -2002,6 +2004,127 @@ pub(crate) async fn transform_blob_v2_batch(
 ) -> Result<RecordBatch> {
     let plan = BlobV2BatchRewritePlan::try_new(schema, batch.schema().as_ref(), keep_row_addr)?;
     plan.transform_batch(dataset, batch).await
+}
+
+/// Wrap `reader` so logical blob v2 values, minimal or complete, use
+/// [`BLOB_V2_LOGICAL_TYPE`], the type [`transform_blob_v2_batch`] rewrites
+/// descriptors to, so rows from both can be interleaved.
+pub(crate) fn complete_logical_blob_v2_reader(
+    schema: &lance_core::datatypes::Schema,
+    reader: Box<dyn RecordBatchReader + Send>,
+) -> Result<Box<dyn RecordBatchReader + Send>> {
+    let fields = schema.fields.clone();
+    let complete_batch = move |batch: RecordBatch| -> Result<RecordBatch> {
+        let input_schema = batch.schema();
+        let (output_fields, columns) =
+            complete_logical_blob_v2_columns(&fields, input_schema.fields(), batch.columns())?;
+        Ok(RecordBatch::try_new(
+            Arc::new(ArrowSchema::new_with_metadata(
+                output_fields,
+                input_schema.metadata().clone(),
+            )),
+            columns,
+        )?)
+    };
+    // Completing an empty batch gives the reader a schema identical to its batches.
+    let empty_batch = complete_batch(RecordBatch::new_empty(reader.schema()))?;
+    let output_schema = empty_batch.schema();
+    let batches = reader.map(move |batch| {
+        let batch = batch?;
+        complete_batch(batch).map_err(ArrowError::from)
+    });
+    Ok(Box::new(RecordBatchIterator::new(batches, output_schema)))
+}
+
+fn complete_logical_blob_v2_columns(
+    fields: &[LanceField],
+    input_fields: &Fields,
+    columns: &[ArrayRef],
+) -> Result<(Vec<FieldRef>, Vec<ArrayRef>)> {
+    let mut output_fields = Vec::with_capacity(columns.len());
+    let mut output_columns = Vec::with_capacity(columns.len());
+    for (input_field, array) in input_fields.iter().zip(columns) {
+        let field = fields
+            .iter()
+            .find(|field| field.name == *input_field.name());
+        let (output_field, output_column) = match field {
+            Some(field) => complete_logical_blob_v2_array(field, input_field, array)?,
+            None => (input_field.clone(), array.clone()),
+        };
+        output_fields.push(output_field);
+        output_columns.push(output_column);
+    }
+    Ok((output_fields, output_columns))
+}
+
+fn complete_logical_blob_v2_array(
+    field: &LanceField,
+    input_field: &FieldRef,
+    array: &ArrayRef,
+) -> Result<(FieldRef, ArrayRef)> {
+    if field.is_blob_v2() {
+        let Some(blob) = array
+            .as_struct_opt()
+            .filter(|blob| BlobV2Layout::classify(blob.fields()) == Some(BlobV2Layout::Logical))
+        else {
+            return Ok((input_field.clone(), array.clone()));
+        };
+        let columns = BLOB_V2_LOGICAL_FIELDS
+            .iter()
+            .map(|logical_field| {
+                blob.column_by_name(logical_field.name())
+                    .cloned()
+                    .unwrap_or_else(|| new_null_array(logical_field.data_type(), blob.len()))
+            })
+            .collect();
+        let completed = StructArray::try_new(
+            BLOB_V2_LOGICAL_FIELDS.clone(),
+            columns,
+            blob.nulls().cloned(),
+        )?;
+        return Ok((
+            transformed_arrow_field(field, BLOB_V2_LOGICAL_TYPE.clone()),
+            Arc::new(completed) as ArrayRef,
+        ));
+    }
+    if !field_contains_blob_v2(field) {
+        return Ok((input_field.clone(), array.clone()));
+    }
+    let completed: ArrayRef = match array.data_type() {
+        ArrowDataType::Struct(_) => {
+            let struct_arr = array.as_struct();
+            let (children, columns) = complete_logical_blob_v2_columns(
+                &field.children,
+                struct_arr.fields(),
+                struct_arr.columns(),
+            )?;
+            let nulls = struct_arr.nulls().cloned();
+            Arc::new(StructArray::try_new(children.into(), columns, nulls)?)
+        }
+        ArrowDataType::List(_) => complete_logical_blob_v2_list_array::<i32>(field, array)?,
+        ArrowDataType::LargeList(_) => complete_logical_blob_v2_list_array::<i64>(field, array)?,
+        _ => return Ok((input_field.clone(), array.clone())),
+    };
+    Ok((
+        arrow_field_with_data_type(input_field, completed.data_type().clone()),
+        completed,
+    ))
+}
+
+fn complete_logical_blob_v2_list_array<O: OffsetSizeTrait>(
+    field: &LanceField,
+    array: &ArrayRef,
+) -> Result<ArrayRef> {
+    let item = field.children.first().ok_or_else(|| {
+        Error::internal(format!(
+            "List field '{}' has no item field in the dataset schema",
+            field.name
+        ))
+    })?;
+    let (input_item, offsets, values, nulls) = array.as_list::<O>().clone().into_parts();
+    let (item_field, values) = complete_logical_blob_v2_array(item, &input_item, &values)?;
+    let completed = GenericListArray::<O>::try_new(item_field, offsets, values, nulls)?;
+    Ok(Arc::new(completed))
 }
 
 /// Build a scan reader for rewrite and optionally capture row IDs.

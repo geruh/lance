@@ -2472,6 +2472,11 @@ impl FileFragment {
         // to the physical form stored on disk so it matches the fragment's left batch.
         let right_stream =
             SchemaAdapter::new(right_schema.clone()).to_physical_reader(right_stream);
+        let right_stream = if has_blob_v2 {
+            super::optimize::complete_logical_blob_v2_reader(self.schema(), right_stream)?
+        } else {
+            right_stream
+        };
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         let mut matched_offsets = RoaringBitmap::new();
         let frag_id_u32 = u32::try_from(self.metadata.id).map_err(|_| {
@@ -7547,6 +7552,133 @@ mod tests {
         // Verify the operation produced valid results
         assert!(!fields_modified.is_empty());
         assert!(!updated_fragment.files.is_empty());
+    }
+
+    #[derive(Clone, Copy)]
+    enum BlobColumnNesting {
+        TopLevel,
+        StructChild,
+        ListItem,
+    }
+
+    #[rstest]
+    #[case::top_level(BlobColumnNesting::TopLevel)]
+    #[case::struct_child(BlobColumnNesting::StructChild)]
+    #[case::list_item(BlobColumnNesting::ListItem)]
+    #[tokio::test]
+    async fn test_update_columns_accepts_minimal_blob_v2_layout(
+        #[case] nesting: BlobColumnNesting,
+    ) {
+        use crate::blob::{BlobArrayBuilder, blob_field};
+        use arrow_array::{LargeBinaryArray, ListArray};
+        use arrow_buffer::OffsetBuffer;
+
+        // `BlobArrayBuilder` builds the minimal `data, uri` layout, while the
+        // unmatched rows read back from the fragment use the complete layout.
+        let blob_batch = |ids: Vec<i64>, payloads: &[Option<&str>]| {
+            let mut builder = BlobArrayBuilder::new(payloads.len());
+            for &payload in payloads {
+                match payload {
+                    Some(bytes) => builder.push_bytes(bytes).unwrap(),
+                    None => builder.push_null().unwrap(),
+                }
+            }
+            let blobs = builder.finish().unwrap();
+            let (payload_field, payload) = match nesting {
+                BlobColumnNesting::TopLevel => (blob_field("payload", true), blobs),
+                BlobColumnNesting::StructChild => {
+                    let names = ids.iter().map(|id| format!("name-{id}"));
+                    let info = StructArray::from(vec![
+                        (
+                            Arc::new(ArrowField::new("name", DataType::Utf8, true)),
+                            Arc::new(StringArray::from_iter_values(names)) as ArrayRef,
+                        ),
+                        (Arc::new(blob_field("blob", true)), blobs),
+                    ]);
+                    let field = ArrowField::new("payload", info.data_type().clone(), true);
+                    (field, Arc::new(info) as ArrayRef)
+                }
+                BlobColumnNesting::ListItem => {
+                    let items = ListArray::try_new(
+                        Arc::new(blob_field("item", true)),
+                        OffsetBuffer::from_lengths(vec![1; payloads.len()]),
+                        blobs,
+                        None,
+                    )
+                    .unwrap();
+                    let field = ArrowField::new("payload", items.data_type().clone(), true);
+                    (field, Arc::new(items) as ArrayRef)
+                }
+            };
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int64, false),
+                payload_field,
+            ]));
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids)), payload]).unwrap()
+        };
+
+        let test_dir = TempStrDir::default();
+        let initial = blob_batch(vec![1, 2, 3], &[Some("one"), Some("two"), Some("three")]);
+        let schema = initial.schema();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema.clone()),
+            test_dir.as_ref(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let update = blob_batch(vec![2, 3], &[Some("NEW"), None]);
+        let right_stream = RecordBatchIterator::new(vec![Ok(update)], schema);
+        let mut fragment = dataset.get_fragment(0).unwrap();
+        let (updated_fragment, fields_modified) = fragment
+            .update_columns(right_stream, "id", "id")
+            .await
+            .unwrap();
+        let dataset = Dataset::commit(
+            test_dir.as_ref(),
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated_fragment],
+                new_fragments: vec![],
+                fields_modified,
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner
+            .project(&["id", "payload"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let payload = &batch["payload"];
+        let blobs = match nesting {
+            BlobColumnNesting::TopLevel => payload,
+            BlobColumnNesting::StructChild => payload.as_struct().column_by_name("blob").unwrap(),
+            BlobColumnNesting::ListItem => payload.as_list::<i32>().values(),
+        };
+        assert_eq!(batch["id"].as_ref(), &Int64Array::from(vec![1, 2, 3]));
+        assert_eq!(
+            blobs.as_ref(),
+            &LargeBinaryArray::from_iter([Some("one"), Some("NEW"), None])
+        );
     }
 
     #[tokio::test]
