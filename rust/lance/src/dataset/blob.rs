@@ -226,6 +226,13 @@ fn collect_external_blob_uris(
     }
 
     if field.is_blob_v2() {
+        // Raw blob bytes reference no external object.
+        if matches!(
+            array.data_type(),
+            ArrowDataType::Binary | ArrowDataType::LargeBinary
+        ) {
+            return Ok(());
+        }
         let struct_array = array.as_struct();
         if BlobV2Layout::classify(struct_array.fields()) != Some(BlobV2Layout::Logical) {
             return Err(blob_v2_shape_error(field, &[BlobV2Layout::Logical]));

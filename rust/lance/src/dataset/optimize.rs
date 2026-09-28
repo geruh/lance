@@ -1611,6 +1611,13 @@ impl BlobV2FieldRewritePlan {
         }
 
         if field.is_blob_v2() {
+            // Raw blob bytes carry no descriptor to resolve; the Blob v2 writer accepts them.
+            if matches!(
+                input_field.data_type(),
+                ArrowDataType::Binary | ArrowDataType::LargeBinary
+            ) {
+                return Ok(Self::passthrough(input_field));
+            }
             let field_id = u32::try_from(field.id).map_err(|_| {
                 Error::internal(format!(
                     "Blob v2 field id {} for '{}' does not fit in u32",

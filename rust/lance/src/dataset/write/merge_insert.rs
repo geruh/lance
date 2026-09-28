@@ -216,6 +216,36 @@ pub(crate) fn canonical_source_schema(
     Ok(Schema::new_with_metadata(fields, source.metadata().clone()))
 }
 
+/// Convert a merge source schema for comparison with `target`, promoting legacy
+/// blob fields where `target` stores Blob v2, whose writer accepts legacy bytes.
+fn source_comparison_schema(
+    source: &Schema,
+    target: &lance_core::datatypes::Schema,
+) -> Result<lance_core::datatypes::Schema> {
+    fn promote_where_blob_v2(
+        field: &mut lance_core::datatypes::Field,
+        target: &lance_core::datatypes::Field,
+    ) -> Result<()> {
+        if target.is_blob_v2() {
+            return field.promote_blob_v2();
+        }
+        for child in &mut field.children {
+            if let Some(target_child) = target.child(&child.name) {
+                promote_where_blob_v2(child, target_child)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut schema = lance_core::datatypes::Schema::try_from(source)?;
+    for field in &mut schema.fields {
+        if let Some(target_field) = target.fields.iter().find(|f| f.name == field.name) {
+            promote_where_blob_v2(field, target_field)?;
+        }
+    }
+    Ok(schema)
+}
+
 struct UpdatedRowAddrReconciler<I>
 where
     I: Iterator<Item = (u64, (usize, usize))>,
@@ -1198,8 +1228,8 @@ impl MergeInsertJob {
     }
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
-        let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
         let target_schema = self.dataset.schema();
+        let lance_schema = source_comparison_schema(schema, target_schema)?;
 
         let version = self.params.write_version(&self.dataset);
         let mut options = versions::schema_compare_options(version);
@@ -2602,8 +2632,8 @@ impl MergeInsertJob {
     /// write a non-nullable NULL downstream.
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
         // Convert to lance schema for comparison
-        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.schema();
+        let lance_schema = source_comparison_schema(source_schema, full_schema)?;
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
             &SchemaCompareOptions {
@@ -2752,8 +2782,8 @@ impl MergeInsertJob {
         // The slow path consumes a single stream; adapt the provider back into one.
         let source = provider_to_stream(provider).await?;
         let source_schema = source.schema();
-        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
+        let lance_schema = source_comparison_schema(source_schema.as_ref(), full_schema)?;
         let is_full_schema = full_schema.compare_with_options(
             &lance_schema,
             &SchemaCompareOptions {
@@ -15163,6 +15193,100 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::full_scan_join(false)]
+    #[case::scalar_index_join(true)]
+    #[tokio::test]
+    async fn test_merge_insert_accepts_blob_v1_source_after_blob_v2_promotion(
+        #[case] use_index: bool,
+    ) {
+        use arrow_array::LargeBinaryArray;
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_arrow::BLOB_META_KEY;
+        use lance_core::datatypes::BlobHandling;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, true),
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+        ]));
+        let make_reader = |ids: Vec<u32>, blobs: &[&[u8]]| {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(ids)),
+                    Arc::new(LargeBinaryArray::from(blobs.to_vec())),
+                ],
+            )
+            .unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+        };
+        Dataset::write(
+            make_reader(vec![0, 1], &[b"foo", b"bar"]),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // A 2.2 append promotes the legacy blob column to Blob v2.
+        let mut dataset = Dataset::write(
+            make_reader(vec![2], &[b"promoted"]),
+            &test_dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(&["id"], IndexType::Scalar, None, &scalar_params, false)
+            .await
+            .unwrap();
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(use_index)
+            .data_storage_version(LanceFileVersion::V2_2)
+            .try_build()
+            .unwrap();
+        let source = make_reader(vec![1, 3], &[b"baz", b"qux"]);
+        let (dataset, stats) = job.execute_reader(source).await.unwrap();
+        assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (1, 1));
+
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut rows = batch["id"]
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(batch["blob"].as_binary::<i64>().iter())
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            rows,
+            vec![
+                (0, Some(b"foo".as_slice())),
+                (1, Some(b"baz".as_slice())),
+                (2, Some(b"promoted".as_slice())),
+                (3, Some(b"qux".as_slice())),
+            ]
         );
     }
 

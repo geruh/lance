@@ -40,7 +40,7 @@ Blob versioning follows dataset file format rules:
 
 - `data_storage_version` is the Lance file format version of a dataset.
 - A dataset's `data_storage_version` is fixed once created.
-- For `data_storage_version >= 2.2`, legacy blob metadata (`lance-encoding:blob`) is rejected on write.
+- For `data_storage_version >= 2.2`, legacy blob metadata (`lance-encoding:blob`) is accepted as input and written as Blob v2.
 - Legacy metadata-based blob write remains available for `0.1`, `2.0`, and `2.1`.
 
 ```python
