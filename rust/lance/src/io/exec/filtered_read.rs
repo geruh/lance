@@ -2772,9 +2772,7 @@ impl FilteredReadExec {
     }
 
     fn retained_physical_row_count(&self, fragments: &[Fragment]) -> Option<u64> {
-        if self.dataset.manifest().writer_version.is_none() {
-            return None;
-        }
+        self.dataset.manifest().writer_version.as_ref()?;
         fragments
             .iter()
             .map(|fragment| fragment.physical_rows)
