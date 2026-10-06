@@ -345,6 +345,10 @@ pub struct FragmentTree {
     buffer: Vec<pb::FragmentTreeMutation>,
     buffer_index: OnceLock<node::BufferIndex>,
     next_action_sequence: u64,
+    /// The opened root's next sequence. The suffix and this writer's mutations
+    /// start here. Whole-bucket drains keep their per-fragment history contiguous
+    /// within each buffer. Older history may interleave across buffers.
+    contiguous_from: u64,
     total_fragments: u64,
     total_rows: u64,
     /// The next fragment id an append allocates; see `next_fragment_id`.
@@ -354,19 +358,6 @@ pub struct FragmentTree {
     force_flush: bool,
     /// Exact descriptor this writer opened/prepared; derived, never persisted.
     snapshot: Option<Box<pb::FragmentTree>>,
-}
-
-#[derive(Clone)]
-struct MutableState {
-    version: u64,
-    children: Vec<pb::FragmentTreeChild>,
-    buffer: Vec<pb::FragmentTreeMutation>,
-    next_action_sequence: u64,
-    total_fragments: u64,
-    total_rows: u64,
-
-    next_fragment_id: u64,
-    visible_rows: u64,
 }
 
 impl FragmentTree {
@@ -467,6 +458,7 @@ impl FragmentTree {
             buffer: Vec::new(),
             buffer_index: OnceLock::new(),
             next_action_sequence: 1,
+            contiguous_from: 1,
             total_fragments: num_fragments,
             total_rows,
 
@@ -1065,34 +1057,6 @@ impl FragmentTree {
         Ok(objects)
     }
 
-    fn mutable_state(&self) -> MutableState {
-        MutableState {
-            version: self.version,
-            children: self.children.clone(),
-            buffer: self.buffer.clone(),
-            next_action_sequence: self.next_action_sequence,
-            total_fragments: self.total_fragments,
-            total_rows: self.total_rows,
-
-            next_fragment_id: self.next_fragment_id,
-            visible_rows: self.visible_rows,
-        }
-    }
-
-    fn restore_mutable_state(&mut self, state: MutableState) {
-        self.buffer_index.take();
-        self.version = state.version;
-        self.children = state.children;
-        self.buffer = state.buffer;
-        self.next_action_sequence = state.next_action_sequence;
-        self.store.next_action_sequence = state.next_action_sequence;
-        self.total_fragments = state.total_fragments;
-
-        self.total_rows = state.total_rows;
-        self.next_fragment_id = state.next_fragment_id;
-        self.visible_rows = state.visible_rows;
-    }
-
     /// Advance the version, aggregates and ID allocator, and tag each action
     /// with its sequence number and deltas. The caller buffers the actions.
     fn stage_commit(
@@ -1560,7 +1524,10 @@ impl FragmentTree {
                 } = rewrite.read_internal(&self.store, &child, end).await?;
                 buffer.extend(incoming);
                 let before = buffer.len();
-                buffer = node::squash_buffer(buffer);
+                buffer = node::squash_buffer(
+                    buffer,
+                    node::combine_from(&children, self.contiguous_from),
+                );
                 acc.squashed += (before - buffer.len()) as u64;
                 // This node is one level deeper than the parent that flushed to it.
                 let (children, buffer, a) = self

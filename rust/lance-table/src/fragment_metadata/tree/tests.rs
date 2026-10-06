@@ -1449,6 +1449,266 @@ async fn failed_prepare_restores_frontiers_and_buffer() {
     );
 }
 
+#[tokio::test]
+async fn dropped_prepare_leaves_the_tree_unchanged() {
+    let policy = SnapshotPolicy::default();
+    let mut fixture = Fixture::new(1, FragmentTreeConfig::default(), policy).await;
+    let original = fixture.tree.materialize().await.unwrap();
+    let touched = fixture.tree.resolve_touched(&[0]).await.unwrap();
+    let delayed = FailpointController::default();
+    delayed.set_get_latency(std::time::Duration::from_secs(60));
+    let mut store = fixture.store.as_ref().clone();
+    store.apply_wrapper(&delayed);
+    fixture.tree = fixture.tree.with_object_store(Arc::new(store));
+    let mut pending = Box::pin(fixture.tree.prepare_snapshot(
+        ValidatedCommit::fragment_actions(vec![action::add_data_file(
+            0,
+            &make_backfill_data_file(0, 1),
+        )]),
+        &touched,
+        &fixture.snapshot,
+        policy,
+        true,
+    ));
+    // Suspend at the first leaf GET, after the rewrite takes the routing.
+    assert!(futures::poll!(pending.as_mut()).is_pending());
+    drop(pending);
+    fixture.tree = fixture.tree.with_object_store(fixture.store.clone());
+    assert_eq!(fixture.tree.version(), 1);
+    assert_eq!(fixture.tree.materialize().await.unwrap(), original);
+
+    let appended = make_fragment(1);
+    let (snapshot, _) = fixture
+        .tree
+        .prepare_snapshot(
+            ValidatedCommit::fragment_actions(vec![action::upsert_fragment(&appended)]),
+            &TouchedFragments::default(),
+            &fixture.snapshot,
+            policy,
+            false,
+        )
+        .await
+        .unwrap();
+    let reopened = fixture.open(&snapshot, fixture.tree.version()).await;
+    assert_eq!(
+        reopened.materialize().await.unwrap(),
+        vec![original[0].clone(), appended]
+    );
+}
+
+fn stored(action_sequence: u64, action: pb::FragmentAction) -> pb::FragmentTreeMutation {
+    pb::FragmentTreeMutation {
+        action_sequence,
+        action: Some(action),
+        ..Default::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OuterBuffer {
+    Root,
+    Interior,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LaterMutation {
+    ClearDeletionFile,
+    Upsert,
+}
+
+// The spec permits sequences 1 and 3 in one buffer, with 2 in a deeper buffer.
+#[rstest]
+#[case::root_reset_then_clear(OuterBuffer::Root, LaterMutation::ClearDeletionFile)]
+#[case::root_edit_between_resets(OuterBuffer::Root, LaterMutation::Upsert)]
+#[case::interior_reset_then_clear(OuterBuffer::Interior, LaterMutation::ClearDeletionFile)]
+#[tokio::test]
+async fn interleaved_stored_history_replays_in_sequence_order(
+    #[case] outer: OuterBuffer,
+    #[case] later: LaterMutation,
+) {
+    let policy = SnapshotPolicy::default();
+    // Fanout 4 and 4 KiB leaves keep these small nodes above the merge
+    // floors, so drains reach every level instead of collapsing the tree.
+    let config = FragmentTreeConfig::new(16 * 1024, 4)
+        .with_max_leaf_bytes(4096)
+        .with_semantic_buffer_bytes(1);
+    let mut fixture = Fixture::new(0, config.clone(), policy).await;
+    let nodes = &fixture.tree.store;
+    let left = nodes.write_leaf(&[make_fragment(0)], 0).await.unwrap();
+    let right = nodes.write_leaf(&[make_fragment(1)], 0).await.unwrap();
+    let added = make_backfill_data_file(0, 1);
+    let inner = nodes
+        .write_internal(
+            vec![left.child_ref, right.child_ref],
+            vec![stored(2, action::add_data_file(0, &added))],
+        )
+        .await
+        .unwrap();
+    let mut sibling = Vec::new();
+    for id in [2, 3] {
+        sibling.push(
+            nodes
+                .write_leaf(&[make_fragment(id)], 0)
+                .await
+                .unwrap()
+                .child_ref,
+        );
+    }
+    let sibling = nodes.write_internal(sibling, Vec::new()).await.unwrap();
+    let mut first = make_fragment(0);
+    first.files[0] = make_replacement_data_file(0, 0);
+    let (last, expected) = match later {
+        LaterMutation::Upsert => {
+            let mut second = make_fragment(0);
+            second.files[0] = make_replacement_data_file(0, 1);
+            (action::upsert_fragment(&second), second)
+        }
+        LaterMutation::ClearDeletionFile => {
+            let mut expected = first.clone();
+            expected.files.push(added);
+            (action::clear_deletion_file(0), expected)
+        }
+    };
+    let outer_buffer = vec![stored(1, action::upsert_fragment(&first)), stored(3, last)];
+    let (children, buffer) = match outer {
+        OuterBuffer::Interior => {
+            let outer = nodes
+                .write_internal(vec![inner.child_ref, sibling.child_ref], outer_buffer)
+                .await
+                .unwrap();
+            (vec![outer.child_ref], Vec::new())
+        }
+        OuterBuffer::Root => (vec![inner.child_ref, sibling.child_ref], outer_buffer),
+    };
+    let snapshot = pb::FragmentTree {
+        root: Some(pb::fragment_tree::Root::InlineRoot(pb::FragmentTreeRoot {
+            children,
+            buffer,
+            next_action_sequence: 4,
+        })),
+        mutations_since_root: vec![],
+        next_action_sequence: 4,
+    };
+    fixture.tree = FragmentTree::open_snapshot(
+        fixture.store.clone(),
+        fixture.base.clone(),
+        fixture.scheduler.clone(),
+        Arc::new(LanceCache::with_capacity(0)),
+        &snapshot,
+        1,
+        config,
+        4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.tree.resolve_fragment(0).await.unwrap(),
+        Some(expected.clone())
+    );
+
+    let appended = make_fragment(4);
+    let (published, stats) = fixture
+        .tree
+        .prepare_snapshot(
+            ValidatedCommit::fragment_actions(vec![action::upsert_fragment(&appended)]),
+            &TouchedFragments::default(),
+            &snapshot,
+            policy,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(stats.flushes > 0, "{stats:?}");
+    let reopened = fixture.open(&published, fixture.tree.version()).await;
+    assert_eq!(
+        reopened.materialize().await.unwrap(),
+        [
+            vec![expected],
+            (1..4).map(make_fragment).collect(),
+            vec![appended]
+        ]
+        .concat()
+    );
+}
+
+#[tokio::test]
+async fn fresh_opens_fold_repeated_edits_above_leaves() {
+    let policy = SnapshotPolicy::default();
+    let mut fixture = Fixture::new(2, FragmentTreeConfig::default(), policy).await;
+    assert_eq!(fixture.tree.height(), 1);
+    let mut replaced = make_fragment(0);
+    for round in 0..3 {
+        replaced.files[0] = make_replacement_data_file(0, round);
+        fixture
+            .commit(vec![action::upsert_fragment(&replaced)], policy, false)
+            .await;
+        fixture.tree = fixture
+            .open(&fixture.snapshot, fixture.tree.version())
+            .await;
+        assert_eq!(fixture.tree.root_buffer_len(), 1);
+    }
+    assert_eq!(
+        fixture.tree.materialize().await.unwrap(),
+        vec![replaced, make_fragment(1)]
+    );
+}
+
+// Replacing fragment 0 twice must not count as replacing both fragments in the leaf.
+#[tokio::test]
+async fn repeated_replacements_of_one_fragment_cover_it_once() {
+    let policy = SnapshotPolicy::default();
+    let config = FragmentTreeConfig::default().with_semantic_buffer_bytes(1);
+    let fixture = Fixture::new(0, config.clone(), policy).await;
+    let leaf = fixture
+        .tree
+        .store
+        .write_leaf(&[make_fragment(0), make_fragment(1)], 0)
+        .await
+        .unwrap();
+    // Wide records make the drain worth its leaf rewrite.
+    let mut first = make_fragment_with_files(0, 32);
+    first.files[0] = make_replacement_data_file(0, 0);
+    let snapshot = pb::FragmentTree {
+        root: Some(pb::fragment_tree::Root::InlineRoot(pb::FragmentTreeRoot {
+            children: vec![leaf.child_ref],
+            buffer: vec![stored(1, action::upsert_fragment(&first))],
+            next_action_sequence: 2,
+        })),
+        mutations_since_root: vec![],
+        next_action_sequence: 2,
+    };
+    let mut tree = FragmentTree::open_snapshot(
+        fixture.store.clone(),
+        fixture.base.clone(),
+        fixture.scheduler.clone(),
+        Arc::new(LanceCache::with_capacity(0)),
+        &snapshot,
+        1,
+        config.clone(),
+        2,
+    )
+    .await
+    .unwrap();
+    let mut second = first.clone();
+    second.files[0] = make_replacement_data_file(0, 1);
+    let touched = tree.resolve_touched(&[0]).await.unwrap();
+    let (_, stats) = tree
+        .prepare_snapshot(
+            ValidatedCommit::fragment_actions(vec![action::upsert_fragment(&second)]),
+            &touched,
+            &snapshot,
+            policy,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(stats.flushes > 0, "{stats:?}");
+    assert_eq!(
+        tree.materialize().await.unwrap(),
+        vec![second, make_fragment(1)]
+    );
+}
+
 #[rstest]
 #[case::rewrite(false, None)]
 #[case::split_and_remove(true, None)]

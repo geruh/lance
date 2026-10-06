@@ -57,9 +57,9 @@ pub struct Manifest {
     /// sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
 
-    /// Fragment metadata tree descriptor when fragment records are external.
-    /// `None` means [`Self::fragments`] is the complete state. This unstable
-    /// representation requires the fragment metadata reader/writer feature flag.
+    /// Experimental fragment tree descriptor. This API may change at any time.
+    /// `None` means [`Self::fragments`] is the complete state. A tree requires
+    /// the fragment metadata reader/writer feature flag.
     pub fragment_tree: Option<Arc<pb::FragmentTree>>,
 
     /// The file position of the version aux data.
