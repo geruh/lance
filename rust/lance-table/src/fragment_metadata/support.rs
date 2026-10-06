@@ -14,6 +14,7 @@ const FILE_VERSION: ConcreteFileVersion = ConcreteFileVersion::V2_0;
 /// A realistic Lance data-file path `data/<50 chars>.lance` derived
 /// deterministically from `(id, salt)`. Matches Lance's real naming: first 3 of
 /// 16 UUID bytes → 24 binary chars, remaining 13 → 26 hex chars.
+#[cfg_attr(coverage, coverage(off))]
 pub fn data_file_path(id: u64, salt: u64) -> String {
     // splitmix64-fill 16 pseudo-random-but-deterministic bytes (a synthetic UUID).
     let mut bytes = [0u8; 16];
@@ -46,6 +47,7 @@ pub fn data_file_path(id: u64, salt: u64) -> String {
 
 /// A base 1-row fragment with one two-column data file — the bootstrap table of
 /// N tiny fragments.
+#[cfg_attr(coverage, coverage(off))]
 pub fn make_fragment(id: u64) -> Fragment {
     let mut fragment = Fragment::new(id).with_file(
         data_file_path(id, 0),
@@ -60,6 +62,7 @@ pub fn make_fragment(id: u64) -> Fragment {
 
 /// The data file that backfill round `col` attaches to `frag_id` (add-column):
 /// one new field in a new data file, as an embedding backfill would produce.
+#[cfg_attr(coverage, coverage(off))]
 pub fn make_backfill_data_file(frag_id: u64, col: u32) -> DataFile {
     DataFile::new(
         data_file_path(frag_id, col as u64 + 1),
@@ -75,6 +78,7 @@ pub fn make_backfill_data_file(frag_id: u64, col: u32) -> DataFile {
 /// the same base columns in a fresh file, as an update or compaction rewrite
 /// would produce. Path salts start above every backfill salt so replacement
 /// paths never collide with add-column paths.
+#[cfg_attr(coverage, coverage(off))]
 pub fn make_replacement_data_file(frag_id: u64, round: u32) -> DataFile {
     const REPLACEMENT_SALT_BASE: u64 = 1 << 32;
     DataFile::new(
@@ -88,6 +92,7 @@ pub fn make_replacement_data_file(frag_id: u64, round: u32) -> DataFile {
 }
 
 /// A fragment containing one base file and additional single-column files.
+#[cfg_attr(coverage, coverage(off))]
 pub fn make_fragment_with_files(id: u64, num_files: u32) -> Fragment {
     let mut fragment = make_fragment(id);
     for col in 0..num_files.saturating_sub(1) {

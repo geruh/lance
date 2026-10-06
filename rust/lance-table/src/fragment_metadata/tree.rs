@@ -483,7 +483,7 @@ impl FragmentTree {
         self.children.iter().map(|c| c.height).max().unwrap_or(0) + 1
     }
 
-    /// Latest atomically published version held by this session.
+    /// Version of the opened or prepared snapshot. The caller publishes it.
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -949,17 +949,6 @@ impl FragmentTree {
             pending.extend(internal.children);
         }
         Ok(keys)
-    }
-
-    /// Collect `(height, logical_bytes)` for each internal node, including the root.
-    pub async fn internal_node_sizes(&self) -> Result<Vec<(u32, u64)>> {
-        let mut out = vec![(
-            self.height(),
-            node::internal_logical_bytes(&self.children, &self.buffer),
-        )];
-        self.collect_internal_sizes(self.children.clone(), &mut out)
-            .await?;
-        Ok(out)
     }
 
     /// Read node occupancy and encoded sizes. Leaf sizes come from child references.
@@ -1988,23 +1977,6 @@ impl FragmentTree {
                     leaves,
                 )
                 .await?;
-            }
-            Ok(())
-        })
-    }
-
-    fn collect_internal_sizes<'a>(
-        &'a self,
-        children: Vec<pb::FragmentTreeChild>,
-        out: &'a mut Vec<(u32, u64)>,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            for c in &children {
-                if c.height > 0 {
-                    out.push((c.height, c.object_size));
-                    let node = self.store.read_internal(c).await?;
-                    self.collect_internal_sizes(node.children, out).await?;
-                }
             }
             Ok(())
         })

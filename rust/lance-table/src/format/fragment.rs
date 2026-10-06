@@ -264,7 +264,7 @@ impl DataFile {
 impl pb::DataFile {
     /// [`DataFile::validate`] on the encoded entry, so a writer can reject a
     /// file its readers would reject without decoding the record that holds it.
-    pub fn validate(&self, base_path: &Path) -> Result<()> {
+    pub(crate) fn validate(&self, base_path: &Path) -> Result<()> {
         validate_data_file(
             &self.path,
             &self.fields,
@@ -640,8 +640,9 @@ impl Fragment {
     }
 
     /// Every Lance-format file this fragment references: the base data files
-    /// plus the data file of each overlay. Hidden row lineage columns live in
-    /// the base data files too. Deletion files use `.arrow` or `.bin` instead.
+    /// plus the data file of each overlay. The fragment's other referenced
+    /// files are not in this format: a deletion file is `.arrow` or `.bin`, and
+    /// external row-id or row-version metadata is a raw byte range.
     ///
     /// Prefer this over `files`, which is the base data files only and so omits
     /// overlays.
@@ -964,10 +965,13 @@ impl From<&Fragment> for pb::DataFragment {
 mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
+    use crate::io::manifest::read_manifest;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use lance_core::utils::tempfile::TempDir;
     use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
+    use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use roaring::RoaringBitmap;
     use serde_json::{Value, json};
@@ -1300,6 +1304,58 @@ mod tests {
         data_file
             .validate(&base_path)
             .expect("validation should allow extra columns without field ids");
+    }
+
+    #[rstest::rstest]
+    #[case::original(None, true)]
+    #[case::tombstone(Some(vec![0, TOMBSTONE_FIELD_ID, 1]), true)]
+    #[case::unsorted(Some(vec![1, TOMBSTONE_FIELD_ID, 0]), false)]
+    #[case::duplicate(Some(vec![0, TOMBSTONE_FIELD_ID, 0]), false)]
+    #[tokio::test]
+    async fn encoded_validation_preserves_legacy_rules(
+        #[case] fields: Option<Vec<i32>>,
+        #[case] is_valid: bool,
+    ) {
+        let tmp = TempDir::default();
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test_data/v0.5.9/dataset_with_fragments/_versions/1.manifest"
+            ),
+            tmp.std_path().join("1.manifest"),
+        )
+        .unwrap();
+        let manifest = read_manifest(
+            &ObjectStore::local(),
+            &tmp.obj_path().join("1.manifest"),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut file = manifest.fragments[0].files[0].clone();
+        assert!(file.uses_v1_data_file_encoding());
+        assert_eq!(file.fields.as_ref(), &[0]);
+        assert!(file.column_indices.is_empty());
+        if let Some(fields) = fields {
+            file.fields = fields.into();
+        }
+        let decoded = file.validate(&tmp.obj_path());
+        let encoded = pb::DataFile::from(&file).validate(&tmp.obj_path());
+        if is_valid {
+            decoded.unwrap();
+            encoded.unwrap();
+        } else {
+            let errors = [decoded.unwrap_err(), encoded.unwrap_err()];
+            for error in &errors {
+                assert!(matches!(error, Error::CorruptFile { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("unsorted or duplicate field ids")
+                );
+            }
+            assert_eq!(errors[0].to_string(), errors[1].to_string());
+        }
     }
 
     #[test]

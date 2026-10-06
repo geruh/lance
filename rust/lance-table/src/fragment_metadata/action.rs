@@ -3,10 +3,8 @@
 
 //! Storage-action constructors and routing keys.
 //!
-//! Every action here is an already-validated storage mutation with one
-//! unambiguous leaf application in action sequence order (see
-//! [`crate::fragment_metadata::node::apply_actions`]). Transaction intent is validated
-//! and translated into these in [`crate::fragment_metadata::commit`].
+//! These constructors do not validate actions. Tree preparation checks them
+//! against the resolved fragment state before storing them.
 
 use crate::format::pb::{self, fragment_action::Action};
 use crate::format::{DataFile, DeletionFile, DeletionFileType, Fragment};

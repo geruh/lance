@@ -255,10 +255,9 @@ impl Manifest {
         }
     }
 
-    /// Performs a shallow_clone of the manifest entirely in memory without:
-    /// - Any persistent storage operations
-    /// - Modifications to the original data
-    /// - If the shallow clone is for branch, ref_name is the source branch
+    /// Clone the manifest in memory. For a branch, `ref_name` names the source.
+    /// Tree descriptors are copied unchanged. Before publication, the caller
+    /// must rebuild the tree or remap its references to the source dataset.
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,

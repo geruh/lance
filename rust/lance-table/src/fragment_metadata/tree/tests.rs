@@ -203,16 +203,16 @@ struct Fixture {
 }
 
 #[rstest]
-#[case::root_envelope(false)]
-#[case::child_object(true)]
+#[case::zero_sequence(false)]
+#[case::zero_object_size(true)]
 #[tokio::test]
-async fn snapshot_rejects_objects_over_its_hard_limit(#[case] oversized_child: bool) {
+async fn snapshot_rejects_invalid_root_and_child_metadata(#[case] is_child_invalid: bool) {
     let fixture = Fixture::new(2, FragmentTreeConfig::default(), SnapshotPolicy::default()).await;
     let mut snapshot = fixture.snapshot.clone();
     let Some(pb::fragment_tree::Root::InlineRoot(root)) = &mut snapshot.root else {
         panic!("expected inline root");
     };
-    if oversized_child {
+    if is_child_invalid {
         root.children[0].object_size = 0;
     } else {
         root.next_action_sequence = 0;
@@ -230,9 +230,9 @@ async fn snapshot_rejects_objects_over_its_hard_limit(#[case] oversized_child: b
     .await;
     let error = result
         .err()
-        .expect("oversized snapshot must be rejected at open");
+        .expect("invalid snapshot must be rejected at open");
     assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
-    if oversized_child {
+    if is_child_invalid {
         assert!(
             error.to_string().contains("object_size") || error.to_string().contains("child"),
             "{error}"

@@ -12,11 +12,10 @@ use std::sync::{Arc, Mutex};
 use crate::object_store::WrappingObjectStore;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as OSResult,
 };
 
@@ -25,10 +24,7 @@ use object_store::{
 pub enum FailOn {
     /// Any `put_opts` whose path contains the substring.
     Put,
-    /// Only create-only puts (root and transaction publication).
-    CreateOnly,
     Get,
-    Delete,
 }
 
 /// Whether the failure is reported before or after the underlying request.
@@ -91,18 +87,13 @@ impl FailpointController {
     }
 
     /// Decide whether this request must fail, and when.
-    fn check(&self, on: FailOn, path: &Path, create_only: bool) -> Option<FailWhen> {
+    fn check(&self, on: FailOn, path: &Path) -> Option<FailWhen> {
         let mut state = self.state.lock().unwrap();
         let failpoint = state.failpoint.clone()?;
         if state.tripped {
             return None;
         }
-        let class_matches = match failpoint.on {
-            FailOn::Put => on == FailOn::Put || on == FailOn::CreateOnly,
-            FailOn::CreateOnly => on == FailOn::CreateOnly && create_only,
-            other => other == on,
-        };
-        if !class_matches || !path.as_ref().contains(&failpoint.path_contains) {
+        if failpoint.on != on || !path.as_ref().contains(&failpoint.path_contains) {
             return None;
         }
         state.matched += 1;
@@ -162,13 +153,7 @@ impl OSObjectStore for FailpointStore {
         bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
-        let create_only = matches!(opts.mode, PutMode::Create);
-        let class = if create_only {
-            FailOn::CreateOnly
-        } else {
-            FailOn::Put
-        };
-        match self.controller.check(class, location, create_only) {
+        match self.controller.check(FailOn::Put, location) {
             Some(FailWhen::Before) => Err(injected(location)),
             Some(FailWhen::After) => {
                 self.target.put_opts(location, bytes, opts).await?;
@@ -183,19 +168,14 @@ impl OSObjectStore for FailpointStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> OSResult<Box<dyn MultipartUpload>> {
-        // Leaf Lance files are written through a multipart upload; treat the
-        // upload start as the write for failpoint purposes.
-        match self.controller.check(FailOn::Put, location, false) {
-            Some(FailWhen::Before) => Err(injected(location)),
-            Some(FailWhen::After) | None => self.target.put_multipart_opts(location, opts).await,
-        }
+        self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         if let Some(latency) = self.controller.get_latency() {
             tokio::time::sleep(latency).await;
         }
-        match self.controller.check(FailOn::Get, location, false) {
+        match self.controller.check(FailOn::Get, location) {
             Some(_) => Err(injected(location)),
             None => self.target.get_opts(location, options).await,
         }
@@ -205,30 +185,7 @@ impl OSObjectStore for FailpointStore {
         &self,
         locations: BoxStream<'static, OSResult<Path>>,
     ) -> BoxStream<'static, OSResult<Path>> {
-        let controller = self.controller.clone();
-        let target = self.target.clone();
-        locations
-            .then(move |location| {
-                let controller = controller.clone();
-                let target = target.clone();
-                async move {
-                    let location = location?;
-                    let verdict = controller.check(FailOn::Delete, &location, false);
-                    if verdict == Some(FailWhen::Before) {
-                        return Err(injected(&location));
-                    }
-                    let once = location.clone();
-                    let deleted = target
-                        .delete_stream(futures::stream::once(async move { Ok(once) }).boxed())
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    match verdict {
-                        Some(FailWhen::After) => Err(injected(&location)),
-                        _ => Ok(deleted.into_iter().next().unwrap_or(location)),
-                    }
-                }
-            })
-            .boxed()
+        self.target.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {

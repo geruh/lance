@@ -1409,10 +1409,8 @@ impl NodeStore {
     }
 }
 
-/// Fetch a whole object through the object-store trait, never through the
-/// local-filesystem fast path, so store wrappers (tracking, injected
-/// latency, caches) observe all metadata reads.
-pub async fn get_whole(object_store: &ObjectStore, path: &Path) -> Result<bytes::Bytes> {
+// Use the object-store trait so wrappers observe metadata reads on local storage too.
+async fn get_whole(object_store: &ObjectStore, path: &Path) -> Result<bytes::Bytes> {
     let result = object_store
         .inner
         .get_opts(path, object_store::GetOptions::default())

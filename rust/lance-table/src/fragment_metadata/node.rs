@@ -20,7 +20,7 @@ use lance_core::{Error, Result};
 /// Default routing and leaf targets. These are independent writer policies.
 pub const DEFAULT_MAX_NODE_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_MAX_LEAF_BYTES: u64 = 1024 * 1024;
-pub const DEFAULT_MAX_CHILDREN_PER_NODE: u32 = 16;
+const DEFAULT_MAX_CHILDREN_PER_NODE: u32 = 16;
 
 /// Encoded-byte policy for immutable nodes and semantic buffers.
 #[derive(Debug, Clone)]
@@ -101,25 +101,19 @@ impl FragmentTreeConfig {
         self.hard_capacity_bytes = bytes;
         self
     }
-    pub fn split_ceiling(&self) -> u64 {
-        self.max_node_bytes
-    }
-    pub fn split_piece_bytes(&self) -> u64 {
+    pub(crate) fn split_piece_bytes(&self) -> u64 {
         self.max_node_bytes / 2
     }
-    pub fn merge_floor(&self) -> u64 {
+    pub(crate) fn merge_floor(&self) -> u64 {
         self.max_node_bytes / 4
     }
-    pub fn coalesce_ceiling(&self) -> u64 {
+    pub(crate) fn coalesce_ceiling(&self) -> u64 {
         self.max_node_bytes * 3 / 5
     }
-    pub fn leaf_split_ceiling(&self) -> u64 {
-        self.max_leaf_bytes
-    }
-    pub fn leaf_merge_floor(&self) -> u64 {
+    pub(crate) fn leaf_merge_floor(&self) -> u64 {
         self.max_leaf_bytes / 4
     }
-    pub fn leaf_coalesce_ceiling(&self) -> u64 {
+    pub(crate) fn leaf_coalesce_ceiling(&self) -> u64 {
         self.max_leaf_bytes * 3 / 5
     }
 }
@@ -261,7 +255,7 @@ pub fn overflows_with(
     config: &FragmentTreeConfig,
 ) -> bool {
     children.len() as u32 > config.max_children_per_node
-        || internal_logical_bytes(children, &[]) + buffer_bytes >= config.split_ceiling()
+        || internal_logical_bytes(children, &[]) + buffer_bytes >= config.max_node_bytes
 }
 
 /// Whether pending bytes exceed the semantic buffer. This is the soft bound.
@@ -477,7 +471,7 @@ pub fn is_underflow(child: &pb::FragmentTreeChild, config: &FragmentTreeConfig) 
 /// changes. Storage paths verify. The reducer oracle and lowering compare
 /// records only, with deltas left unset.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DeltaCheck {
+enum DeltaCheck {
     Trust,
     Verify,
 }
