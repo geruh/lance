@@ -27,6 +27,12 @@ impl Default for SnapshotPolicy {
     }
 }
 
+// A collapse retry restores routing. Rewrites leave frontiers and totals unchanged.
+struct RootRouting {
+    children: Vec<pb::FragmentTreeChild>,
+    buffer: Vec<pb::FragmentTreeMutation>,
+}
+
 impl FragmentTree {
     /// Resolve validation state while retaining complete leaf reads on local
     /// scratch storage for a subsequent bulk materialization. Scratch is owned
@@ -241,15 +247,20 @@ impl FragmentTree {
         }
         let mut buffer = root.buffer;
         buffer.extend(snapshot.mutations_since_root.iter().cloned());
+        let buffer = node::squash_buffer(
+            buffer,
+            node::combine_from(&root.children, root.next_action_sequence),
+        );
         config.validate()?;
         Ok(Self {
             store,
             config,
             version,
             children: root.children,
-            buffer: node::squash_buffer(buffer),
+            buffer,
             buffer_index: OnceLock::new(),
             next_action_sequence: snapshot.next_action_sequence,
+            contiguous_from: root.next_action_sequence,
             total_fragments,
             total_rows,
             visible_rows,
@@ -259,9 +270,9 @@ impl FragmentTree {
         })
     }
 
-    /// Prepare a validated mutation for manifest publication. No version becomes
-    /// visible here. On failure, the in-memory tree is restored; objects already
-    /// written remain unreachable until normal retention GC removes them.
+    /// Prepare a snapshot without publishing a version. An error or dropped future
+    /// leaves this tree's fragment state unchanged. Unreferenced objects written
+    /// during preparation remain until retention cleanup removes them.
     pub async fn prepare_snapshot(
         &mut self,
         commit: ValidatedCommit,
@@ -282,19 +293,17 @@ impl FragmentTree {
             self.next_fragment_id,
             self.store.base(),
         )?;
-        let previous = self.mutable_state();
-        let result = self
-            .prepare_snapshot_inner(commit, deltas, previous_snapshot, policy, bulk)
-            .await;
-        self.force_flush = false;
+        // Keep partial rewrites private if preparation fails or is cancelled.
+        let mut staged = self.clone();
         self.store.clear_validation_reads();
-        if result.is_err() {
-            self.restore_mutable_state(previous);
-        }
-        if let Ok((snapshot, _)) = &result {
-            self.snapshot = Some(Box::new(snapshot.clone()));
-        }
-        result
+        let (snapshot, stats) = staged
+            .prepare_snapshot_inner(commit, deltas, previous_snapshot, policy, bulk)
+            .await?;
+        staged.force_flush = false;
+        staged.store.clear_validation_reads();
+        staged.snapshot = Some(Box::new(snapshot.clone()));
+        *self = staged;
+        Ok((snapshot, stats))
     }
 
     async fn prepare_snapshot_inner(
@@ -312,12 +321,15 @@ impl FragmentTree {
         let suffix = (!bulk && matches!(&previous.root, Some(Root::RootUuid(_)))).then(|| {
             let mut suffix = previous.mutations_since_root.clone();
             suffix.extend(tagged.iter().cloned());
-            node::squash_buffer(suffix)
+            node::squash_buffer(suffix, self.contiguous_from)
         });
         self.buffer_index.take();
         self.buffer.extend(tagged);
         let before = self.buffer.len();
-        self.buffer = node::squash_buffer(std::mem::take(&mut self.buffer));
+        self.buffer = node::squash_buffer(
+            std::mem::take(&mut self.buffer),
+            node::combine_from(&self.children, self.contiguous_from),
+        );
         let squashed = before - self.buffer.len();
         if let Some(suffix) = suffix
             && !node::internal_overflows(&self.children, &self.buffer, &self.config)
@@ -337,21 +349,26 @@ impl FragmentTree {
         self.force_flush = bulk;
         // A collapse starts only where an ingested interior keeps a single
         // interior child, which needs a root child at height two or more.
-        // Below that the buffered rewrite never falls back, so the staged
+        // Below that the buffered rewrite never falls back, so the saved
         // copy of the whole buffer would go unused.
-        let staged = (!bulk && self.children.iter().any(|child| child.height >= 2))
-            .then(|| self.mutable_state());
+        let before_rewrite =
+            (!bulk && self.children.iter().any(|child| child.height >= 2)).then(|| RootRouting {
+                children: self.children.clone(),
+                buffer: self.buffer.clone(),
+            });
         let mut acc = self.rewrite_tree().await?;
         if acc.collapses > 0 {
-            let Some(staged) = staged else {
+            let Some(before_rewrite) = before_rewrite else {
                 return Err(Error::internal(format!(
                     "fragment metadata tree at version {} collapsed a routing level without \
-                     staged state to retry from",
+                     saved routing to retry from",
                     self.version
                 )));
             };
             // Nothing written by the abandoned rewrite is referenced.
-            self.restore_mutable_state(staged);
+            self.buffer_index.take();
+            self.children = before_rewrite.children;
+            self.buffer = before_rewrite.buffer;
             self.force_flush = true;
             acc = self.rewrite_tree().await?;
         }

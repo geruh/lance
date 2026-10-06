@@ -677,11 +677,10 @@ fn apply_one(frags: &mut BTreeMap<u64, Fragment>, action: pb::FragmentAction) ->
 
 /// Normalize validated current-state actions, preserving each fragment's effect.
 ///
-/// This is not a transaction validator: superseding a prefix is legal only
-/// after that prefix has been validated. Committed transaction history must
-/// retain the original actions. A run must also be a contiguous per-fragment
-/// segment of the action sequence number history; never normalize across an unapplied message
-/// held by another node.
+/// Callers must validate actions before combining them and retain the originals
+/// in transaction history. From `contiguous_from` onward, each fragment's history
+/// must be contiguous within this buffer, with no intervening action in another
+/// node. Earlier actions pass through unchanged.
 ///
 /// The last whole-fragment reset establishes a known state, so its suffix can
 /// be evaluated once. Otherwise, deletion-file assignments form an independent
@@ -689,23 +688,34 @@ fn apply_one(frags: &mut BTreeMap<u64, Fragment>, action: pb::FragmentAction) ->
 /// matching semantics. In particular, a path-changing replacement chain cannot
 /// be combined blindly: the second edit might match a different file slot.
 ///
-/// Combined actions retain the last contributing action sequence number and the sum of aggregate
-/// deltas. If a sum cannot be represented, leave that run unchanged.
-pub fn squash_buffer(mut buffer: Vec<pb::FragmentTreeMutation>) -> Vec<pb::FragmentTreeMutation> {
+/// Combined actions retain the last sequence number and the sum of aggregate
+/// deltas. If a sum overflows, the run stays unchanged.
+pub fn squash_buffer(
+    mut buffer: Vec<pb::FragmentTreeMutation>,
+    contiguous_from: u64,
+) -> Vec<pb::FragmentTreeMutation> {
     // Distinct keys leave nothing to combine, and proving that costs far less
     // than grouping every action by key. The order matches the grouped path,
     // which sorts by action sequence with ties in key order.
-    let mut keys: Vec<u64> = buffer.iter().map(action_key).collect();
+    let mut keys: Vec<u64> = buffer
+        .iter()
+        .filter(|tagged| tagged.action_sequence >= contiguous_from)
+        .map(action_key)
+        .collect();
     keys.sort_unstable();
     if keys.windows(2).all(|pair| pair[0] != pair[1]) {
         buffer.sort_by_key(|tagged| (tagged.action_sequence, action_key(tagged)));
         return buffer;
     }
+    let mut squashed = Vec::new();
     let mut runs: BTreeMap<u64, Vec<pb::FragmentTreeMutation>> = BTreeMap::new();
     for tagged in buffer {
-        runs.entry(action_key(&tagged)).or_default().push(tagged);
+        if tagged.action_sequence < contiguous_from {
+            squashed.push(tagged);
+        } else {
+            runs.entry(action_key(&tagged)).or_default().push(tagged);
+        }
     }
-    let mut squashed = Vec::new();
     for (key, mut run) in runs {
         run.sort_by_key(|tagged| tagged.action_sequence);
         if run.len() > 1 {
@@ -715,6 +725,17 @@ pub fn squash_buffer(mut buffer: Vec<pb::FragmentTreeMutation>) -> Vec<pb::Fragm
     }
     squashed.sort_by_key(|tagged| tagged.action_sequence);
     squashed
+}
+
+/// Parents of leaves can combine all their history. They have no deeper buffers,
+/// and ancestors drain whole buckets into them. Above interiors, older history
+/// may interleave with deeper buffers, so the sequence boundary still applies.
+pub(crate) fn combine_from(children: &[pb::FragmentTreeChild], contiguous_from: u64) -> u64 {
+    if children.iter().all(|child| child.height == 0) {
+        0
+    } else {
+        contiguous_from
+    }
 }
 
 fn combined(run: &[pb::FragmentTreeMutation], action: Action) -> Option<pb::FragmentTreeMutation> {

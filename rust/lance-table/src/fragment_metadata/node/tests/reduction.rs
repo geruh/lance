@@ -29,7 +29,7 @@ fn equivalent(base: Fragment, actions: Vec<pb::FragmentAction>) {
     let actions = tagged(actions);
     let mut expected = BTreeMap::from([(base.id, base.clone())]);
     node::apply_actions(&mut expected, actions.clone()).unwrap();
-    let normalized = node::squash_buffer(actions);
+    let normalized = node::squash_buffer(actions, 0);
     let mut actual = BTreeMap::from([(base.id, base)]);
     node::apply_actions(&mut actual, normalized).unwrap();
     assert_eq!(actual, expected);
@@ -179,15 +179,15 @@ fn check_random_sequence(seed: u64, steps: usize) {
         // Each eight-action batch models one validated commit. Compare every
         // snapshot, including the prefix after incremental normalization.
         if step % 8 == 7 || step + 1 == steps {
-            pending = node::squash_buffer(pending);
+            pending = node::squash_buffer(pending, 0);
             let mut actual = base.clone();
             node::apply_actions(&mut actual, pending.clone()).unwrap();
             assert_eq!(actual, expected, "seed={seed}, step={step}");
             let mut one_shot = base.clone();
-            node::apply_actions(&mut one_shot, node::squash_buffer(originals.clone())).unwrap();
+            node::apply_actions(&mut one_shot, node::squash_buffer(originals.clone(), 0)).unwrap();
             assert_eq!(one_shot, expected, "one-shot seed={seed}, step={step}");
             assert_eq!(
-                node::squash_buffer(pending.clone()),
+                node::squash_buffer(pending.clone(), 0),
                 pending,
                 "normal form idempotence"
             );
@@ -250,7 +250,7 @@ fn legal_reductions_preserve_aggregates(#[case] case: u8) {
         action.total_rows_delta = i as i64 * 10 - 5;
         action.visible_rows_delta = i as i64 * 5 - 3;
     }
-    let output = node::squash_buffer(input.clone());
+    let output = node::squash_buffer(input.clone(), 0);
     assert!(output.len() < input.len());
     assert_eq!(
         input.iter().map(|t| t.fragment_count_delta).sum::<i64>(),
@@ -284,7 +284,7 @@ fn distinct_keys_come_back_in_action_sequence_order() {
     input[2].action_sequence = 5;
     let mut expected = input.clone();
     expected.sort_by_key(|tagged| tagged.action_sequence);
-    assert_eq!(node::squash_buffer(input), expected);
+    assert_eq!(node::squash_buffer(input, 0), expected);
 }
 
 #[test]
@@ -295,5 +295,20 @@ fn unrepresentable_aggregate_keeps_original_run() {
     ]);
     input[0].visible_rows_delta = i64::MAX;
     input[1].visible_rows_delta = 1;
-    assert_eq!(node::squash_buffer(input.clone()), input);
+    assert_eq!(node::squash_buffer(input.clone(), 0), input);
+}
+
+#[test]
+fn history_below_contiguous_from_is_never_combined() {
+    let input = tagged(vec![
+        action::upsert_fragment(&make_fragment(7)),
+        action::clear_deletion_file(7),
+        action::clear_deletion_file(7),
+        action::clear_deletion_file(7),
+    ]);
+    assert_eq!(node::squash_buffer(input.clone(), 0).len(), 1);
+    let output = node::squash_buffer(input.clone(), 3);
+    assert_eq!(output[..2], input[..2]);
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[2].action_sequence, 4);
 }

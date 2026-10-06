@@ -2367,8 +2367,12 @@ mod tests {
             .err()
             .expect("retained reads must fetch the deleted leaf");
         assert!(error.is_not_found(), "{error}");
+        // Local-store errors use platform path separators.
         assert!(
-            error.to_string().contains(&written.child_ref.path),
+            error
+                .to_string()
+                .replace('\\', "/")
+                .contains(&written.child_ref.path),
             "{error}"
         );
     }

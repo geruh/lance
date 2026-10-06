@@ -5,6 +5,8 @@
 //!
 //! Native transactions own validation and rebase. This module prepares tree
 //! objects and a descriptor. The Version Manifest is the publication authority.
+//!
+//! This API and its on-disk layout are experimental and may change at any time.
 
 pub mod action;
 mod bulk;
