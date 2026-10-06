@@ -36,8 +36,8 @@ impl TouchedFragments {
     }
 }
 
-/// A commit whose every action has been validated against
-/// [`TouchedFragments`] and is safe to store.
+/// Storage actions from a validated native transaction. Tree preparation checks
+/// them against [`TouchedFragments`] before storing them.
 #[derive(Debug, Clone)]
 pub struct ValidatedCommit {
     /// Advance the ID allocator, including reservations; never decrease it.
@@ -54,15 +54,10 @@ impl ValidatedCommit {
     }
 }
 
-/// Production `Operation::DataReplacement` for one fragment, decided against
-/// the fragment's current state:
-///
-/// * a data file with the same fields and file version is swapped in place,
-///   which becomes a [`pb::ReplaceDataFile`] naming the file it replaces;
-/// * a replacement whose fields the fragment does not cover at all is the
-///   add-column case and becomes an [`pb::AddDataFile`];
-/// * a missing fragment, a partial field overlap, or a replacement identical
-///   to the existing file is rejected, as the flat commit rejects them.
+/// Encode a data replacement with matching fields and file version, or a file
+/// addition with disjoint fields. Partial overlaps are not supported here.
+/// Callers handling them must derive the final fragment and use an upsert.
+/// Missing fragments and unchanged replacements return an error.
 pub fn data_replacement(
     current: Option<&Fragment>,
     fragment_id: u64,
@@ -153,12 +148,8 @@ pub fn data_replacement(
     Ok(vec![action::upsert_fragment(&updated)])
 }
 
-/// Check that every storage action targets a fragment the commit resolved,
-/// or appends an id the tree has never assigned, then apply the actions to
-/// the touched snapshot to derive each action's fragment-count and row-count
-/// contribution. Application errors here are storage invariant violations,
-/// not user errors: a validated action must always apply. `base` is the
-/// dataset root that data file errors name.
+/// Validate action targets and derive their fragment and row-count deltas.
+/// Unresolved IDs must be introduced by an upsert at or above `next_fragment_id`.
 pub(crate) fn aggregate_deltas(
     actions: &[pb::FragmentAction],
     touched: &TouchedFragments,
@@ -315,14 +306,9 @@ fn upserted_counts(record: &pb::DataFragment) -> Result<(i64, i64)> {
     ))
 }
 
-/// The writer invariant for every fragment stored in the tree. Exact
-/// visible-row aggregates need a known physical row count and a known deleted
-/// count for every deletion file. Production writers always produce both, and
-/// conversion of older data must compute the missing count or refuse. Every
-/// data file must also pass the checks the leaf decoder applies, so a tree is
-/// never published with a record its readers reject. `base` is the dataset
-/// root that data file errors name.
-pub fn require_storable(fragment: &Fragment, base: &Path) -> Result<()> {
+/// Require known physical and deletion counts for exact row aggregates, and
+/// validate data files with the same checks used by the leaf decoder.
+pub(crate) fn require_storable(fragment: &Fragment, base: &Path) -> Result<()> {
     if fragment.id > u64::from(u32::MAX) {
         return Err(Error::invalid_input(format!(
             "Fragment ID {} exceeds u32",
@@ -365,7 +351,7 @@ pub fn require_storable(fragment: &Fragment, base: &Path) -> Result<()> {
 /// One action's contribution to the tree aggregates, derived by applying it
 /// to the touched snapshot.
 #[derive(Debug, Clone, Copy)]
-pub struct ActionDeltas {
+pub(crate) struct ActionDeltas {
     pub fragment_count: i64,
     pub physical_rows: i64,
     /// Physical minus deleted rows, exact by [`require_storable`].
@@ -415,7 +401,7 @@ mod tests {
     };
 
     #[test]
-    fn data_replacement_swaps_appends_or_rejects_like_production() {
+    fn data_replacement_encodes_matching_or_disjoint_fields() {
         let fragment = make_fragment(7);
 
         // Exact fields and file version: swap the named file in place.

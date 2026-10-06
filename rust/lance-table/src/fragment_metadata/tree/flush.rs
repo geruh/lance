@@ -126,7 +126,7 @@ fn reclaimed_bytes(child: &pb::FragmentTreeChild, actions: &[pb::FragmentTreeMut
 
 pub(super) fn fair_share(children: &[pb::FragmentTreeChild], config: &FragmentTreeConfig) -> u64 {
     let routing = node::internal_logical_bytes(children, &[]);
-    config.split_ceiling().saturating_sub(routing) / children.len().max(1) as u64
+    config.max_node_bytes.saturating_sub(routing) / children.len().max(1) as u64
 }
 
 /// Whether the buffer holding a batch is over a byte budget.
