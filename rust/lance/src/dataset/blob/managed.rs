@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
     sync::Arc,
 };
@@ -23,6 +23,7 @@ use crate::dataset::Dataset;
 use lance_core::datatypes::{BlobKind, BlobV2Layout, Field as LanceField};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
+use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 
 pub(in crate::dataset) fn field_contains_blob(field: &LanceField) -> bool {
     field.is_blob_v2() || field.children.iter().any(field_contains_blob)
@@ -211,32 +212,106 @@ pub(super) async fn managed_references(
     Ok(references)
 }
 
-/// Resolve only objects within the cleanup owner's deletion jurisdiction.
+/// Managed blob references within the cleanup owner's scope.
 pub(in crate::dataset) async fn managed_paths(
     dataset: &Dataset,
     owner: &Dataset,
+    owner_base_ids: &BTreeSet<Option<u32>>,
     scan: crate::dataset::scanner::Scanner,
 ) -> Result<HashSet<Path>> {
     let references = managed_references(dataset, scan, false).await?;
-    let mut paths = HashSet::new();
-    let mut bases = HashMap::new();
-    for (id, uri) in references {
-        if let std::collections::hash_map::Entry::Vacant(entry) = bases.entry(id) {
-            let root = dataset.blob_base_path(id)?;
-            let store = dataset.object_store(id).await?;
-            entry.insert((store.store_prefix == owner.object_store.store_prefix, root));
-        }
-        let (same_store, root) = bases
-            .get(&id)
-            .ok_or_else(|| Error::internal("Missing resolved Managed base"))?;
-        if *same_store {
-            let path = join_base_and_relative_path(root, &uri)?;
-            if path.prefix_match(&owner.base).is_some() {
-                paths.insert(path);
-            }
-        }
+    let mut paths = HashSet::with_capacity(references.len());
+    let mut root_by_base: HashMap<u32, Option<Path>> = HashMap::new();
+    for (base_id, uri) in references {
+        let path = if owner_base_ids.contains(&base_id) {
+            join_base_and_relative_path(&owner.base, &uri)?
+        } else if let Some(base_id) = base_id {
+            let root = if let Some(root) = root_by_base.get(&base_id) {
+                root.clone()
+            } else {
+                let root = nested_blob_root(dataset, owner, base_id).await?;
+                root_by_base.insert(base_id, root.clone());
+                root
+            };
+            let Some(root) = root else {
+                continue;
+            };
+            join_base_and_relative_path(&root, &uri)?
+        } else {
+            continue;
+        };
+        paths.insert(path);
     }
     Ok(paths)
+}
+
+async fn nested_blob_root(
+    dataset: &Dataset,
+    owner: &Dataset,
+    base_id: u32,
+) -> Result<Option<Path>> {
+    let registry = dataset.session.store_registry();
+    let base_store = dataset.object_store(Some(base_id)).await?;
+    if !may_be_same_store(
+        registry.as_ref(),
+        &owner.object_store,
+        base_store.scheme(),
+        &base_store.store_prefix,
+    ) {
+        return Ok(None);
+    }
+    let root = dataset
+        .manifest
+        .base_paths
+        .get(&base_id)
+        .ok_or_else(|| {
+            Error::invalid_input(format!("Managed blob references unknown base_id {base_id}"))
+        })?
+        .extract_path(registry)?;
+    Ok(Some(root))
+}
+
+/// Whether `owner` may be the store named by `scheme` and `prefix`.
+///
+/// `prefix` comes from the opened store, so it includes options that are not
+/// in the URI, such as an Azure account. An unknown provider or a prefix that
+/// is not `scheme$location` matches, and cleanup keeps the object.
+pub(in crate::dataset) fn may_be_same_store(
+    registry: &ObjectStoreRegistry,
+    owner: &ObjectStore,
+    scheme: &str,
+    prefix: &str,
+) -> bool {
+    if owner.store_prefix == prefix {
+        return true;
+    }
+    let local = |scheme: &str| matches!(scheme, "file" | "file-object-store" | "file+uring");
+    if local(owner.scheme()) && local(scheme) {
+        return true;
+    }
+    if local(owner.scheme()) || local(scheme) {
+        return false;
+    }
+    let Some(owner_provider) = registry.get_provider(owner.scheme()) else {
+        return true;
+    };
+    let Some(provider) = registry.get_provider(scheme) else {
+        return true;
+    };
+    if !Arc::ptr_eq(&owner_provider, &provider) {
+        return false;
+    }
+    match (
+        prefix_location(&owner.store_prefix, owner.scheme()),
+        prefix_location(prefix, scheme),
+    ) {
+        (Some(owner_location), Some(location)) => owner_location == location,
+        _ => true,
+    }
+}
+
+fn prefix_location<'a>(prefix: &'a str, scheme: &str) -> Option<&'a str> {
+    prefix.strip_prefix(scheme)?.strip_prefix('$')
 }
 
 /// Preserve Managed references and adopt Packed/Dedicated objects in place.
@@ -410,6 +485,8 @@ mod tests {
     use lance_core::datatypes::BlobKind;
     use lance_core::{Error, utils::tempfile::TempStrDir};
     use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::storage_options::StorageOptionsAccessor;
+    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_table::feature_flags::FLAG_MANAGED_BLOBS;
     use lance_table::format::BasePath;
     use object_store::path::Path;
@@ -546,5 +623,111 @@ mod tests {
         assert!(blob.read_range(0..0).await.unwrap().is_empty());
         assert_eq!(recording.head_requests.load(Ordering::Relaxed), 0);
         assert!(recording.requested_ranges().is_empty());
+    }
+
+    async fn opened_store(uri: &str, options: &[(&str, &str)]) -> Arc<ObjectStore> {
+        let options = options
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        ObjectStore::from_uri_and_params(Arc::new(ObjectStoreRegistry::default()), uri, &params)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn local_scheme_alias_names_one_store() {
+        let registry = ObjectStoreRegistry::default();
+        let owner = opened_store("file:///tmp/orders", &[]).await;
+        let base = opened_store("file-object-store:///tmp/orders/_blobs", &[]).await;
+        assert!(super::may_be_same_store(
+            &registry,
+            &owner,
+            base.scheme(),
+            &base.store_prefix
+        ));
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn distinct_buckets_are_different_stores() {
+        let registry = ObjectStoreRegistry::default();
+        let options = [
+            ("region", "us-east-1"),
+            ("aws_access_key_id", "test"),
+            ("aws_secret_access_key", "test"),
+        ];
+        let owner = opened_store("s3://bucket-a/orders", &options).await;
+        let same_bucket = opened_store("s3://bucket-a/orders/_blobs", &options).await;
+        let other_bucket = opened_store("s3://bucket-b/orders/_blobs", &options).await;
+        let dynamo_alias = opened_store("s3+ddb://bucket-a/orders/_blobs", &options).await;
+        assert!(super::may_be_same_store(
+            &registry,
+            &owner,
+            same_bucket.scheme(),
+            &same_bucket.store_prefix
+        ));
+        assert!(!super::may_be_same_store(
+            &registry,
+            &owner,
+            other_bucket.scheme(),
+            &other_bucket.store_prefix
+        ));
+        assert!(super::may_be_same_store(
+            &registry,
+            &owner,
+            dynamo_alias.scheme(),
+            &dynamo_alias.store_prefix
+        ));
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn azure_account_comes_from_storage_options() {
+        let registry = ObjectStoreRegistry::default();
+        let owner = opened_store("az://container/orders", &[("account_name", "account-a")]).await;
+        let same_account = opened_store(
+            "az://container/orders/_blobs",
+            &[("account_name", "account-a")],
+        )
+        .await;
+        let other_account = opened_store(
+            "az://container/orders/_blobs",
+            &[("account_name", "account-b")],
+        )
+        .await;
+        let scheme_alias = opened_store(
+            "abfss://container/orders/_blobs",
+            &[("account_name", "account-a")],
+        )
+        .await;
+        assert_eq!(owner.store_prefix, "az$container@account-a");
+        assert_eq!(same_account.store_prefix, "az$container@account-a");
+        assert_eq!(other_account.store_prefix, "az$container@account-b");
+        assert!(super::may_be_same_store(
+            &registry,
+            &owner,
+            same_account.scheme(),
+            &same_account.store_prefix
+        ));
+        assert!(!super::may_be_same_store(
+            &registry,
+            &owner,
+            other_account.scheme(),
+            &other_account.store_prefix
+        ));
+        assert!(super::may_be_same_store(
+            &registry,
+            &owner,
+            scheme_alias.scheme(),
+            &scheme_alias.store_prefix
+        ));
     }
 }
