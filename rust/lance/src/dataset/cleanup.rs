@@ -300,7 +300,8 @@ fn is_managed_blob_directory(directory: &str) -> bool {
     matches!(directory, "_blobs" | "data")
 }
 
-fn in_blob_deletion_scope(owner_base: &Path, path: &Path) -> bool {
+/// `data/` and `_blobs/` are the directories cleanup deletes `.blob` files from.
+pub(in crate::dataset) fn in_blob_deletion_scope(owner_base: &Path, path: &Path) -> bool {
     let Some(mut relative) = path.prefix_match(owner_base) else {
         return false;
     };
@@ -336,7 +337,7 @@ fn may_be_same_location(
     let Ok(path) = provider.extract_path(&url) else {
         return true;
     };
-    // The prefix includes the owner's storage options. An Azure account may be recorded there.
+    // The prefix includes the base's storage options, including the Azure account.
     let same_store = match registry.calculate_object_store_prefix(uri, storage_options) {
         Ok(prefix) => super::blob::may_be_same_store(registry, store, url.scheme(), &prefix),
         Err(_) => true,
@@ -1951,11 +1952,13 @@ impl<'a> CleanupTask<'a> {
             let by_lineage = base.is_dataset_root
                 && normalize_branch(base.name.as_deref()) == branch
                 && own.base_paths.get(&base.id) != Some(base);
+            // `base_<id>.account_name` overrides the dataset account.
+            let base_params = self.dataset.store_params_for_base(Some(base));
             by_lineage
                 || may_be_same_location(
                     &registry,
                     &self.dataset.object_store,
-                    self.dataset.initial_storage_options(),
+                    base_params.storage_options(),
                     &base.path,
                     &self.dataset.base,
                 )
@@ -4880,6 +4883,199 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::data_base(false)]
+    #[case::dataset_root(true)]
+    #[tokio::test]
+    async fn cleanup_keeps_nested_root_added_on_child(#[case] is_dataset_root: bool) {
+        let uri = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            uri.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = Arc::new(
+            parent
+                .create_branch("child", parent.version_id(), None)
+                .await
+                .unwrap(),
+        );
+        let blob_dir = format!("{}/_blobs", uri.as_str());
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(format!("{blob_dir}/receipt.blob"), b"receipt").unwrap();
+        let child = child
+            .add_bases(
+                vec![BasePath::new(
+                    7,
+                    blob_dir,
+                    Some("main".to_string()),
+                    is_dataset_root,
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+        let mut values = BlobDescriptorArrayBuilder::new("blob");
+        values
+            .push(BlobDescriptor::Managed {
+                base_id: Some(7),
+                uri: "receipt.blob".to_string(),
+                offset: 0,
+                size: 7,
+            })
+            .unwrap();
+        let (field, column) = values.finish().unwrap().into_parts();
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let child = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                child.uri(),
+                Some(WriteParams {
+                    mode: WriteMode::Overwrite,
+                    data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let blob = child.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blob[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"receipt"
+        );
+        parent.update_config([("revision", "2")]).await.unwrap();
+        parent.update_config([("revision", "3")]).await.unwrap();
+        clean_every_old_version(uri.as_str()).await;
+        let receipt = parent.base.clone().join("_blobs").join("receipt.blob");
+        assert!(
+            parent.object_store.exists(&receipt).await.unwrap(),
+            "parent cleanup deleted a live blob registered only on its child"
+        );
+        let child = Arc::new(
+            Dataset::open(uri.as_str())
+                .await
+                .unwrap()
+                .checkout_branch("child")
+                .await
+                .unwrap(),
+        );
+        let blob = child.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blob[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"receipt"
+        );
+
+        let mut parent = Dataset::open(uri.as_str()).await.unwrap();
+        parent.delete_branch("child").await.unwrap();
+        clean_every_old_version(uri.as_str()).await;
+        assert!(
+            !parent.object_store.exists(&receipt).await.unwrap(),
+            "cleanup retained {receipt}"
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn cleanup_reclaims_a_parent_blob_named_only_by_a_foreign_root() {
+        let uri = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            uri.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = Arc::new(
+            parent
+                .create_branch("child", parent.version_id(), None)
+                .await
+                .unwrap(),
+        );
+        let blob_dir = format!("{}/_blobs", uri.as_str());
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(format!("{blob_dir}/receipt.blob"), b"receipt").unwrap();
+        let child = child
+            .add_bases(
+                vec![BasePath::new(
+                    7,
+                    "s3://bucket-b/orders".to_string(),
+                    Some("main".to_string()),
+                    true,
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+        let mut values = BlobDescriptorArrayBuilder::new("blob");
+        values
+            .push(BlobDescriptor::Managed {
+                base_id: Some(7),
+                uri: "_blobs/receipt.blob".to_string(),
+                offset: 0,
+                size: 7,
+            })
+            .unwrap();
+        let (field, column) = values.finish().unwrap().into_parts();
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            child.uri(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        parent.update_config([("revision", "2")]).await.unwrap();
+        parent.update_config([("revision", "3")]).await.unwrap();
+
+        let parent = DatasetBuilder::from_uri(uri.as_str())
+            .with_storage_options(HashMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("aws_access_key_id".to_string(), "test".to_string()),
+                ("aws_secret_access_key".to_string(), "test".to_string()),
+            ]))
+            .load()
+            .await
+            .unwrap();
+        let child = parent.checkout_branch("child").await.unwrap();
+        let foreign = child.object_store(Some(7)).await.unwrap();
+        assert_eq!(foreign.store_prefix, "s3$bucket-b");
+        assert!(!crate::dataset::blob::may_be_same_store(
+            child.session.store_registry().as_ref(),
+            &parent.object_store,
+            foreign.scheme(),
+            &foreign.store_prefix,
+        ));
+
+        let receipt = parent.base.clone().join("_blobs").join("receipt.blob");
+        assert!(parent.object_store.exists(&receipt).await.unwrap());
+        cleanup_old_versions(
+            &parent,
+            CleanupPolicy {
+                before_version: Some(parent.version_id()),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !parent.object_store.exists(&receipt).await.unwrap(),
+            "parent cleanup kept {receipt} for a root on {prefix}",
+            prefix = foreign.store_prefix
+        );
+    }
+
     #[tokio::test]
     async fn root_cleanup_drops_its_fork_once_a_grandchild_reads_only_its_parent() {
         let uri = TempStrDir::default();
@@ -5104,6 +5300,72 @@ mod tests {
             "s3://bucket-b/orders",
             &base,
         ));
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn same_path_on_another_azure_account_is_not_a_parent_base() {
+        let dir = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        async fn parent_base(dataset: &Dataset, base_account: &str) -> (String, bool) {
+            let params = ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(HashMap::from([
+                        ("account_name".to_string(), "account-a".to_string()),
+                        ("account_key".to_string(), "dGVzdA==".to_string()),
+                        ("base_7.account_name".to_string(), base_account.to_string()),
+                    ])),
+                )),
+                ..Default::default()
+            };
+            let registry = dataset.session.store_registry();
+            let (owner, owner_base) = ObjectStore::from_uri_and_params(
+                registry,
+                "az://container/orders",
+                &params.scoped_to_base(None),
+            )
+            .await
+            .unwrap();
+            let mut dataset = dataset.with_object_store(owner, Some(params));
+            dataset.base = owner_base;
+            let base = BasePath::new(
+                7,
+                "az://container/orders".to_string(),
+                Some("other".to_string()),
+                false,
+            );
+            Arc::make_mut(&mut dataset.manifest)
+                .base_paths
+                .insert(7, base);
+            let opened = dataset.object_store(Some(7)).await.unwrap();
+            let mut manifest = dataset.manifest.as_ref().clone();
+            manifest.branch = Some("branch".to_string());
+            let task = CleanupTask::new(
+                &dataset.cleanup(CleanupPolicy::default()),
+                CleanupAction::Execute,
+            )
+            .unwrap();
+            (
+                opened.store_prefix.clone(),
+                task.parent_base_ids(&manifest).contains(&Some(7)),
+            )
+        }
+
+        let (opened, is_parent) = parent_base(&dataset, "account-b").await;
+        assert_eq!(opened, "az$container@account-b");
+        assert!(!is_parent);
+
+        let (opened, is_parent) = parent_base(&dataset, "account-a").await;
+        assert_eq!(opened, "az$container@account-a");
+        assert!(is_parent);
     }
 
     #[cfg(unix)]
@@ -8593,8 +8855,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            // A tagged entry, and like every tagged entry a writer makes it
-            // leaves its base id unset.
+            // Writers leave base_id unset on tagged index entries.
             assert_ne!(branch_entry.index_version, 0);
             assert_eq!(branch_entry.base_id, None);
             branch

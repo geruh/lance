@@ -212,12 +212,21 @@ pub(super) async fn managed_references(
     Ok(references)
 }
 
+/// Where a managed blob base sits relative to the dataset being cleaned.
+#[derive(Clone)]
+enum BaseResolution {
+    Resolved(Path),
+    /// Opened store is not the dataset being cleaned.
+    Foreign,
+    /// The base did not open.
+    Unresolved,
+}
+
 /// Blob paths this cleanup owner may still reference.
 ///
-/// Bases that may reference this dataset's files are joined onto the
-/// owner's root, so a differently spelled parent URI still protects
-/// those files. Any other registered base is joined onto its own root
-/// only when its store may be the owner's.
+/// Keep a resolved path in `data/` or `_blobs/`. A base in `owner_base_ids`
+/// with no such path joins onto the owner's root. An opened foreign store
+/// contributes no path.
 pub(in crate::dataset) async fn managed_paths(
     dataset: &Dataset,
     owner: &Dataset,
@@ -226,61 +235,93 @@ pub(in crate::dataset) async fn managed_paths(
 ) -> Result<HashSet<Path>> {
     let references = managed_references(dataset, scan, false).await?;
     let mut paths = HashSet::with_capacity(references.len());
-    let mut root_by_base: HashMap<u32, Option<Path>> = HashMap::new();
+    let mut resolution_by_base = HashMap::new();
+    let primary = primary_root(dataset, owner);
     for (base_id, uri) in references {
-        let path = if owner_base_ids.contains(&base_id) {
-            join_base_and_relative_path(&owner.base, &uri)?
-        } else if let Some(base_id) = base_id {
-            let root = if let Some(root) = root_by_base.get(&base_id) {
-                root.clone()
-            } else {
-                let root = nested_blob_root(dataset, owner, base_id).await?;
-                root_by_base.insert(base_id, root.clone());
-                root
-            };
-            let Some(root) = root else {
-                continue;
-            };
-            join_base_and_relative_path(&root, &uri)?
-        } else {
-            continue;
+        let root = match base_id {
+            Some(id) => {
+                registered_root(dataset, owner, id, owner_base_ids, &mut resolution_by_base).await?
+            }
+            None => primary.clone(),
         };
-        paths.insert(path);
+        match &root {
+            BaseResolution::Resolved(root) => {
+                let path = join_base_and_relative_path(root, &uri)?;
+                if crate::dataset::cleanup::in_blob_deletion_scope(&owner.base, &path) {
+                    paths.insert(path);
+                    continue;
+                }
+            }
+            BaseResolution::Foreign => continue,
+            BaseResolution::Unresolved => {}
+        }
+        if owner_base_ids.contains(&base_id) {
+            paths.insert(join_base_and_relative_path(&owner.base, &uri)?);
+        }
     }
     Ok(paths)
 }
 
-async fn nested_blob_root(
+fn primary_root(dataset: &Dataset, owner: &Dataset) -> BaseResolution {
+    let registry = dataset.session.store_registry();
+    if may_be_same_store(
+        registry.as_ref(),
+        &owner.object_store,
+        dataset.object_store.scheme(),
+        &dataset.object_store.store_prefix,
+    ) {
+        BaseResolution::Resolved(dataset.base.clone())
+    } else {
+        BaseResolution::Foreign
+    }
+}
+
+async fn registered_root(
     dataset: &Dataset,
     owner: &Dataset,
     base_id: u32,
-) -> Result<Option<Path>> {
-    let registry = dataset.session.store_registry();
-    let base_store = dataset.object_store(Some(base_id)).await?;
-    if !may_be_same_store(
-        registry.as_ref(),
-        &owner.object_store,
-        base_store.scheme(),
-        &base_store.store_prefix,
-    ) {
-        return Ok(None);
+    owner_base_ids: &BTreeSet<Option<u32>>,
+    resolution_by_base: &mut HashMap<u32, BaseResolution>,
+) -> Result<BaseResolution> {
+    if let Some(root) = resolution_by_base.get(&base_id) {
+        return Ok(root.clone());
     }
-    let root = dataset
-        .manifest
-        .base_paths
-        .get(&base_id)
-        .ok_or_else(|| {
-            Error::invalid_input(format!("Managed blob references unknown base_id {base_id}"))
-        })?
-        .extract_path(registry)?;
-    Ok(Some(root))
+    let registry = dataset.session.store_registry();
+    let root = match dataset.object_store(Some(base_id)).await {
+        Ok(base_store) => {
+            if !may_be_same_store(
+                registry.as_ref(),
+                &owner.object_store,
+                base_store.scheme(),
+                &base_store.store_prefix,
+            ) {
+                BaseResolution::Foreign
+            } else {
+                let root = dataset
+                    .manifest
+                    .base_paths
+                    .get(&base_id)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Managed blob references unknown base_id {base_id}"
+                        ))
+                    })?
+                    .extract_path(registry)?;
+                BaseResolution::Resolved(root)
+            }
+        }
+        // An inherited base may be unavailable here. Fall back to lineage.
+        Err(_) if owner_base_ids.contains(&Some(base_id)) => BaseResolution::Unresolved,
+        Err(error) => return Err(error),
+    };
+    resolution_by_base.insert(base_id, root.clone());
+    Ok(root)
 }
 
 /// Whether `owner` may be the store named by `scheme` and `prefix`.
 ///
-/// `prefix` comes from the opened store, so it includes options that are not
-/// in the URI, such as an Azure account. An unknown provider or a prefix that
-/// is not `scheme$location` matches, and cleanup keeps the object.
+/// `prefix` comes from the opened store and includes an Azure account.
+/// An unknown provider or a prefix that is not `scheme$location` matches.
 pub(in crate::dataset) fn may_be_same_store(
     registry: &ObjectStoreRegistry,
     owner: &ObjectStore,
