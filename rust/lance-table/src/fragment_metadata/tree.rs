@@ -8,7 +8,10 @@
 //! Manifest publishes the prepared root after every dependency has been written.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(any(test, feature = "test-util"))]
+use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -20,24 +23,30 @@ use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 
 use crate::format::Fragment;
 use crate::format::pb;
+use crate::fragment_metadata::TreeContext;
 use crate::fragment_metadata::commit::{self, TouchedFragments, ValidatedCommit};
-use crate::fragment_metadata::node::{
-    self, FragmentTreeConfig, InternalNode, apply_aggregate_delta, sum_aggregate_deltas,
+use crate::fragment_metadata::content::{self, apply_aggregate_delta, sum_aggregate_deltas};
+use crate::fragment_metadata::node::{self, FragmentTreeConfig, InternalNode};
+use crate::fragment_metadata::store::{
+    LeafLocation, NodeStore, PendingLeafRead, SingleFlightLeafCache, StoredFragments,
 };
-use crate::fragment_metadata::store::{NodeStore, PendingLeafRead};
-use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::ScanScheduler;
+use lance_io::object_store::{ObjectStore, WrappingObjectStore};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 
+mod audit;
+mod bulk;
 mod flush;
 mod publication;
 mod rewrite;
+mod summary;
+mod transaction;
 pub(super) use flush::MAX_CONCURRENT_LEAF_DRAINS;
 pub use publication::SnapshotPolicy;
+pub use summary::LeafSummaries;
+pub use transaction::{CommitMode, InventoryRetention, TreeCommit};
 
 /// Accumulated write work over one commit (for stats / benchmark accounting).
 #[derive(Debug, Default, Clone, Copy)]
@@ -146,6 +155,7 @@ pub struct CommitStats {
 }
 
 /// Tree size and occupancy statistics.
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Default, Clone)]
 pub struct ShapeReport {
     /// Root-to-leaf edge count; see [`FragmentTree::height`].
@@ -197,10 +207,11 @@ impl FragmentWalk {
     }
 }
 
-/// Bounds a lazy scan's metadata readahead to eight decoded leaves.
-const MAX_LEAF_READAHEAD: usize = 8;
+/// Bounds the node reads a set read keeps in flight and the window a ramped
+/// scan grows to, and with them the decoded leaves either holds at once.
+const MAX_READS_IN_FLIGHT: usize = 8;
 
-/// How many leaf reads a fragment stream keeps in flight.
+/// How many leaf reads a fragment scan keeps in flight.
 #[derive(Debug, Clone, Copy)]
 struct LeafReadahead {
     depth: usize,
@@ -208,9 +219,11 @@ struct LeafReadahead {
 }
 
 impl LeafReadahead {
-    fn fixed(depth: usize) -> Self {
-        let depth = depth.max(1);
-        Self { depth, max: depth }
+    fn fixed(depth: NonZeroUsize) -> Self {
+        Self {
+            depth: depth.get(),
+            max: depth.get(),
+        }
     }
 
     fn ramp(max: usize) -> Self {
@@ -225,10 +238,10 @@ impl LeafReadahead {
 /// A spawned leaf read. Dropping it aborts the task, so a stream dropped
 /// early neither decodes nor admits leaves nobody will consume. A GET the
 /// task already handed to the scan scheduler still completes.
-struct LeafRead(tokio::task::JoinHandle<Result<Vec<Fragment>>>);
+struct SpawnedRead<T>(tokio::task::JoinHandle<Result<T>>);
 
-impl Future for LeafRead {
-    type Output = Result<Vec<Fragment>>;
+impl<T> Future for SpawnedRead<T> {
+    type Output = Result<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.0).poll(cx).map(|joined| match joined {
@@ -241,7 +254,7 @@ impl Future for LeafRead {
     }
 }
 
-impl Drop for LeafRead {
+impl<T> Drop for SpawnedRead<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -263,26 +276,18 @@ struct LeafWindow {
     store: NodeStore,
     leaves: BoxStream<'static, Result<BufferedChild>>,
     routing: Routing,
-    reads: FuturesOrdered<LeafRead>,
+    reads: FuturesOrdered<SpawnedRead<Vec<Fragment>>>,
     readahead: LeafReadahead,
 }
 
 impl LeafWindow {
-    fn spawn_read(&self, (child, actions, end): BufferedChild) -> LeafRead {
+    fn spawn_read(&self, (child, actions, end): BufferedChild) -> SpawnedRead<Vec<Fragment>> {
         let store = self.store.clone();
         // Decoding is CPU-bound. A task per leaf lets the leaves in flight
         // decode in parallel instead of on the task polling this stream.
-        LeafRead(tokio::spawn(async move {
+        SpawnedRead(tokio::spawn(async move {
             let fragments = store.read_leaf_in_range(&child, end).await?;
-            if actions.is_empty() {
-                return Ok(fragments);
-            }
-            let mut fragments: BTreeMap<u64, Fragment> = fragments
-                .into_iter()
-                .map(|fragment| (fragment.id, fragment))
-                .collect();
-            store.apply_verified(&mut fragments, actions)?;
-            Ok(fragments.into_values().collect())
+            store.replay(fragments, actions)
         }))
     }
 }
@@ -333,9 +338,45 @@ pub enum OffsetResolution {
     BeyondEnd,
 }
 
-/// A writer session over a fragment metadata tree. Holds the root (child
-/// references, ε-buffer, and aggregates). Interior and leaf nodes are read on
-/// demand. A scan may prefetch several leaves.
+/// One leaf's records, in id order, as this tree's version sees them.
+#[derive(Debug, PartialEq)]
+pub enum LeafFragments {
+    /// No buffered action routes to the leaf, so the records are exactly the
+    /// checked object at `location`. Their ids and file paths are the same in
+    /// every version naming it. Inherited base ids follow the naming reference,
+    /// as [`LeafLocation`] explains.
+    Stored {
+        location: LeafLocation,
+        fragments: StoredFragments,
+    },
+    /// Records with this version's buffered actions applied, which no stored
+    /// object holds. A root without children yields its whole table this way.
+    Replayed(Vec<Fragment>),
+}
+
+/// One leaf of a [`FragmentTree::leaf_stream`] walk. `stored_at` is the
+/// location of a leaf no buffered action routes to.
+async fn read_leaf_fragments(
+    store: NodeStore,
+    leaves: SingleFlightLeafCache,
+    (child, actions, end): BufferedChild,
+    stored_at: Option<LeafLocation>,
+) -> Result<LeafFragments> {
+    let read = store.read_leaf_single_flight(&leaves, &child, end).await?;
+    if let Some(location) = stored_at {
+        return Ok(LeafFragments::Stored {
+            location,
+            fragments: StoredFragments(read),
+        });
+    }
+    Ok(LeafFragments::Replayed(
+        store.replay(read.into_vec(), actions)?,
+    ))
+}
+
+/// An immutable fragment metadata snapshot. Holds the root, buffered changes
+/// and aggregates. Interior and leaf nodes are read on demand. Begin an
+/// isolated [`TreeCommit`] to prepare changes without modifying this snapshot.
 #[derive(Clone)]
 pub struct FragmentTree {
     store: NodeStore,
@@ -352,66 +393,152 @@ pub struct FragmentTree {
     total_fragments: u64,
     total_rows: u64,
     /// The next fragment id an append allocates; see `next_fragment_id`.
+    /// Reads end the root's last child here, because no stored record or
+    /// buffered action may name an id that is not allocated yet.
     next_fragment_id: u64,
     visible_rows: u64,
-    /// Transient selection of ordered bulk materialization for this commit.
-    force_flush: bool,
-    /// Exact descriptor this writer opened/prepared; derived, never persisted.
-    snapshot: Option<Box<pb::FragmentTree>>,
+    /// Exact descriptor this snapshot opened or prepared.
+    descriptor: Arc<pb::FragmentTree>,
+    /// Complete records owned by this exact snapshot, when explicitly retained.
+    resident: Option<Arc<Vec<Fragment>>>,
 }
 
 impl FragmentTree {
     /// Bind an immutable snapshot to another handle for the same object namespace.
     pub fn with_object_store(mut self, store: Arc<ObjectStore>) -> Self {
-        self.store.rebind(store);
+        self.store.rebind(store, &[]);
         self
     }
 
-    pub fn set_foreign_bases(&mut self, foreign_bases: HashMap<u32, (Arc<ObjectStore>, Path)>) {
-        self.store.set_foreign_bases(foreign_bases);
+    /// Bind the already-wrapped primary store and apply the same wrappers to
+    /// inherited stores. Aliased bases share one wrapped store. Checked caches
+    /// remain shared because these wrappers preserve the object namespace.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_io::object_store::{ObjectStore, WrappingObjectStore};
+    /// # use lance_table::fragment_metadata::FragmentTree;
+    /// # fn wrapped(tree: FragmentTree, primary: Arc<ObjectStore>,
+    /// #            wrappers: &[Arc<dyn WrappingObjectStore>]) -> FragmentTree {
+    /// tree.with_object_store_wrappers(primary, wrappers)
+    /// # }
+    /// ```
+    pub fn with_object_store_wrappers(
+        mut self,
+        primary: Arc<ObjectStore>,
+        wrappers: &[Arc<dyn WrappingObjectStore>],
+    ) -> Self {
+        self.store.rebind(primary, wrappers);
+        self
     }
 
-    /// Reuse checked leaves and interiors through `leaves`, which every tree a
-    /// session opens can share. Entries are keyed by node location and parent
-    /// reference, so reads return the same fragments with or without the cache.
-    /// Walks that rewrite an interior decode their own copy, while read-only
-    /// walks, full materialization for a commit included, share checked ones.
-    pub fn set_leaf_cache(&mut self, leaves: LanceCache) {
-        self.store.set_leaf_cache(leaves);
+    /// Borrow the complete inventory, if this snapshot explicitly retained it.
+    ///
+    /// ```
+    /// # use lance_table::fragment_metadata::FragmentTree;
+    /// # fn example(tree: &FragmentTree) {
+    /// if let Some(fragments) = tree.resident_fragments() {
+    ///     assert_eq!(fragments.len() as u64, tree.count_fragments());
+    /// }
+    /// # }
+    /// ```
+    pub fn resident_fragments(&self) -> Option<&Arc<Vec<Fragment>>> {
+        self.resident.as_ref()
+    }
+
+    /// The descriptor a Version Manifest publishes for this snapshot.
+    ///
+    /// ```
+    /// # use lance_table::fragment_metadata::FragmentTree;
+    /// # fn example(tree: &FragmentTree) {
+    /// assert!(tree.descriptor().root.is_some());
+    /// # }
+    /// ```
+    pub fn descriptor(&self) -> &Arc<pb::FragmentTree> {
+        &self.descriptor
+    }
+
+    /// Retain this snapshot's complete inventory for eager APIs. Ordinary walks
+    /// and materialization do not change residency. The load keeps up to the
+    /// object store's I/O parallelism of leaf reads in flight.
+    ///
+    /// ```
+    /// # use lance_table::fragment_metadata::FragmentTree;
+    /// # async fn example(tree: FragmentTree) -> lance_core::Result<()> {
+    /// let eager = tree.hydrate().await?;
+    /// assert!(eager.resident_fragments().is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn hydrate(mut self) -> Result<Self> {
+        if self.resident.is_none() {
+            // The store clamps its I/O parallelism to at least one, so the
+            // fallback only satisfies the type.
+            let readahead = NonZeroUsize::new(self.store.object_store.io_parallelism())
+                .unwrap_or(NonZeroUsize::MIN);
+            let fragments = Arc::new(self.clone())
+                .scan_with_readahead(0, readahead)
+                .try_collect()
+                .await?;
+            self.resident = Some(Arc::new(fragments));
+        }
+        Ok(self)
+    }
+
+    /// Bind a successfully published snapshot to its manifest version and storage.
+    /// Call only after the Version Manifest has confirmed this exact descriptor.
+    /// Writer budgets come from that manifest, including any config update.
+    ///
+    /// ```
+    /// # use lance_table::fragment_metadata::{FragmentTree, FragmentTreeConfig, TreeContext};
+    /// # fn confirmed(tree: FragmentTree, version: u64, config: FragmentTreeConfig,
+    /// #              context: TreeContext) -> lance_core::Result<FragmentTree> {
+    /// tree.into_published(version, config, context)
+    /// # }
+    /// ```
+    pub fn into_published(
+        mut self,
+        version: u64,
+        config: FragmentTreeConfig,
+        context: TreeContext,
+    ) -> Result<Self> {
+        config.validate()?;
+        self.version = version;
+        self.config = config;
+        self.store = context.into_store(&self.config, self.store.next_action_sequence);
+        Ok(self)
+    }
+
+    /// Raise the next fragment id an append allocates to `next_fragment_id`.
+    /// A rebuild of an existing inventory keeps every id its manifest already
+    /// allocated, since index coverage may still name a removed fragment. A
+    /// lower value changes nothing.
+    ///
+    /// ```
+    /// # use lance_table::fragment_metadata::FragmentTree;
+    /// # fn example(rebuilt: FragmentTree) {
+    /// let rebuilt = rebuilt.with_allocation_frontier(10);
+    /// assert!(rebuilt.next_fragment_id() >= 10);
+    /// # }
+    /// ```
+    pub fn with_allocation_frontier(mut self, next_fragment_id: u64) -> Self {
+        self.next_fragment_id = self.next_fragment_id.max(next_fragment_id);
+        self
     }
 
     async fn build(
-        mut store: NodeStore,
+        store: NodeStore,
         config: FragmentTreeConfig,
         fragments: &[Fragment],
+        version: u64,
+        policy: SnapshotPolicy,
     ) -> Result<(Self, BootstrapStats)> {
         config.validate()?;
-        store.hard_capacity_bytes = config.hard_capacity_bytes;
         let mut io = 0u64;
         let mut layer: Vec<pb::FragmentTreeChild> = Vec::new();
-        let mut total_rows = 0u64;
-        let mut visible_rows = 0u64;
-        let mut next_fragment_id = 0u64;
+        let (next_fragment_id, total_rows, visible_rows) =
+            commit::validate_bootstrap(fragments, store.base())?;
         let num_fragments = fragments.len() as u64;
-        for f in fragments {
-            next_fragment_id = next_fragment_id.max(f.id.checked_add(1).ok_or_else(|| {
-                Error::invalid_input(format!("Fragment ID {} leaves no next ID", f.id))
-            })?);
-            commit::require_storable(f, store.base())?;
-            visible_rows = visible_rows
-                .checked_add(f.num_rows().unwrap_or(0) as u64)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!("Visible row count overflow at fragment {}", f.id))
-                })?;
-            total_rows = total_rows
-                .checked_add(f.physical_rows.unwrap_or(0) as u64)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "fragment metadata tree total_rows overflow while bootstrapping fragment id={}",
-                        f.id
-                    ))
-                })?;
-        }
         for w in store.write_initial_leaves(fragments, &config).await? {
             io += w.io_bytes;
             layer.push(w.child_ref);
@@ -419,41 +546,21 @@ impl FragmentTree {
         let num_leaves = layer.len() as u64;
         node::fence(&mut layer, 0);
 
-        // Byte pressure matters even below the configured fanout ceiling: a
-        // directory of long paths can overflow with very few children.
-        while node::internal_overflows(&layer, &[], &config) {
-            let previous_width = layer.len();
-            let mut next: Vec<pb::FragmentTreeChild> = Vec::new();
-            let groups = node::split_internal(
-                layer,
-                Vec::new(),
-                config.split_piece_bytes(),
-                config.max_children_per_node,
-            );
-            // Fewer pieces is not enough: split_internal folds only its last
-            // lone child, so a budget that fits one reference per piece still
-            // leaves single-child pieces, which the format rejects on read.
-            if groups.len() >= previous_width
-                || groups.iter().any(|(children, _)| children.len() < 2)
-            {
-                return Err(Error::invalid_input(format!(
-                    "node budget {} cannot group two child references; widen the directory budget",
-                    config.max_node_bytes
-                )));
-            }
-            for (group, buffer) in groups {
-                let w = store.write_internal(group, buffer).await?;
-                io += w.io_bytes;
-                next.push(w.child_ref);
-            }
-            layer = next;
-        }
+        let (layer, _, routing) = Self::lift_root(&store, &config, layer, Vec::new(), None).await?;
+        io += routing.io_bytes;
         let height = layer.iter().map(|c| c.height).max().unwrap_or(0) + 1;
+        let root = pb::FragmentTreeRoot {
+            children: layer.clone(),
+            buffer: Vec::new(),
+            next_action_sequence: 1,
+        };
+        let (descriptor, root_bytes) =
+            publication::checkpoint(&store, &config, root, policy).await?;
 
         let tree = Self {
             store,
             config,
-            version: 1,
+            version,
             children: layer,
             buffer: Vec::new(),
             buffer_index: OnceLock::new(),
@@ -464,13 +571,13 @@ impl FragmentTree {
 
             next_fragment_id,
             visible_rows,
-            force_flush: false,
-            snapshot: None,
+            descriptor: Arc::new(descriptor),
+            resident: None,
         };
         Ok((
             tree,
             BootstrapStats {
-                io_write_bytes: io,
+                io_write_bytes: io + root_bytes,
                 num_leaves,
                 height,
             },
@@ -483,7 +590,8 @@ impl FragmentTree {
         self.children.iter().map(|c| c.height).max().unwrap_or(0) + 1
     }
 
-    /// Version of the opened or prepared snapshot. The caller publishes it.
+    /// Authoritative manifest version this snapshot was opened from. Preparing
+    /// changes does not assign a publication version. The manifest owns that.
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -517,6 +625,7 @@ impl FragmentTree {
     }
 
     /// Number of actions currently buffered directly in the in-memory root.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn root_buffer_len(&self) -> usize {
         self.buffer.len()
     }
@@ -524,17 +633,19 @@ impl FragmentTree {
     /// Whether `bytes` more of buffered actions keep the root under its
     /// semantic budget, so a commit of that size can stay buffered instead
     /// of draining in the same commit.
-    pub fn can_buffer(&self, bytes: u64) -> bool {
+    fn can_buffer(&self, bytes: u64) -> bool {
         node::buffer_bytes(&self.buffer) + bytes < self.config.semantic_buffer_bytes
     }
 
     /// Number of direct child references currently held by the in-memory root.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn root_child_count(&self) -> usize {
         self.children.len()
     }
 
     /// Encoded leaf sizes when the root points directly to leaves. Returns an
     /// empty list when there is an intervening routing level.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn leaf_object_sizes(&self) -> Vec<u64> {
         self.children
             .iter()
@@ -551,10 +662,16 @@ impl FragmentTree {
     /// Resolve one fragment by loading only the root-to-leaf path: at most
     /// `height` reads on a compacted root.
     ///
-    /// Routing follows sibling `min_key` fences (see [`node::child_index_for`]),
-    /// and buffered actions from every node on the path are applied with the
+    /// Routing follows sibling lower-bound fences, and buffered actions from
+    /// every node on the path are applied with the
     /// same action_sequence ordering as [`Self::materialize`].
     pub async fn resolve_fragment(&self, frag_id: u64) -> Result<Option<Fragment>> {
+        if let Some(fragments) = &self.resident {
+            return Ok(fragments
+                .binary_search_by_key(&frag_id, |fragment| fragment.id)
+                .ok()
+                .map(|index| fragments[index].clone()));
+        }
         let index = self.buffer_index();
         let mut sequences = None;
         let mut actions: Vec<pb::FragmentTreeMutation> = index
@@ -563,7 +680,7 @@ impl FragmentTree {
             .collect();
         let mut children = Cow::Borrowed(self.children.as_slice());
         let mut fragment = None;
-        let mut end = node::ROOT_EXCLUSIVE_END;
+        let mut end = self.next_fragment_id;
 
         while !children.is_empty() {
             let index = node::child_index_for(&children, frag_id);
@@ -588,7 +705,7 @@ impl FragmentTree {
                     .node
                     .buffer
                     .iter()
-                    .filter(|tagged| node::action_key(tagged) == frag_id)
+                    .filter(|tagged| content::action_key(tagged) == frag_id)
                     .cloned(),
             );
             children = Cow::Owned(internal.node.children.clone());
@@ -602,59 +719,40 @@ impl FragmentTree {
         Ok(fragments.remove(&frag_id))
     }
 
-    /// Resolve the fragments a commit touches, sharing reads within each subtree.
-    pub async fn resolve_touched(&self, fragment_ids: &[u64]) -> Result<TouchedFragments> {
-        let ids: BTreeSet<u64> = fragment_ids.iter().copied().collect();
-        if ids.is_empty() {
-            return Ok(TouchedFragments::default());
-        }
-        let bitmap: Option<RoaringBitmap> = ids
-            .iter()
-            .map(|id| u32::try_from(*id).ok())
-            .collect::<Option<Vec<u32>>>()
-            .map(RoaringBitmap::from_iter);
-        let fragments = match bitmap {
-            Some(bitmap) => self
-                .resolve_fragments_concurrent(&bitmap, 8)
-                .await?
-                .into_iter()
-                .map(|fragment| (fragment.id, fragment))
-                .collect(),
-            None => {
-                let mut fragments = BTreeMap::new();
-                for id in &ids {
-                    if let Some(fragment) = self.resolve_fragment(*id).await? {
-                        fragments.insert(*id, fragment);
-                    }
-                }
-                fragments
-            }
-        };
-        Ok(TouchedFragments { ids, fragments })
-    }
-
-    /// Resolve a set of fragment ids while loading only the subtrees whose
-    /// routing range intersects the set.
+    /// Resolve the selected fragment ids in ascending order, omitting ids
+    /// the table does not hold. Only the subtrees whose routing range
+    /// intersects the set are read, each at most once. Routing prunes by
+    /// fences, since buffered inserts may extend a leaf's stored key range.
+    /// Up to eight reads of sibling interiors, and then of covering leaves,
+    /// run at once.
     ///
-    /// Prune by routing fences, since buffered inserts may extend a leaf's
-    /// stored key range. Each covering node or leaf is loaded at most once.
-    /// Node and leaf GETs run with concurrency 1; use
-    /// [`Self::resolve_fragments_concurrent`] when the caller can overlap them.
+    /// ```
+    /// # use lance_table::fragment_metadata::FragmentTree;
+    /// # use roaring::RoaringBitmap;
+    /// # async fn example(tree: &FragmentTree) -> lance_core::Result<()> {
+    /// let ids = RoaringBitmap::from_iter([2, 7, 90]);
+    /// for fragment in tree.resolve_fragments(&ids).await? {
+    ///     assert!(ids.contains(fragment.id as u32));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn resolve_fragments(&self, fragment_ids: &RoaringBitmap) -> Result<Vec<Fragment>> {
-        self.resolve_fragments_concurrent(fragment_ids, 1).await
-    }
-
-    /// Same as [`Self::resolve_fragments`], overlapping up to `concurrency`
-    /// GETs of sibling covering interiors, then of covering leaves.
-    pub async fn resolve_fragments_concurrent(
-        &self,
-        fragment_ids: &RoaringBitmap,
-        concurrency: usize,
-    ) -> Result<Vec<Fragment>> {
+        if let Some(fragments) = &self.resident {
+            return Ok(fragment_ids
+                .iter()
+                .filter_map(|id| {
+                    fragments
+                        .binary_search_by_key(&u64::from(id), |fragment| fragment.id)
+                        .ok()
+                        .map(|index| fragments[index].clone())
+                })
+                .collect());
+        }
         let actions: Vec<_> = self
             .buffer
             .iter()
-            .filter(|tagged| bitmap_contains(fragment_ids, node::action_key(tagged)))
+            .filter(|tagged| bitmap_contains(fragment_ids, content::action_key(tagged)))
             .cloned()
             .collect();
         if self.children.is_empty() {
@@ -666,9 +764,8 @@ impl FragmentTree {
         self.collect_covering_leaves(
             self.children.clone(),
             actions,
-            0..node::ROOT_EXCLUSIVE_END,
+            0..self.next_fragment_id,
             fragment_ids,
-            concurrency.max(1),
             &mut self.buffer_index().sequences(&self.buffer),
             &mut leaves,
         )
@@ -685,18 +782,10 @@ impl FragmentTree {
                         .read_leaf_shared(&child, end)
                         .await?
                         .select(|fragment| bitmap_contains(fragment_ids, fragment.id));
-                    if actions.is_empty() {
-                        return Result::Ok(selected);
-                    }
-                    let mut fragments: BTreeMap<u64, Fragment> = selected
-                        .into_iter()
-                        .map(|fragment| (fragment.id, fragment))
-                        .collect();
-                    store.apply_verified(&mut fragments, actions)?;
-                    Ok(fragments.into_values().collect())
+                    store.replay(selected, actions)
                 }
             })
-            .buffered(concurrency.max(1))
+            .buffered(MAX_READS_IN_FLIGHT)
             .try_concat()
             .await?;
         debug_assert!(
@@ -712,7 +801,8 @@ impl FragmentTree {
     ///
     /// Totals are exact by the writer invariant on known counts. Buffered
     /// actions above a child adjust its total and are applied when its leaf
-    /// is read, so the descent and a full stream agree.
+    /// is read, so the descent and a full stream agree. A resident snapshot
+    /// descends the tree too, because its inventory holds no subtree totals.
     pub async fn fragment_at_row_offset(&self, offset: u64) -> Result<OffsetResolution> {
         if offset >= self.visible_rows {
             return Ok(OffsetResolution::BeyondEnd);
@@ -720,7 +810,7 @@ impl FragmentTree {
         let mut remaining = offset;
         let mut children = self.children.clone();
         let mut actions: Vec<pb::FragmentTreeMutation> = self.buffer.clone();
-        let mut end = node::ROOT_EXCLUSIVE_END;
+        let mut end = self.next_fragment_id;
         let mut sequences = self.buffer_index().sequences(&self.buffer);
         loop {
             if children.is_empty() {
@@ -756,15 +846,9 @@ impl FragmentTree {
                 )));
             };
             if child.height == 0 {
-                let mut fragments: BTreeMap<u64, Fragment> = self
-                    .store
-                    .read_leaf_in_range(&child, child_end)
-                    .await?
-                    .into_iter()
-                    .map(|fragment| (fragment.id, fragment))
-                    .collect();
-                self.store.apply_verified(&mut fragments, bucket)?;
-                return Ok(walk_fragments(fragments.into_values(), remaining));
+                let stored = self.store.read_leaf_in_range(&child, child_end).await?;
+                let fragments = self.store.replay(stored, bucket)?;
+                return Ok(walk_fragments(fragments, remaining));
             }
             let internal = self.store.read_internal_in_range(&child, child_end).await?;
             sequences.admit(&child.path, &internal.buffer)?;
@@ -783,12 +867,23 @@ impl FragmentTree {
     /// repeated anywhere in the tree is rejected. The first failure in key
     /// order is the one returned, and dropping the call cancels its GETs.
     pub async fn materialize(&self) -> Result<Vec<Fragment>> {
+        if let Some(fragments) = &self.resident {
+            return Ok(fragments.as_ref().clone());
+        }
+        let (mut fragments, actions) = self.stored_and_routed().await?;
+        self.store.apply_verified(&mut fragments, actions)?;
+        Ok(fragments.into_values().collect())
+    }
+
+    /// Every leaf's stored records and every buffered action, not yet
+    /// replayed.
+    async fn stored_and_routed(
+        &self,
+    ) -> Result<(BTreeMap<u64, Fragment>, Vec<pb::FragmentTreeMutation>)> {
         let mut fragments: BTreeMap<u64, Fragment> = BTreeMap::new();
         if self.children.is_empty() {
             // Only a root keeps its whole table in buffered actions.
-            self.store
-                .apply_verified(&mut fragments, self.buffer.clone())?;
-            return Ok(fragments.into_values().collect());
+            return Ok((fragments, self.buffer.clone()));
         }
         // Beyond the decoded table, memory in flight is at most `width`
         // started leaves, each holding its fetched object or a cached leaf.
@@ -833,80 +928,93 @@ impl FragmentTree {
             );
             actions.extend(leaf.actions);
         }
-        self.store.apply_verified(&mut fragments, actions)?;
-        Ok(fragments.into_values().collect())
+        Ok((fragments, actions))
     }
 
-    /// Stream fragments in id order. This walk materializes one leaf at a
-    /// time. [`Self::fragment_stream_with_prefetch`] may keep several leaf
-    /// reads in flight.
-    pub fn iter_fragments(&self) -> impl Stream<Item = Result<Fragment>> + '_ {
-        futures::stream::try_unfold(self.start_walk_from(0), move |mut walk| async move {
-            let next = self.walk_next(&mut walk).await?;
-            Ok(next.map(|fragment| (fragment, walk)))
-        })
-    }
-
-    /// The same walk as [`Self::iter_fragments`], owning the tree so the
-    /// stream can outlive a borrow. It reads one leaf at a time, which suits
-    /// the cleanup and file listing walks that consume it.
-    pub fn fragment_stream(self: Arc<Self>) -> BoxStream<'static, Result<Fragment>> {
-        self.fragment_stream_with_prefetch(1)
-    }
-
-    /// Stream fragments in increasing ID order, starting at `fragment_id`
-    /// inclusively. Routing skips earlier subtrees; holes and removed IDs are
-    /// omitted. The stream remains pinned to this tree's version. This is the
-    /// source a lazy scanner consumes.
+    /// Stream this snapshot's fragments in ascending id order, leaf by leaf,
+    /// starting at `lower_bound` inclusively. Holes and removed ids are
+    /// omitted, and routing skips the subtrees that hold only smaller ids.
+    /// This is the source a lazy scanner consumes.
     ///
-    /// The first leaf is read alone. Each time the consumer takes a leaf, the
-    /// number of leaf reads kept in flight doubles, up to eight. A consumer
-    /// that stops inside the first leaf therefore reads only that leaf, and a
-    /// long walk overlaps its leaf reads. Dropping the stream aborts the leaf
-    /// decodes still in flight.
+    /// The scan starts with one leaf read in flight. Each time the consumer
+    /// takes a leaf, the number of leaf reads allowed in flight doubles, up to
+    /// eight. A consumer that stops inside the first leaf reads only that leaf,
+    /// and a long scan overlaps its leaf reads. A resident snapshot answers
+    /// from its retained inventory without storage IO, as point, set and
+    /// complete reads do.
+    ///
+    /// The stream owns the snapshot, so it can outlive the caller, and stays
+    /// pinned to the snapshot's version. Dropping it aborts the leaf decodes
+    /// still in flight.
     ///
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use lance_table::fragment_metadata::FragmentTree;
     /// # use futures::TryStreamExt;
     /// # async fn example(tree: Arc<FragmentTree>) -> lance_core::Result<()> {
-    /// let mut stream = tree.fragment_stream_from(100);
+    /// let mut stream = tree.scan(100);
     /// while let Some(fragment) = stream.try_next().await? {
     ///     assert!(fragment.id >= 100);
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn fragment_stream_from(
-        self: Arc<Self>,
-        fragment_id: u64,
-    ) -> BoxStream<'static, Result<Fragment>> {
-        self.windowed_fragments(fragment_id, LeafReadahead::ramp(MAX_LEAF_READAHEAD))
+    pub fn scan(self: Arc<Self>, lower_bound: u64) -> BoxStream<'static, Result<Fragment>> {
+        self.scan_from(lower_bound, LeafReadahead::ramp(MAX_READS_IN_FLIGHT))
     }
 
-    /// Stream in ID order with at most `prefetch` leaf reads in flight, including
-    /// across routing-node boundaries. Zero selects one read at a time.
-    pub fn fragment_stream_with_prefetch(
+    /// Stream as [`Self::scan`] does, with at most `readahead` leaf reads in
+    /// flight from the first leaf on and no doubling. A caller that polls many
+    /// scans at once can bound each to one read.
+    ///
+    /// ```no_run
+    /// # use std::num::NonZeroUsize;
+    /// # use std::sync::Arc;
+    /// # use lance_table::fragment_metadata::FragmentTree;
+    /// # use futures::TryStreamExt;
+    /// # async fn example(tree: Arc<FragmentTree>) -> lance_core::Result<()> {
+    /// let fragments: Vec<_> = tree
+    ///     .clone()
+    ///     .scan_with_readahead(0, NonZeroUsize::MIN)
+    ///     .try_collect()
+    ///     .await?;
+    /// assert_eq!(fragments.len() as u64, tree.count_fragments());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scan_with_readahead(
         self: Arc<Self>,
-        prefetch: usize,
+        lower_bound: u64,
+        readahead: NonZeroUsize,
     ) -> BoxStream<'static, Result<Fragment>> {
-        self.windowed_fragments(0, LeafReadahead::fixed(prefetch))
+        self.scan_from(lower_bound, LeafReadahead::fixed(readahead))
     }
 
-    fn windowed_fragments(
+    fn scan_from(
         self: Arc<Self>,
         lower_bound: u64,
         readahead: LeafReadahead,
     ) -> BoxStream<'static, Result<Fragment>> {
+        if let Some(fragments) = self.resident.clone() {
+            let first = fragments.partition_point(|fragment| fragment.id < lower_bound);
+            return futures::stream::iter(first..fragments.len())
+                .map(move |index| Ok(fragments[index].clone()))
+                .boxed();
+        }
         let walk = self.start_walk_from(lower_bound);
         if self.children.is_empty() {
             // A root without children holds its whole table in its buffer,
             // which starting the walk has already replayed.
-            return futures::stream::try_unfold((self, walk), |(tree, mut walk)| async move {
-                let next = tree.walk_next(&mut walk).await?;
-                Ok(next.map(|fragment| (fragment, (tree, walk))))
-            })
-            .boxed();
+            return match walk.pending_error {
+                Some(error) => futures::stream::once(std::future::ready(Err(error))).boxed(),
+                None => futures::stream::iter(
+                    walk.ready
+                        .into_iter()
+                        .filter(move |fragment| fragment.id >= lower_bound)
+                        .map(Ok),
+                )
+                .boxed(),
+            };
         }
         let store = self.store.clone();
         let leaves = futures::stream::try_unfold((self, walk), |(tree, mut walk)| async move {
@@ -935,23 +1043,110 @@ impl FragmentTree {
         .boxed()
     }
 
+    /// The walk of [`Self::scan`], one leaf at a time, so a caller that visits
+    /// many versions can tell a leaf it already saw by its location. A leaf
+    /// no buffered action routes to is read only when `read_stored` accepts
+    /// its location, so a leaf the caller already holds costs no GET. A leaf
+    /// with routed actions is always read and replayed. Leaves are read
+    /// through `leaves`, so concurrent walks of versions that share a leaf
+    /// read it once. Interiors are read through this tree's configured leaf
+    /// cache, see [`TreeContext::with_leaf_cache`]. A resident snapshot reads
+    /// its leaves too, because a leaf's identity needs the stored leaf.
+    ///
+    /// Each leaf is read in a spawned task, which dropping the stream aborts,
+    /// and the next leaf is routed only once the consumer takes this one.
+    ///
+    /// ```no_run
+    /// # use std::collections::BTreeSet;
+    /// # use std::sync::{Arc, Mutex};
+    /// # use lance_core::cache::LanceCache;
+    /// # use lance_table::fragment_metadata::{FragmentTree, LeafFragments};
+    /// # use lance_table::fragment_metadata::SingleFlightLeafCache;
+    /// # use futures::TryStreamExt;
+    /// # async fn example(versions: Vec<Arc<FragmentTree>>) -> lance_core::Result<()> {
+    /// let leaves = SingleFlightLeafCache::new(LanceCache::with_capacity(64 * 1024 * 1024));
+    /// let seen = Mutex::new(BTreeSet::new());
+    /// for tree in versions {
+    ///     let mut stream =
+    ///         tree.leaf_stream(&leaves, |location| !seen.lock().unwrap().contains(location));
+    ///     while let Some(leaf) = stream.try_next().await? {
+    ///         if let LeafFragments::Stored { location, .. } = leaf {
+    ///             seen.lock().unwrap().insert(location);
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn leaf_stream<'a>(
+        self: Arc<Self>,
+        leaves: &SingleFlightLeafCache,
+        read_stored: impl Fn(&LeafLocation) -> bool + Send + 'a,
+    ) -> BoxStream<'a, Result<LeafFragments>> {
+        let mut walk = self.start_walk_from(0);
+        if self.children.is_empty() {
+            let leaf = match walk.pending_error.take() {
+                Some(error) => Err(error),
+                None => Ok(LeafFragments::Replayed(walk.ready.into())),
+            };
+            return futures::stream::once(std::future::ready(leaf)).boxed();
+        }
+        let leaves = leaves.clone();
+        futures::stream::try_unfold(
+            (self, walk, read_stored),
+            move |(tree, mut walk, read_stored)| {
+                let leaves = leaves.clone();
+                async move {
+                    loop {
+                        let Some((child, actions, end)) = tree.walk_next_leaf(&mut walk).await?
+                        else {
+                            return Ok(None);
+                        };
+                        let stored_at = if actions.is_empty() {
+                            let location = LeafLocation(tree.store.child_location(&child)?);
+                            if !read_stored(&location) {
+                                continue;
+                            }
+                            Some(location)
+                        } else {
+                            None
+                        };
+                        // Decoding is CPU-bound, and a caller such as cleanup
+                        // polls many walks from one task, so each leaf decodes
+                        // on its own.
+                        let read = SpawnedRead(tokio::spawn(read_leaf_fragments(
+                            tree.store.clone(),
+                            leaves,
+                            (child, actions, end),
+                            stored_at,
+                        )));
+                        return Ok(Some((read.await?, (tree, walk, read_stored))));
+                    }
+                }
+            },
+        )
+        .boxed()
+    }
+
     /// Fragment ids that still have a buffered action somewhere in the tree,
     /// root included. Empty means every committed action has reached a leaf.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn buffered_action_keys(&self) -> Result<HashSet<u64>> {
-        let mut keys: HashSet<u64> = self.buffer.iter().map(node::action_key).collect();
+        let mut keys: HashSet<u64> = self.buffer.iter().map(content::action_key).collect();
         let mut pending = self.children.clone();
         while let Some(child) = pending.pop() {
             if child.height == 0 {
                 continue;
             }
             let internal = self.store.read_internal(&child).await?;
-            keys.extend(internal.buffer.iter().map(node::action_key));
+            keys.extend(internal.buffer.iter().map(content::action_key));
             pending.extend(internal.children);
         }
         Ok(keys)
     }
 
     /// Read node occupancy and encoded sizes. Leaf sizes come from child references.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn shape_report(&self) -> Result<ShapeReport> {
         let root = self.compacted_root();
         let mut report = ShapeReport {
@@ -982,71 +1177,7 @@ impl FragmentTree {
         Ok(report)
     }
 
-    /// The leaf-watermark invariant: every action still buffered anywhere in
-    /// the tree must be newer than the leaf watermark it routes to. A
-    /// violation would mean a leaf claims to hold a change it never applied.
-    /// Like every reader, it also rejects an action sequence that two of the
-    /// buffers it decodes share.
-    pub async fn verify_watermarks(&self) -> Result<()> {
-        // (action sequence number, routing key), gathered root first.
-        let mut pending: Vec<(u64, u64)> = self
-            .buffer
-            .iter()
-            .map(|tagged| (tagged.action_sequence, node::action_key(tagged)))
-            .collect();
-        let mut sequences = self.buffer_index().sequences(&self.buffer);
-        let mut stack: Vec<pb::FragmentTreeChild> = self.children.clone();
-        let mut leaves: Vec<pb::FragmentTreeChild> = Vec::new();
-        while let Some(child) = stack.pop() {
-            if child.height == 0 {
-                leaves.push(child);
-                continue;
-            }
-            let internal = self.store.read_internal(&child).await?;
-            sequences.admit(&child.path, &internal.buffer)?;
-            pending.extend(
-                internal
-                    .buffer
-                    .iter()
-                    .map(|tagged| (tagged.action_sequence, node::action_key(tagged))),
-            );
-            stack.extend(internal.children);
-        }
-        leaves.sort_by_key(|leaf| leaf.min_key);
-        for (action_sequence, key) in pending {
-            if leaves.is_empty() {
-                continue;
-            }
-            let leaf = &leaves[node::child_index_for(&leaves, key)];
-            if action_sequence <= leaf.materialized_through_action_sequence {
-                return Err(Error::invalid_input(format!(
-                    "buffered action action_sequence={action_sequence} for fragment {key} is at or below its \
-                     leaf's watermark {} (leaf {}): the leaf claims a change it cannot hold",
-                    leaf.materialized_through_action_sequence, leaf.path
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Read every node and leaf reachable from this root, proving the
-    /// published tree references no missing object. Returns the object count.
-    pub async fn verify_reachable(&self) -> Result<u64> {
-        let mut pending = self.children.clone();
-        let mut objects = 0u64;
-        while let Some(child) = pending.pop() {
-            objects += 1;
-            if child.height == 0 {
-                // A cached leaf would hide an object missing from storage.
-                self.store.read_leaf_uncached(&child).await?;
-            } else {
-                pending.extend(self.store.read_internal(&child).await?.children);
-            }
-        }
-        Ok(objects)
-    }
-
-    /// Advance the version, aggregates and ID allocator, and tag each action
+    /// Advance aggregates and the ID allocator, and tag each action
     /// with its sequence number and deltas. The caller buffers the actions.
     fn stage_commit(
         &mut self,
@@ -1088,11 +1219,7 @@ impl FragmentTree {
         let visible_rows =
             apply_aggregate_delta(self.visible_rows, visible_rows_delta, "visible_rows")?;
 
-        for action in actions {
-            if let Some(pb::fragment_action::Action::UpsertFragment(fragment)) = &action.action {
-                self.next_fragment_id = self.next_fragment_id.max(fragment.id + 1);
-            }
-        }
+        let next_fragment_id = commit.allocation_frontier(self.next_fragment_id)?;
         let first_action_sequence = self.next_action_sequence;
         let tagged = commit
             .fragment_actions
@@ -1108,22 +1235,10 @@ impl FragmentTree {
             })
             .collect();
         self.next_action_sequence = next_action_sequence;
-        self.store.next_action_sequence = next_action_sequence;
         self.total_fragments = total_fragments;
         self.total_rows = total_rows;
         self.visible_rows = visible_rows;
-        self.version = self.version.checked_add(1).ok_or_else(|| {
-            Error::invalid_input("fragment metadata tree version counter exhausted")
-        })?;
-        if let Some(next) = commit.next_fragment_id {
-            if next < self.next_fragment_id || next > u64::from(u32::MAX) + 1 {
-                return Err(Error::invalid_input(format!(
-                    "Fragment ID frontier {next} must be between {} and 2^32",
-                    self.next_fragment_id
-                )));
-            }
-            self.next_fragment_id = next;
-        }
+        self.next_fragment_id = next_fragment_id;
         Ok(tagged)
     }
 
@@ -1138,14 +1253,14 @@ impl FragmentTree {
     /// Flush the root buffer as far as it goes, then split, coalesce, and
     /// shrink the root. Every touched node is copy-on-write, so nothing here
     /// is visible until the root is published.
-    async fn rewrite_tree(&mut self) -> Result<WriteAcc> {
+    async fn rewrite_tree(&mut self, mode: CommitMode) -> Result<WriteAcc> {
         let mut acc = WriteAcc::default();
-        let rewrite = rewrite::RewriteNodes::new(&self.buffer);
+        let rewrite = rewrite::RewriteNodes::new(&self.buffer, self.next_action_sequence);
 
         let children = std::mem::take(&mut self.children);
         let buffer = std::mem::take(&mut self.buffer);
-        let (children, buffer, a) = if self.force_flush {
-            let result = super::bulk::materialize(
+        let (children, buffer, a) = if mode == CommitMode::Bulk {
+            let (children, work) = bulk::materialize(
                 &self.store,
                 &self.config,
                 children,
@@ -1153,19 +1268,7 @@ impl FragmentTree {
                 self.next_action_sequence.saturating_sub(1),
             )
             .await?;
-            (
-                result.children,
-                Vec::new(),
-                WriteAcc {
-                    io_bytes: result.io_bytes,
-                    flushes: result.flushes,
-                    splits: result.splits,
-                    merges: result.merges,
-                    materialized: result.materialized,
-                    max_flush_depth: result.max_flush_depth,
-                    ..Default::default()
-                },
-            )
+            (children, Vec::new(), work)
         } else {
             self.flush_internal(children, buffer, 0, 0..node::ROOT_EXCLUSIVE_END, &rewrite)
                 .await?
@@ -1208,7 +1311,7 @@ impl FragmentTree {
         // Repair children that drains left underfull or single-child before
         // routing is split, as ingest does below the root, so no split piece
         // persists a single-child interior.
-        if !self.force_flush {
+        if mode == CommitMode::Incremental {
             let children = std::mem::take(&mut self.children);
             let (children, a) = self
                 .merge_small_children(children, node::ROOT_EXCLUSIVE_END, &rewrite)
@@ -1217,35 +1320,19 @@ impl FragmentTree {
             self.children = children;
         }
 
-        // A broad transaction can cross several heights at once. Keep lifting
-        // routing until the new root itself fits, not just its first children.
-        while node::internal_overflows(&self.children, &self.buffer, &self.config) {
-            let previous_width = self.children.len();
-            let pieces = node::split_internal(
-                std::mem::take(&mut self.children),
-                std::mem::take(&mut self.buffer),
-                self.config.split_piece_bytes(),
-                self.config.max_children_per_node,
-            );
-            if pieces.len() >= previous_width
-                || pieces.iter().any(|(children, _)| children.len() < 2)
-            {
-                return Err(Error::invalid_input(format!(
-                    "node budget {} cannot reduce a root with {} children",
-                    self.config.max_node_bytes, previous_width
-                )));
-            }
-            let mut new_children = Vec::with_capacity(pieces.len());
-            for (ch, buf) in pieces {
-                let w = rewrite.write_internal(&self.store, ch, buf).await?;
-                acc.io_bytes += w.io_bytes;
-                new_children.push(w.child_ref);
-            }
-            self.children = new_children;
-            acc.splits += 1;
-        }
+        let (children, buffer, routing) = Self::lift_root(
+            &self.store,
+            &self.config,
+            std::mem::take(&mut self.children),
+            std::mem::take(&mut self.buffer),
+            Some(&rewrite),
+        )
+        .await?;
+        self.children = children;
+        self.buffer = buffer;
+        acc.add(routing);
 
-        if !self.force_flush {
+        if mode == CommitMode::Incremental {
             let children = std::mem::take(&mut self.children);
             let (children, a) = self
                 .merge_small_children(children, node::ROOT_EXCLUSIVE_END, &rewrite)
@@ -1255,8 +1342,60 @@ impl FragmentTree {
         }
 
         self.maybe_shrink_root(&rewrite).await?;
+        // The root keeps a lone interior only when adopting its level would
+        // overflow. Readers reject that interior if it has one child, and no
+        // sibling is left to pair it with, so the commit rebuilds instead.
+        if let [only] = self.children.as_slice()
+            && only.height > 0
+            && only.num_children == 1
+        {
+            acc.collapses += 1;
+            return Ok(acc);
+        }
         node::fence(&mut self.children, 0);
         Ok(acc)
+    }
+
+    /// Build as many routing levels as needed for the root to fit. Bootstrap
+    /// has no source nodes to track. A rewrite retains its sequence admission.
+    async fn lift_root(
+        store: &NodeStore,
+        config: &FragmentTreeConfig,
+        mut children: Vec<pb::FragmentTreeChild>,
+        mut buffer: Vec<pb::FragmentTreeMutation>,
+        rewrite: Option<&rewrite::RewriteNodes>,
+    ) -> Result<FlushResult> {
+        let mut acc = WriteAcc::default();
+        while node::internal_overflows(&children, &buffer, config) {
+            let previous_width = children.len();
+            let pieces = node::split_internal(
+                children,
+                buffer,
+                config.split_piece_bytes(),
+                config.max_children_per_node,
+            );
+            if pieces.len() >= previous_width
+                || pieces.iter().any(|(children, _)| children.len() < 2)
+            {
+                return Err(Error::invalid_input(format!(
+                    "node budget {} cannot group two child references into fewer root nodes \
+                     (children={previous_width}); widen the directory budget",
+                    config.max_node_bytes
+                )));
+            }
+            children = Vec::with_capacity(pieces.len());
+            buffer = Vec::new();
+            for (group, actions) in pieces {
+                let written = match rewrite {
+                    Some(rewrite) => rewrite.write_internal(store, group, actions).await?,
+                    None => store.write_internal(group, actions).await?,
+                };
+                acc.io_bytes += written.io_bytes;
+                children.push(written.child_ref);
+            }
+            acc.splits += 1;
+        }
+        Ok((children, buffer, acc))
     }
 
     /// Flush an internal node's buffer to its children while it is pressured.
@@ -1294,8 +1433,8 @@ impl FragmentTree {
                         .actions()
                         .iter()
                         .flatten()
-                        .any(flush::retires_fragment),
-                    None => buffer.iter().any(flush::retires_fragment),
+                        .any(content::retires_fragment),
+                    None => buffer.iter().any(content::retires_fragment),
                 };
                 let pressure = if structural || buffer_bytes >= self.config.semantic_buffer_bytes {
                     flush::Pressure::Pressured
@@ -1432,55 +1571,7 @@ impl FragmentTree {
             let mut acc = WriteAcc::default();
             if child.height == 0 {
                 acc.materialized += incoming.len() as u64;
-                let retired = flush::retired_keys(&incoming);
-                let replaced = incoming
-                    .iter()
-                    .filter(|action| flush::replaces_fragment(action))
-                    .count() as u64;
-                let map: BTreeMap<u64, Fragment> = if retired + replaced == child.num_keys {
-                    // The batch claims to remove or replace every stored
-                    // fragment, so only record headers are read, to check
-                    // each stored delta and that no stored record survives
-                    // without its files.
-                    let overwritten: BTreeSet<u64> = incoming
-                        .iter()
-                        .filter(|action| {
-                            matches!(
-                                action.action.as_ref().and_then(|a| a.action.as_ref()),
-                                Some(pb::fragment_action::Action::UpsertFragment(_))
-                            )
-                        })
-                        .map(node::action_key)
-                        .collect();
-                    let mut map: BTreeMap<u64, Fragment> = self
-                        .store
-                        .read_leaf_headers(&child, end)
-                        .await?
-                        .into_iter()
-                        .map(|header| (header.id, header))
-                        .collect();
-                    let stored: Vec<u64> = map.keys().copied().collect();
-                    self.store.apply_verified(&mut map, incoming)?;
-                    if let Some(id) = stored
-                        .iter()
-                        .find(|id| map.contains_key(id) && !overwritten.contains(id))
-                    {
-                        return Err(super::validation::corrupt(format!(
-                            "Buffered actions for leaf {} count every stored fragment as \
-                                 removed or replaced, but fragment {id} is neither",
-                            child.path
-                        )));
-                    }
-                    self.store.share_data_file_lists(map.values_mut());
-                    map
-                } else {
-                    let fragments = self.store.read_leaf_in_range(&child, end).await?;
-                    let mut map: BTreeMap<u64, Fragment> =
-                        fragments.into_iter().map(|f| (f.id, f)).collect();
-                    self.store.apply_verified(&mut map, incoming)?;
-                    map
-                };
-                let new_frags: Vec<Fragment> = map.into_values().collect();
+                let new_frags = content::replay_leaf(&self.store, &child, end, incoming).await?;
 
                 // A fully-emptied leaf is dropped from its parent. Keeping it would
                 // create a phantom child with min_key=0 that corrupts the
@@ -1513,7 +1604,7 @@ impl FragmentTree {
                 } = rewrite.read_internal(&self.store, &child, end).await?;
                 buffer.extend(incoming);
                 let before = buffer.len();
-                buffer = node::squash_buffer(
+                buffer = content::squash_buffer(
                     buffer,
                     node::combine_from(&children, self.contiguous_from),
                 );
@@ -1596,17 +1687,25 @@ impl FragmentTree {
             let mut j = i + 1;
             while j < children.len() {
                 let c = &children[j];
+                // A sibling's reference is checked only when the sibling is
+                // read, so a misstated size or fanout must not wrap the sums.
+                let (Some(next_bytes), Some(next_fan)) = (
+                    bytes.checked_add(c.object_size),
+                    fan.checked_add(c.num_children),
+                ) else {
+                    break;
+                };
                 let fits = if is_leaf {
-                    bytes + c.object_size <= self.config.leaf_coalesce_ceiling()
+                    next_bytes <= self.config.leaf_coalesce_ceiling()
                 } else {
-                    fan + c.num_children <= self.config.max_children_per_node
-                        && bytes + c.object_size <= self.config.coalesce_ceiling()
+                    next_fan <= self.config.max_children_per_node
+                        && next_bytes <= self.config.coalesce_ceiling()
                 };
                 if !fits {
                     break;
                 }
-                bytes += c.object_size;
-                fan += c.num_children;
+                bytes = next_bytes;
+                fan = next_fan;
                 group.push(c.clone());
                 j += 1;
             }
@@ -1823,52 +1922,21 @@ impl FragmentTree {
             let action_buckets =
                 node::partition_buffer_by_child(&self.children, self.buffer.clone());
             if let Err(error) =
-                node::validate_routed(&self.children, &action_buckets, node::ROOT_EXCLUSIVE_END)
+                node::validate_routed(&self.children, &action_buckets, self.next_fragment_id)
             {
                 walk.pending_error = Some(error);
                 return walk;
             }
-            walk.push_children(
-                self.children.clone(),
-                action_buckets,
-                node::ROOT_EXCLUSIVE_END,
-            );
+            walk.push_children(self.children.clone(), action_buckets, self.next_fragment_id);
         }
         walk
-    }
-
-    /// Advance an in-order walk by one fragment, reading one leaf at a time.
-    async fn walk_next(&self, walk: &mut FragmentWalk) -> Result<Option<Fragment>> {
-        if let Some(error) = walk.pending_error.take() {
-            return Err(error);
-        }
-        loop {
-            if let Some(fragment) = walk.ready.pop_front() {
-                if fragment.id < walk.lower_bound {
-                    continue;
-                }
-                return Ok(Some(fragment));
-            }
-            let Some((child, actions, end)) = self.walk_next_leaf(walk).await? else {
-                return Ok(None);
-            };
-            let mut fragments: BTreeMap<u64, Fragment> = self
-                .store
-                .read_leaf_in_range(&child, end)
-                .await?
-                .into_iter()
-                .map(|fragment| (fragment.id, fragment))
-                .collect();
-            self.store.apply_verified(&mut fragments, actions)?;
-            walk.ready.extend(fragments.into_values());
-        }
     }
 
     /// Traverse routing once, yielding leaves and their inherited actions in
     /// order. Leaf I/O can then be prefetched without buffering the full table.
     async fn walk_next_leaf(&self, walk: &mut FragmentWalk) -> Result<Option<BufferedChild>> {
-        // The leaf-prefetching streams drive this walk directly, so a routing
-        // error found when the walk started must surface here too.
+        // Every walk reader steps through here, so a routing error found when
+        // the walk started must surface here.
         if let Some(error) = walk.pending_error.take() {
             return Err(error);
         }
@@ -1895,16 +1963,14 @@ impl FragmentTree {
 
     /// Collect the leaves whose range intersects `fragment_ids`, each with
     /// the buffered actions for those ids routed to it. `routed` holds the
-    /// actions for this node's `range`. Up to `concurrency` covering sibling
-    /// interiors are read at once.
-    #[allow(clippy::too_many_arguments)]
+    /// actions for this node's `range`. Up to [`MAX_READS_IN_FLIGHT`] covering
+    /// sibling interiors are read at once.
     fn collect_covering_leaves<'a>(
         &'a self,
         children: Vec<pb::FragmentTreeChild>,
         routed: Vec<pb::FragmentTreeMutation>,
         range: Range<u64>,
         fragment_ids: &'a RoaringBitmap,
-        concurrency: usize,
         sequences: &'a mut node::DecodedSequences,
         leaves: &'a mut Vec<BufferedChild>,
     ) -> BoxFuture<'a, Result<()>> {
@@ -1948,7 +2014,7 @@ impl FragmentTree {
                 })
                 .collect();
             let interiors: Vec<_> = futures::stream::iter(reads)
-                .buffered(concurrency)
+                .buffered(MAX_READS_IN_FLIGHT)
                 .collect()
                 .await;
             for ((child, mut actions, child_range), interior) in covering.into_iter().zip(interiors)
@@ -1964,7 +2030,7 @@ impl FragmentTree {
                         .node
                         .buffer
                         .iter()
-                        .filter(|tagged| bitmap_contains(fragment_ids, node::action_key(tagged)))
+                        .filter(|tagged| bitmap_contains(fragment_ids, content::action_key(tagged)))
                         .cloned(),
                 );
                 self.collect_covering_leaves(
@@ -1972,7 +2038,6 @@ impl FragmentTree {
                     actions,
                     child_range,
                     fragment_ids,
-                    concurrency,
                     sequences,
                     leaves,
                 )
@@ -1988,8 +2053,7 @@ fn walk_fragments(
     mut remaining: u64,
 ) -> OffsetResolution {
     for fragment in fragments {
-        // Counts are known by the writer invariant; a violation would have
-        // been rejected at commit.
+        // Decoded records always carry known counts.
         let visible = fragment.num_rows().unwrap_or(0) as u64;
         if remaining < visible {
             return OffsetResolution::Found(Box::new(fragment), remaining);

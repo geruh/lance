@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_TREE, FRAGMENT_FEATURE_FLAGS, STICKY_READER_FLAGS,
-    STICKY_WRITER_FLAGS,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_TREE, FRAGMENT_FEATURE_FLAGS,
+    FRAGMENT_WRITER_FEATURE_FLAGS, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS,
 };
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -54,8 +54,9 @@ pub struct Manifest {
 
     /// Fragments, the pieces to build the dataset.
     ///
-    /// This list is stored in order, sorted by fragment id.  However, the fragment id
-    /// sequence may have gaps.
+    /// This list is stored in order, sorted by fragment id. However, the fragment id
+    /// sequence may have gaps. For a tree layout, resident records may be absent or
+    /// partial, and [`Self::fragment_tree`] is authoritative.
     pub fragments: Arc<Vec<Fragment>>,
 
     /// Experimental fragment tree descriptor. This API may change at any time.
@@ -150,7 +151,7 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManifestSummary {
     pub total_fragments: u64,
     pub total_data_files: u64,
@@ -196,8 +197,23 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 impl Manifest {
     /// Replace resident fragments and rebuild row offsets, preserving the ID allocator.
     pub fn set_fragments(&mut self, fragments: Vec<Fragment>) {
+        self.set_shared_fragments(Arc::new(fragments));
+    }
+
+    /// Replace resident fragments without copying shared records, rebuilding row offsets.
+    /// This does not change the tree descriptor or establish tree inventory completeness.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_table::format::{Fragment, Manifest};
+    /// # fn example(manifest: &mut Manifest, fragments: Arc<Vec<Fragment>>) {
+    /// manifest.set_shared_fragments(fragments.clone());
+    /// assert!(Arc::ptr_eq(&manifest.fragments, &fragments));
+    /// # }
+    /// ```
+    pub fn set_shared_fragments(&mut self, fragments: Arc<Vec<Fragment>>) {
         self.fragment_offsets = compute_fragment_offsets(&fragments);
-        self.fragments = Arc::new(fragments);
+        self.fragments = fragments;
     }
 
     /// Whether this table requires independently addressed Managed Blob support.
@@ -247,10 +263,13 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
-        let tree_flags = if previous.fragment_tree.is_some() {
-            FLAG_FRAGMENT_TREE | FRAGMENT_FEATURE_FLAGS
+        let (tree_reader_flags, tree_writer_flags) = if previous.fragment_tree.is_some() {
+            (
+                FLAG_FRAGMENT_TREE | FRAGMENT_FEATURE_FLAGS,
+                FLAG_FRAGMENT_TREE | FRAGMENT_WRITER_FEATURE_FLAGS,
+            )
         } else {
-            0
+            (0, 0)
         };
 
         Self {
@@ -264,9 +283,9 @@ impl Manifest {
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
             reader_feature_flags: previous.reader_feature_flags
-                & (STICKY_READER_FLAGS | tree_flags),
+                & (STICKY_READER_FLAGS | tree_reader_flags),
             writer_feature_flags: previous.writer_feature_flags
-                & (STICKY_WRITER_FLAGS | tree_flags),
+                & (STICKY_WRITER_FLAGS | tree_writer_flags),
             max_fragment_id: previous.max_fragment_id,
             max_allocated_field_id: previous.max_allocated_field_id,
             transaction_file: None,
@@ -294,10 +313,13 @@ impl Manifest {
         branch_name: Option<String>,
         transaction_file: String,
     ) -> Self {
-        let tree_flags = if self.fragment_tree.is_some() {
-            FLAG_FRAGMENT_TREE | FRAGMENT_FEATURE_FLAGS
+        let (tree_reader_flags, tree_writer_flags) = if self.fragment_tree.is_some() {
+            (
+                FLAG_FRAGMENT_TREE | FRAGMENT_FEATURE_FLAGS,
+                FLAG_FRAGMENT_TREE | FRAGMENT_WRITER_FEATURE_FLAGS,
+            )
         } else {
-            0
+            (0, 0)
         };
         let cloned_fragments = self
             .fragments
@@ -346,12 +368,12 @@ impl Manifest {
                 & (FLAG_COVERED_INDEX_METADATA
                     | STICKY_READER_FLAGS
                     | FLAG_STABLE_ROW_IDS
-                    | tree_flags),
+                    | tree_reader_flags),
             writer_feature_flags: self.writer_feature_flags
                 & (FLAG_COVERED_INDEX_METADATA
                     | STICKY_WRITER_FLAGS
                     | FLAG_STABLE_ROW_IDS
-                    | tree_flags),
+                    | tree_writer_flags),
             max_fragment_id: self.max_fragment_id,
             max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
@@ -644,50 +666,79 @@ impl Manifest {
         pb_manifest.encode_to_vec()
     }
 
-    /// Get the summary information of a manifest.
+    /// Totals over the resident [`Self::fragments`].
+    ///
+    /// A tree manifest may hold only some of its fragment records, or none, so
+    /// for a tree table this is not the table's summary. Use
+    /// [`FragmentTree::summary`](crate::fragment_metadata::FragmentTree::summary)
+    /// for that.
     ///
     /// This function calculates various statistics about the manifest, including:
     /// - total_files_size: Total size of all data files in bytes
-    /// - total_fragments: Total number of fragments in the dataset
+    /// - total_fragments: Total number of resident fragments
     /// - total_data_files: Total number of data files across all fragments
     /// - total_deletion_files: Total number of deletion files
     /// - total_data_file_rows: Total number of rows in data files
     /// - total_deletion_file_rows: Total number of deleted rows in deletion files
-    /// - total_rows: Total number of rows in the dataset
+    /// - total_rows: Total visible rows in the resident fragments
     pub fn summary(&self) -> ManifestSummary {
+        ManifestSummary::of(&self.fragments)
+    }
+}
+
+impl ManifestSummary {
+    /// The totals [`Manifest::summary`] reports for `fragments`.
+    pub(crate) fn of(fragments: &[Fragment]) -> Self {
         // Calculate total fragments
-        let mut summary =
-            self.fragments
-                .iter()
-                .fold(ManifestSummary::default(), |mut summary, f| {
-                    // Count data files in the current fragment
-                    summary.total_data_files += f.files.len() as u64;
-                    // Sum the number of rows for the current fragment (if available)
-                    if let Some(num_rows) = f.num_rows() {
-                        summary.total_rows += num_rows as u64;
-                    }
-                    // Sum file sizes for all data files in the current fragment (if available)
-                    for data_file in &f.files {
-                        if let Some(size_bytes) = data_file.file_size_bytes.get() {
-                            summary.total_files_size += size_bytes.get();
-                        }
-                    }
-                    // Check and count if the current fragment has a deletion file
-                    if f.deletion_file.is_some() {
-                        summary.total_deletion_files += 1;
-                    }
-                    // Sum the number of deleted rows from the deletion file (if available)
-                    if let Some(deletion_file) = &f.deletion_file
-                        && let Some(num_deleted) = deletion_file.num_deleted_rows
-                    {
-                        summary.total_deletion_file_rows += num_deleted as u64;
-                    }
-                    summary
-                });
-        summary.total_fragments = self.fragments.len() as u64;
+        let mut summary = fragments.iter().fold(Self::default(), |mut summary, f| {
+            // Count data files in the current fragment
+            summary.total_data_files += f.files.len() as u64;
+            // Sum the number of rows for the current fragment (if available)
+            if let Some(num_rows) = f.num_rows() {
+                summary.total_rows += num_rows as u64;
+            }
+            // Sum file sizes for all data files in the current fragment (if available)
+            for data_file in &f.files {
+                if let Some(size_bytes) = data_file.file_size_bytes.get() {
+                    summary.total_files_size += size_bytes.get();
+                }
+            }
+            // Check and count if the current fragment has a deletion file
+            if f.deletion_file.is_some() {
+                summary.total_deletion_files += 1;
+            }
+            // Sum the number of deleted rows from the deletion file (if available)
+            if let Some(deletion_file) = &f.deletion_file
+                && let Some(num_deleted) = deletion_file.num_deleted_rows
+            {
+                summary.total_deletion_file_rows += num_deleted as u64;
+            }
+            summary
+        });
+        summary.total_fragments = fragments.len() as u64;
         summary.total_data_file_rows = summary.total_rows + summary.total_deletion_file_rows;
 
         summary
+    }
+
+    /// Count fragments disjoint from those this summary already counts.
+    pub(crate) fn add(&mut self, other: &Self) {
+        let Self {
+            total_fragments,
+            total_data_files,
+            total_files_size,
+            total_deletion_files,
+            total_data_file_rows,
+            total_deletion_file_rows,
+            total_rows,
+        } = other;
+        self.total_fragments += total_fragments;
+        self.total_data_files += total_data_files;
+        self.total_files_size += total_files_size;
+        self.total_deletion_files += total_deletion_files;
+        self.total_data_file_rows += total_data_file_rows;
+        self.total_deletion_file_rows += total_deletion_file_rows;
+        self.total_rows += total_rows;
     }
 }
 
@@ -1259,6 +1310,18 @@ impl From<&Manifest> for pb::Manifest {
             })
         };
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
+        let (fragments, fragment_tree) = match m.fragment_tree.as_deref() {
+            None => (
+                m.fragments.iter().map(pb::DataFragment::from).collect(),
+                None,
+            ),
+            Some(tree) => (
+                Vec::new(),
+                Some(pb::FragmentTreeMetadata {
+                    layout: Some(pb::fragment_tree_metadata::Layout::Tree(tree.clone())),
+                }),
+            ),
+        };
         Self {
             fields: fields_with_meta.fields.0,
             schema_metadata: m
@@ -1280,11 +1343,7 @@ impl From<&Manifest> for pb::Manifest {
                     prerelease: wv.prerelease.clone(),
                     build_metadata: wv.build_metadata.clone(),
                 }),
-            fragments: if m.fragment_tree.is_some() {
-                Vec::new()
-            } else {
-                m.fragments.iter().map(pb::DataFragment::from).collect()
-            },
+            fragments,
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -1317,14 +1376,7 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
             transaction_section_deprecated: None,
-            fragment_tree: m
-                .fragment_tree
-                .as_ref()
-                .map(|tree| pb::FragmentTreeMetadata {
-                    layout: Some(pb::fragment_tree_metadata::Layout::Tree(
-                        tree.as_ref().clone(),
-                    )),
-                }),
+            fragment_tree,
         }
     }
 }
@@ -1611,6 +1663,30 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::empty_flat(false, 0)]
+    #[case::flat(false, 2)]
+    #[case::empty_resident_tree(true, 0)]
+    #[case::resident_tree(true, 2)]
+    fn encoding_writes_records_only_for_a_flat_manifest(
+        #[case] is_tree: bool,
+        #[case] fragment_count: usize,
+    ) {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new((0..fragment_count as u64).map(Fragment::new).collect()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = is_tree.then(|| Arc::new(pb::FragmentTree::default()));
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.fragment_tree.is_some(), is_tree);
+        assert_eq!(
+            encoded.fragments.len(),
+            if is_tree { 0 } else { fragment_count }
+        );
+    }
+
     #[test]
     fn resident_tree_fragments_are_not_duplicated_in_the_manifest() {
         let mut manifest = Manifest::new(
@@ -1636,6 +1712,7 @@ mod tests {
         assert!(encoded.fragments.is_empty());
         let mut decoded = Manifest::try_from(encoded).unwrap();
         assert_eq!(decoded.fragment_tree, manifest.fragment_tree);
+        assert!(decoded.fragments.is_empty());
         // The records are now lazy, but still require the lineage capability.
         apply_feature_flags(&mut decoded, true, false).unwrap();
         assert_eq!(decoded.reader_feature_flags, manifest.reader_feature_flags);
@@ -2434,6 +2511,17 @@ mod tests {
         assert_eq!(deletion_summary.total_deletion_file_rows, 10);
         assert_eq!(deletion_summary.total_data_file_rows, 50);
         assert_eq!(deletion_summary.total_deletion_files, 1);
+
+        // Summaries of disjoint fragments add up to the summary of them all.
+        let mut parts = real_data_summary;
+        parts.add(&deletion_summary);
+        let all: Vec<Fragment> = real_data_manifest
+            .fragments
+            .iter()
+            .chain(manifest_with_deletion.fragments.iter())
+            .cloned()
+            .collect();
+        assert_eq!(parts, ManifestSummary::of(&all));
 
         //Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();

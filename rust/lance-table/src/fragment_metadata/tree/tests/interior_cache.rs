@@ -25,6 +25,7 @@ fn deletion(id: u64, round: u64) -> pb::FragmentAction {
             base_id: None,
         },
     )
+    .unwrap()
 }
 
 const FRAGMENTS: u64 = 2048;
@@ -81,20 +82,40 @@ async fn warm_reads_perform_no_interior_gets(#[case] id_step: usize) {
     let fixture = buffered_fixture().await;
     let expected = fixture.tree.materialize().await.unwrap();
     let mut tree = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
-    tree.set_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024));
+    tree = reopen_tree(
+        &tree,
+        tree.store
+            .context()
+            .with_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024)),
+    )
+    .await;
     let tree = Arc::new(tree);
     let ids: Vec<u64> = (0..FRAGMENTS).step_by(id_step).collect();
     let bitmap: RoaringBitmap = ids.iter().map(|id| *id as u32).collect();
 
-    let touched = tree.resolve_touched(&ids).await.unwrap();
-    let streamed: Vec<_> = tree.clone().fragment_stream().try_collect().await.unwrap();
+    let touched = tree
+        .begin_commit(CommitMode::Incremental)
+        .resolve_touched(&ids)
+        .await
+        .unwrap()
+        .clone();
+    let streamed: Vec<_> = tree
+        .clone()
+        .scan_with_readahead(0, NonZeroUsize::MIN)
+        .try_collect()
+        .await
+        .unwrap();
     assert_eq!(streamed, expected);
     fixture.io.incremental_stats();
 
     assert_eq!(
-        tree.resolve_touched(&ids).await.unwrap().fragments,
+        tree.begin_commit(CommitMode::Incremental)
+            .resolve_touched(&ids)
+            .await
+            .unwrap()
+            .fragments,
         touched.fragments
     );
     let resolved = tree.resolve_fragments(&bitmap).await.unwrap();
@@ -111,9 +132,19 @@ async fn warm_reads_perform_no_interior_gets(#[case] id_step: usize) {
             Some(fragment)
         );
     }
-    let streamed: Vec<_> = tree.clone().fragment_stream().try_collect().await.unwrap();
+    let streamed: Vec<_> = tree
+        .clone()
+        .scan_with_readahead(0, NonZeroUsize::MIN)
+        .try_collect()
+        .await
+        .unwrap();
     assert_eq!(streamed, expected);
     assert_eq!(tree.materialize().await.unwrap(), expected);
+    let owned = tree
+        .object_paths_owned_by(&fixture.store, &fixture.base)
+        .await
+        .unwrap();
+    assert!(owned.iter().any(|path| path.starts_with("_bt/node/")));
     assert_eq!(interior_gets(&fixture.io.incremental_stats()), 0);
 }
 
@@ -122,7 +153,7 @@ async fn warm_reads_perform_no_interior_gets(#[case] id_step: usize) {
 #[tokio::test]
 async fn cached_interior_fails_a_stricter_frontier() {
     let mut fixture = Fixture::new(FRAGMENTS, small_config(), SnapshotPolicy::default()).await;
-    let (old_snapshot, old_version) = (fixture.snapshot.clone(), fixture.tree.version());
+    let (old_snapshot, old_version) = (fixture.tree.descriptor.clone(), fixture.tree.version());
     for round in 1..=40u64 {
         let actions = (0..16)
             .map(|slot| deletion((round * 16 + slot * 127) % FRAGMENTS, round))
@@ -133,9 +164,9 @@ async fn cached_interior_fails_a_stricter_frontier() {
     }
     let cache = LanceCache::with_capacity(64 * 1024 * 1024);
     let mut newer = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
-    newer.set_leaf_cache(cache.clone());
+    newer = reopen_tree(&newer, newer.store.context().with_leaf_cache(cache.clone())).await;
     assert!(resolve_each(&newer).await.iter().all(Result::is_ok));
 
     let forge = |tree: &mut FragmentTree| {
@@ -144,7 +175,11 @@ async fn cached_interior_fails_a_stricter_frontier() {
         tree.buffer_index.take();
     };
     let mut cached = fixture.open(&old_snapshot, old_version).await;
-    cached.set_leaf_cache(cache.clone());
+    cached = reopen_tree(
+        &cached,
+        cached.store.context().with_leaf_cache(cache.clone()),
+    )
+    .await;
     forge(&mut cached);
     let mut uncached = fixture.open(&old_snapshot, old_version).await;
     forge(&mut uncached);
@@ -206,7 +241,7 @@ async fn cached_interior_fails_a_narrower_range(
     // The interior holds fragments 0 and 1 and buffers the insert of 2.
     let insert = pb::FragmentTreeMutation {
         action_sequence: 1,
-        action: Some(action::upsert_fragment(&make_fragment(2))),
+        action: Some(action::upsert_fragment(&make_fragment(2)).unwrap()),
         fragment_count_delta: 1,
         total_rows_delta: 1,
         visible_rows_delta: 1,
@@ -218,6 +253,12 @@ async fn cached_interior_fails_a_narrower_range(
         .await
         .unwrap()
         .child_ref;
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    fixture.tree = reopen_tree(
+        &fixture.tree,
+        fixture.context().with_leaf_cache(cache.clone()),
+    )
+    .await;
     let tree = &mut fixture.tree;
     tree.children = vec![interior];
     tree.buffer.clear();
@@ -225,10 +266,9 @@ async fn cached_interior_fails_a_narrower_range(
     tree.total_fragments = 3;
     tree.total_rows = 3;
     tree.visible_rows = 3;
+    tree.next_fragment_id = 3;
     tree.next_action_sequence = 2;
     tree.store.next_action_sequence = 2;
-    let cache = LanceCache::with_capacity(1024 * 1024);
-    tree.set_leaf_cache(cache.clone());
     assert!(tree.resolve_fragment(0).await.unwrap().is_some());
     assert!(tree.resolve_fragment(2).await.unwrap().is_some());
 
@@ -252,9 +292,15 @@ async fn cached_interior_fails_a_narrower_range(
 async fn changed_parent_reference_is_checked_again(#[case] forge: fn(&mut pb::FragmentTreeChild)) {
     let fixture = buffered_fixture().await;
     let mut tree = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
-    tree.set_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024));
+    tree = reopen_tree(
+        &tree,
+        tree.store
+            .context()
+            .with_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024)),
+    )
+    .await;
     let valid = resolve_each(&tree).await;
     assert!(valid.iter().all(Result::is_ok));
     let interior = tree
@@ -266,7 +312,7 @@ async fn changed_parent_reference_is_checked_again(#[case] forge: fn(&mut pb::Fr
     let mut forged = tree.clone();
     forge(&mut forged.children[interior]);
     let mut uncached = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
     forge(&mut uncached.children[interior]);
     let from_cache = resolve_each(&forged).await;
@@ -290,7 +336,6 @@ async fn owner_views_of_one_path_stay_apart() {
             fixture.store.clone(),
             base.clone(),
             fixture.scheduler.clone(),
-            Arc::new(LanceCache::with_capacity(0)),
         );
         let mut leaves = Vec::new();
         for offset in 0..2 {
@@ -326,18 +371,28 @@ async fn owner_views_of_one_path_stay_apart() {
         bases.insert(owner as u32, (fixture.store.clone(), base));
         roots.push(child);
     }
+    fixture.tree = reopen_tree(
+        &fixture.tree,
+        fixture
+            .context()
+            .with_foreign_bases(bases)
+            .with_leaf_cache(cache.clone()),
+    )
+    .await;
     fixture.tree.children = roots.clone();
-    fixture.tree.set_foreign_bases(bases);
-    fixture.tree.set_leaf_cache(cache.clone());
+    fixture.tree.next_fragment_id = 4;
     let mut source_view = fixture.tree.clone();
     source_view.store = NodeStore::new(
         fixture.store.clone(),
         Path::from("source-1"),
         fixture.scheduler.clone(),
-        Arc::new(LanceCache::with_capacity(0)),
     );
     source_view.store.next_action_sequence = fixture.tree.store.next_action_sequence;
-    source_view.set_leaf_cache(cache.clone());
+    source_view = reopen_tree(
+        &source_view,
+        source_view.store.context().with_leaf_cache(cache.clone()),
+    )
+    .await;
     let mut local_root = roots[0].clone();
     local_root.base_id = None;
     source_view.children = vec![local_root];
@@ -367,13 +422,24 @@ async fn evicted_interiors_reload_with_the_same_results() {
     let fixture = buffered_fixture().await;
     let expected = fixture.tree.materialize().await.unwrap();
     let mut tree = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
-    tree.set_leaf_cache(LanceCache::with_capacity(16 * 1024));
+    tree = reopen_tree(
+        &tree,
+        tree.store
+            .context()
+            .with_leaf_cache(LanceCache::with_capacity(16 * 1024)),
+    )
+    .await;
     let tree = Arc::new(tree);
     for _ in 0..2 {
         fixture.io.incremental_stats();
-        let streamed: Vec<_> = tree.clone().fragment_stream().try_collect().await.unwrap();
+        let streamed: Vec<_> = tree
+            .clone()
+            .scan_with_readahead(0, NonZeroUsize::MIN)
+            .try_collect()
+            .await
+            .unwrap();
         assert_eq!(streamed, expected);
         assert!(interior_gets(&fixture.io.incremental_stats()) > 0);
         for fragment in expected.iter().step_by(64) {
@@ -418,7 +484,7 @@ async fn cached_interior_owns_its_row_ids() {
             ));
             pb::FragmentTreeMutation {
                 action_sequence: id,
-                action: Some(action::upsert_fragment(&fragment)),
+                action: Some(action::upsert_fragment(&fragment).unwrap()),
                 fragment_count_delta: 1,
                 total_rows_delta: 64,
                 visible_rows_delta: 64,
@@ -432,10 +498,14 @@ async fn cached_interior_owns_its_row_ids() {
         .await
         .unwrap()
         .child_ref;
+    fixture.tree = reopen_tree(
+        &fixture.tree,
+        fixture
+            .context()
+            .with_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024)),
+    )
+    .await;
     fixture.tree.store.next_action_sequence = 9;
-    fixture
-        .tree
-        .set_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024));
     let cached = fixture
         .tree
         .store
@@ -459,9 +529,9 @@ async fn cached_interior_owns_its_row_ids() {
 }
 
 /// A failed interior load is not cached, and a cached interior does not hide
-/// a missing object from reachability checks.
+/// a missing object from validation.
 #[tokio::test]
-async fn missing_interior_is_neither_cached_nor_hidden_from_verification() {
+async fn missing_interior_is_neither_cached_nor_hidden_from_validation() {
     let fixture = buffered_fixture().await;
     let interior = fixture
         .tree
@@ -482,24 +552,35 @@ async fn missing_interior_is_neither_cached_nor_hidden_from_verification() {
         .unwrap();
 
     let mut warm = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
-    warm.set_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024));
+    warm = reopen_tree(
+        &warm,
+        warm.store
+            .context()
+            .with_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024)),
+    )
+    .await;
     assert!(resolve_each(&warm).await.iter().all(Result::is_ok));
+    warm.validate().await.unwrap();
     fixture.store.inner.delete(&location).await.unwrap();
-    let error = warm.verify_reachable().await.unwrap_err();
-    assert!(
-        matches!(error, Error::IO { .. } | Error::NotFound { .. }),
-        "{error}"
-    );
+    let error = warm.validate().await.unwrap_err();
+    assert!(matches!(error, Error::NotFound { .. }), "{error}");
+    assert!(error.to_string().contains(&interior.path), "{error}");
 
     let mut cold = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
-    cold.set_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024));
+    cold = reopen_tree(
+        &cold,
+        cold.store
+            .context()
+            .with_leaf_cache(LanceCache::with_capacity(64 * 1024 * 1024)),
+    )
+    .await;
     let failed = resolve_each(&cold).await;
     let uncached = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
     assert!(failed.iter().any(Result::is_err));
     assert!(same_outcomes(&failed, &resolve_each(&uncached).await));

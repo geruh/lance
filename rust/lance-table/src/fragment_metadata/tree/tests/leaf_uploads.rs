@@ -237,7 +237,10 @@ fn leaf_commit(
         ),
         LeafCommit::BufferedSiblingDrains => (widened(0..FRAGMENTS, 4), false),
     };
-    let actions = changed.iter().map(action::upsert_fragment).collect();
+    let actions = changed
+        .iter()
+        .map(|fragment| action::upsert_fragment(fragment).unwrap())
+        .collect();
     let mut expected: BTreeMap<u64, Fragment> =
         (0..FRAGMENTS).map(|id| (id, make_fragment(id))).collect();
     expected.extend(changed.into_iter().map(|fragment| (fragment.id, fragment)));
@@ -259,11 +262,8 @@ async fn leaf_puts_overlap_within_the_store_window(#[case] write: LeafWrite) {
     let expected = match write {
         LeafWrite::Bootstrap => {
             let mut fragments: Vec<_> = (0..FRAGMENTS).map(make_fragment).collect();
-            let (_, snapshot, _) = FragmentTree::bootstrap_snapshot(
-                store,
-                fixture.base.clone(),
-                fixture.scheduler.clone(),
-                Arc::new(LanceCache::with_capacity(0)),
+            let (tree, _) = FragmentTree::bootstrap_snapshot(
+                TreeContext::new(store, fixture.base.clone(), fixture.scheduler.clone()),
                 fixture.config.clone(),
                 &mut fragments,
                 1,
@@ -272,7 +272,7 @@ async fn leaf_puts_overlap_within_the_store_window(#[case] write: LeafWrite) {
             .await
             .unwrap();
             probe.assert_every_put_landed();
-            fixture.snapshot = snapshot;
+            fixture.tree = tree;
             fragments
         }
         LeafWrite::Commit(commit) => {
@@ -281,7 +281,7 @@ async fn leaf_puts_overlap_within_the_store_window(#[case] write: LeafWrite) {
             fixture.commit(actions, policy, bulk).await;
             probe.assert_every_put_landed();
             assert_eq!(fixture.tree.materialize().await.unwrap(), expected);
-            fixture.tree.verify_watermarks().await.unwrap();
+            fixture.tree.validate().await.unwrap();
             expected
         }
     };
@@ -301,7 +301,7 @@ async fn leaf_puts_overlap_within_the_store_window(#[case] write: LeafWrite) {
         probe.assert_no_parent_put_overlapped_a_leaf_put();
     }
     let reopened = fixture
-        .open(&fixture.snapshot, fixture.tree.version())
+        .open(&fixture.tree.descriptor, fixture.tree.version())
         .await;
     assert_eq!(reopened.materialize().await.unwrap(), expected);
 }
@@ -323,9 +323,9 @@ async fn bulk_keeps_key_order_when_later_leaf_puts_finish_first() {
     );
     let shape = fixture.tree.shape_report().await.unwrap();
     assert!(shape.leaf_keys.len() >= 16, "{shape:?}");
-    fixture.tree.verify_watermarks().await.unwrap();
+    fixture.tree.validate().await.unwrap();
     assert_eq!(fixture.tree.materialize().await.unwrap(), expected);
-    let reopened = fixture.open(&fixture.snapshot, 2).await;
+    let reopened = fixture.open(&fixture.tree.descriptor, 2).await;
     assert_eq!(reopened.materialize().await.unwrap(), expected);
 }
 
@@ -342,10 +342,9 @@ async fn bulk_leaf_put_failure_keeps_the_previous_version(
     let policy = SnapshotPolicy::default();
     let (mut fixture, smallest_leaf) = height_two_fixture().await;
     let original = fixture.tree.materialize().await.unwrap();
-    let previous = fixture.snapshot.clone();
+    let previous = fixture.tree.descriptor.clone();
     let (actions, expected, _) = leaf_commit(LeafCommit::BulkMerge, smallest_leaf);
     let ids: Vec<_> = actions.iter().filter_map(action::target_frag_id).collect();
-    let touched = fixture.tree.resolve_touched_for_bulk(&ids).await.unwrap();
     let failpoint = FailpointController::default();
     failpoint.arm(Failpoint {
         on: FailOn::Put,
@@ -356,40 +355,33 @@ async fn bulk_leaf_put_failure_keeps_the_previous_version(
     let mut store = fixture.store.as_ref().clone();
     store.apply_wrapper(&failpoint);
     fixture.tree = fixture.tree.with_object_store(Arc::new(store));
-    let error = fixture
-        .tree
-        .prepare_snapshot(
-            ValidatedCommit::fragment_actions(actions.clone()),
-            &touched,
-            &previous,
-            policy,
-            true,
-        )
+    let mut transaction = fixture.tree.begin_commit(CommitMode::Bulk);
+    transaction.resolve_touched(&ids).await.unwrap();
+    let error = transaction
+        .prepare(ValidatedCommit::fragment_actions(actions.clone()), policy)
         .await
-        .unwrap_err();
+        .err()
+        .expect("preparation must fail");
     assert!(matches!(error, Error::IO { .. }), "{error}");
     assert!(error.to_string().contains("failpoint"), "{error}");
     assert!(failpoint.tripped());
     assert_eq!(fixture.tree.version(), 1);
+    assert_eq!(fixture.tree.descriptor, previous);
     assert_eq!(fixture.tree.root_buffer_len(), 0);
     assert_eq!(fixture.tree.materialize().await.unwrap(), original);
 
     failpoint.disarm();
-    let (snapshot, _) = fixture
-        .tree
-        .prepare_snapshot(
-            ValidatedCommit::fragment_actions(actions),
-            &touched,
-            &previous,
-            policy,
-            true,
-        )
+    let mut transaction = fixture.tree.begin_commit(CommitMode::Bulk);
+    transaction.resolve_touched(&ids).await.unwrap();
+    let (prepared, _) = transaction
+        .prepare(ValidatedCommit::fragment_actions(actions), policy)
         .await
         .unwrap();
-    assert_eq!(fixture.tree.materialize().await.unwrap(), expected);
+    assert_eq!(fixture.tree.materialize().await.unwrap(), original);
+    assert_eq!(prepared.materialize().await.unwrap(), expected);
     assert_eq!(
         fixture
-            .open(&snapshot, 2)
+            .open(&prepared.descriptor, 2)
             .await
             .materialize()
             .await

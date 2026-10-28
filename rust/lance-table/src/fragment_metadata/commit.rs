@@ -15,7 +15,7 @@ use crate::fragment_metadata::action;
 use lance_core::{Error, Result};
 use object_store::path::Path;
 
-/// The current state of the fragments one commit touches, and nothing else.
+/// Fragment state resolved from a snapshot, including known absent IDs.
 ///
 /// `ids` records every id that was resolved, so an id that is absent from
 /// `fragments` is known to be missing rather than unresolved. A commit may
@@ -52,12 +52,39 @@ impl ValidatedCommit {
             fragment_actions,
         }
     }
+
+    /// Advance the allocation frontier past upserts and explicit reservations.
+    /// Aggregate validation has already checked the upserted fragment IDs.
+    pub(super) fn allocation_frontier(&self, current: u64) -> Result<u64> {
+        let mut frontier = current;
+        for action in &self.fragment_actions {
+            if let Some(Action::UpsertFragment(fragment)) = &action.action {
+                let next = fragment.id.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input(format!("Fragment ID {} leaves no next ID", fragment.id))
+                })?;
+                frontier = frontier.max(next);
+            }
+        }
+        if let Some(next) = self.next_fragment_id {
+            if next < frontier || next > u64::from(u32::MAX) + 1 {
+                return Err(Error::invalid_input(format!(
+                    "Fragment ID frontier {next} must be between {frontier} and 2^32"
+                )));
+            }
+            frontier = next;
+        }
+        Ok(frontier)
+    }
 }
 
 /// Encode a data replacement with matching fields and file version, or a file
-/// addition with disjoint fields. Partial overlaps are not supported here.
-/// Callers handling them must derive the final fragment and use an upsert.
-/// Missing fragments and unchanged replacements return an error.
+/// addition with disjoint fields, as file actions. Missing fragments and
+/// unchanged replacements return an error, and so does a replacement file
+/// actions cannot express. That is a partial field overlap, a fragment that
+/// repeats a file path, a rename onto a path another matching file holds, or
+/// an overlay on a replaced field, which only the transaction's read version
+/// can resolve. Callers handling those must derive the final fragment and use
+/// an upsert.
 pub fn data_replacement(
     current: Option<&Fragment>,
     fragment_id: u64,
@@ -68,6 +95,28 @@ pub fn data_replacement(
             "DataReplacement targets fragment {fragment_id} which does not exist"
         ))
     })?;
+    let inexpressible = |reason: &str| {
+        Error::invalid_input(format!(
+            "DataReplacement for fragment {fragment_id} cannot be encoded as file actions: \
+             {reason}, replacement {}",
+            replacement.path
+        ))
+    };
+    let mut paths = BTreeSet::new();
+    if fragment.files.iter().any(|file| !paths.insert(&file.path)) {
+        return Err(inexpressible("the fragment repeats a data file path"));
+    }
+    // An overlay committed after the transaction read its fragment outlives
+    // the replacement, and one committed before does not.
+    if fragment.overlays.iter().any(|overlay| {
+        overlay
+            .data_file
+            .fields
+            .iter()
+            .any(|field| *field >= 0 && replacement.fields.contains(field))
+    }) {
+        return Err(inexpressible("an overlay covers a replaced field"));
+    }
     let matching: Vec<&DataFile> = fragment
         .files
         .iter()
@@ -77,24 +126,7 @@ pub fn data_replacement(
                 && file.file_minor_version == replacement.file_minor_version
         })
         .collect();
-    let actions = if !matching.is_empty() {
-        let unchanged = matching.iter().all(|file| {
-            file.path == replacement.path
-                && file.file_size_bytes == replacement.file_size_bytes
-                && file.base_id == replacement.base_id
-        });
-        if unchanged {
-            return Err(Error::invalid_input(format!(
-                "DataReplacement for fragment {fragment_id} made no changes: the replacement \
-                 matches the existing data file {} exactly",
-                replacement.path
-            )));
-        }
-        matching
-            .iter()
-            .map(|file| action::replace_data_file(fragment_id, &file.path, replacement))
-            .collect::<Vec<_>>()
-    } else {
+    if matching.is_empty() {
         let covered = fragment
             .files
             .iter()
@@ -107,45 +139,29 @@ pub fn data_replacement(
                 replacement.fields
             )));
         }
-        vec![action::add_data_file(fragment_id, replacement)]
-    };
-
-    let mut paths = BTreeSet::new();
-    let aliases = fragment.files.iter().any(|file| !paths.insert(&file.path));
-    let rename_collision =
-        matching.len() > 1 && matching.iter().any(|file| file.path == replacement.path);
-    let mut overlays = fragment.overlays.clone();
-    let fields: Vec<u32> = replacement
-        .fields
+        return Ok(vec![action::add_data_file(fragment_id, replacement)]);
+    }
+    let unchanged = matching.iter().all(|file| {
+        file.path == replacement.path
+            && file.file_size_bytes == replacement.file_size_bytes
+            && file.base_id == replacement.base_id
+    });
+    if unchanged {
+        return Err(Error::invalid_input(format!(
+            "DataReplacement for fragment {fragment_id} made no changes: the replacement \
+             matches the existing data file {} exactly",
+            replacement.path
+        )));
+    }
+    if matching.len() > 1 && matching.iter().any(|file| file.path == replacement.path) {
+        return Err(inexpressible(
+            "another matching file already holds the replacement path",
+        ));
+    }
+    Ok(matching
         .iter()
-        .filter_map(|field| u32::try_from(*field).ok())
-        .collect();
-    crate::format::overlay::tombstone_overlay_fields(&mut overlays, &fields);
-    if overlays == fragment.overlays && !(aliases || rename_collision) {
-        return Ok(actions);
-    }
-
-    // Validation selects by fields/version, while a storage replacement selects
-    // by first path. A whole-state update retains that decision when aliases,
-    // rename collisions, or overlay tombstones cannot be expressed by the
-    // smaller location-only action language.
-    let mut updated = fragment.clone();
-    updated.overlays = overlays;
-    if matching.is_empty() {
-        updated.files.push(replacement.clone());
-    } else {
-        for file in &mut updated.files {
-            if file.fields == replacement.fields
-                && file.file_major_version == replacement.file_major_version
-                && file.file_minor_version == replacement.file_minor_version
-            {
-                file.path = replacement.path.clone();
-                file.file_size_bytes = replacement.file_size_bytes.clone();
-                file.base_id = replacement.base_id;
-            }
-        }
-    }
-    Ok(vec![action::upsert_fragment(&updated)])
+        .map(|file| action::replace_data_file(fragment_id, &file.path, replacement))
+        .collect())
 }
 
 /// Validate action targets and derive their fragment and row-count deltas.
@@ -214,47 +230,15 @@ pub(crate) fn aggregate_deltas(
             });
             continue;
         }
-        // A record no later action edits contributes only its counts, so it
-        // is not decoded here. Its files are checked encoded for the same
-        // reason as an appended file above.
-        if let Some(Action::UpsertFragment(record)) = &fragment_action.action
-            && last_for_fragment
-        {
-            let overlay_files = record
-                .overlays
-                .iter()
-                .filter_map(|overlay| overlay.data_file.as_ref());
-            for file in record.files.iter().chain(overlay_files) {
-                file.validate(base)?;
-            }
-            if fresh_append {
-                created.insert(fragment_id);
-            }
-            let (physical, visible) = upserted_counts(record)?;
-            deltas.push(ActionDeltas {
-                fragment_count: 1 - before.0,
-                physical_rows: physical - before.1,
-                visible_rows: visible - before.2,
-            });
-            continue;
-        }
-        // Applying an overcounted deletion fails as corrupt stored metadata,
-        // which is right on replay. Here the stored record is intact and the
-        // commit is wrong, so it is refused as input first.
-        if let Some(Action::AddDeletionFile(add)) = &fragment_action.action
-            && let Some(deletion_file) = &add.deletion_file
-            && let Some(rows) = snapshot
-                .get(&fragment_id)
-                .and_then(|fragment| fragment.physical_rows)
-            && deletion_file.num_deleted_rows > rows as u64
-        {
-            return Err(Error::invalid_input(format!(
-                "fragment {fragment_id} has {} deleted rows but only {rows} physical rows",
-                deletion_file.num_deleted_rows
-            )));
-        }
-        crate::fragment_metadata::node::apply_actions(
-            snapshot.to_mut(),
+        // A record no later action edits replaces its fragment whole, so it
+        // is decoded on its own instead of into a copy of the resolved records.
+        let mut replacement = BTreeMap::new();
+        let state = match &fragment_action.action {
+            Some(Action::UpsertFragment(_)) if last_for_fragment => &mut replacement,
+            _ => snapshot.to_mut(),
+        };
+        crate::fragment_metadata::content::apply_actions(
+            state,
             vec![pb::FragmentTreeMutation {
                 action_sequence: offset as u64,
                 action: Some(fragment_action.clone()),
@@ -266,7 +250,7 @@ pub(crate) fn aggregate_deltas(
         if fresh_append {
             created.insert(fragment_id);
         }
-        let after = snapshot.get(&fragment_id);
+        let after = state.get(&fragment_id);
         if let Some(after) = after {
             require_storable(after, base)?;
         }
@@ -279,31 +263,32 @@ pub(crate) fn aggregate_deltas(
     Ok(deltas)
 }
 
-/// Physical and visible rows of an upserted record, checked as decoding it
-/// checks them. Counts in the tree format are always known, including zero.
-fn upserted_counts(record: &pb::DataFragment) -> Result<(i64, i64)> {
-    let deleted = record
-        .deletion_file
-        .as_ref()
-        .map_or(0, |file| file.num_deleted_rows);
-    if record.id > u64::from(u32::MAX) || deleted > record.physical_rows {
-        return Err(Error::invalid_input(format!(
-            "fragment {} has physical_rows={}, deleted_rows={deleted}",
-            record.id, record.physical_rows,
-        )));
+/// Validate an initial inventory and return its allocation frontier, physical
+/// row total, and visible row total. No tree objects are written on failure.
+pub(super) fn validate_bootstrap(fragments: &[Fragment], base: &Path) -> Result<(u64, u64, u64)> {
+    let mut total_rows = 0u64;
+    let mut visible_rows = 0u64;
+    let mut next_fragment_id = 0u64;
+    for f in fragments {
+        next_fragment_id = next_fragment_id.max(f.id.checked_add(1).ok_or_else(|| {
+            Error::invalid_input(format!("Fragment ID {} leaves no next ID", f.id))
+        })?);
+        require_storable(f, base)?;
+        visible_rows = visible_rows
+            .checked_add(f.num_rows().unwrap_or(0) as u64)
+            .ok_or_else(|| {
+                Error::invalid_input(format!("Visible row count overflow at fragment {}", f.id))
+            })?;
+        total_rows = total_rows
+            .checked_add(f.physical_rows.unwrap_or(0) as u64)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "fragment metadata tree total_rows overflow while bootstrapping fragment id={}",
+                    f.id
+                ))
+            })?;
     }
-    let rows = |count: u64| {
-        i64::try_from(count).map_err(|_| {
-            Error::invalid_input(format!(
-                "fragment {} row count does not fit aggregate delta: {count}",
-                record.id
-            ))
-        })
-    };
-    Ok((
-        rows(record.physical_rows)?,
-        rows(record.physical_rows - deleted)?,
-    ))
+    Ok((next_fragment_id, total_rows, visible_rows))
 }
 
 /// Require known physical and deletion counts for exact row aggregates, and
@@ -315,20 +300,7 @@ pub(crate) fn require_storable(fragment: &Fragment, base: &Path) -> Result<()> {
             fragment.id
         )));
     }
-    if fragment.physical_rows.is_none() {
-        return Err(Error::invalid_input(format!(
-            "fragment {} has no physical row count; the fragment metadata tree requires known counts",
-            fragment.id
-        )));
-    }
-    if let Some(deletion_file) = &fragment.deletion_file
-        && deletion_file.num_deleted_rows.is_none()
-    {
-        return Err(Error::invalid_input(format!(
-            "fragment {} has a deletion file without a deleted-row count; the fragment metadata tree requires known counts",
-            fragment.id
-        )));
-    }
+    action::require_known_counts(fragment)?;
     if let (Some(rows), Some(deleted)) = (
         fragment.physical_rows,
         fragment
@@ -399,6 +371,7 @@ mod tests {
     use crate::fragment_metadata::support::{
         make_backfill_data_file, make_fragment, make_replacement_data_file,
     };
+    use rstest::rstest;
 
     #[test]
     fn data_replacement_encodes_matching_or_disjoint_fields() {
@@ -415,6 +388,17 @@ mod tests {
             }
             other => panic!("expected ReplaceDataFile, got {other:?}"),
         }
+
+        // File actions match by first path, so duplicate paths need a whole
+        // record from the caller.
+        let mut aliased = fragment.clone();
+        aliased.files.push(aliased.files[0].clone());
+        let error = data_replacement(Some(&aliased), 7, &matching).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("repeats a data file path"),
+            "{error}"
+        );
 
         // Disjoint fields: the all-NULL add-column case appends verbatim.
         let disjoint = make_backfill_data_file(7, 0);
@@ -529,7 +513,7 @@ mod tests {
         assert!(error.to_string().contains("without resolving"), "{error}");
 
         let error = aggregate_deltas(
-            &[action::upsert_fragment(&make_fragment(3))],
+            &[action::upsert_fragment(&make_fragment(3)).unwrap()],
             &touched,
             10,
             &Path::default(),
@@ -538,7 +522,7 @@ mod tests {
         assert!(error.to_string().contains("without resolving"), "{error}");
 
         let deltas = aggregate_deltas(
-            &[action::upsert_fragment(&make_fragment(10))],
+            &[action::upsert_fragment(&make_fragment(10)).unwrap()],
             &touched,
             10,
             &Path::default(),
@@ -549,14 +533,9 @@ mod tests {
         assert_eq!(deltas[0].physical_rows, 1);
         assert_eq!(deltas[0].visible_rows, 1);
 
-        // The writer invariant: unknown counts are rejected at the door.
-        let mut unknown_physical = make_fragment(10);
-        unknown_physical.physical_rows = None;
-        let error = require_storable(&unknown_physical, &Path::default()).unwrap_err();
-        assert!(error.to_string().contains("physical row count"), "{error}");
         let empty = make_fragment(10).with_physical_rows(0);
         let deltas = aggregate_deltas(
-            &[action::upsert_fragment(&empty)],
+            &[action::upsert_fragment(&empty).unwrap()],
             &touched,
             10,
             &Path::default(),
@@ -588,10 +567,13 @@ mod tests {
         let cases = [
             (action::add_data_file(3, &appended), appended.path.clone()),
             (
-                action::upsert_fragment(&upserted),
+                action::upsert_fragment(&upserted).unwrap(),
                 upserted.files[0].path.clone(),
             ),
-            (action::upsert_fragment(&overlaid), appended.path.clone()),
+            (
+                action::upsert_fragment(&overlaid).unwrap(),
+                appended.path.clone(),
+            ),
         ];
 
         for (fragment_action, path) in cases {
@@ -610,13 +592,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn aggregate_deltas_rejects_an_overcounted_deletion_as_invalid_input() {
-        let touched = TouchedFragments {
-            ids: BTreeSet::from([7]),
-            fragments: BTreeMap::from([(7, make_fragment(7).with_physical_rows(2))]),
-        };
-        let overcount = pb::FragmentAction {
+    /// The resolved record is intact, so input it cannot take is the caller's
+    /// error, not corrupt metadata.
+    #[rstest]
+    #[case::overcounted_deletion(
+        pb::FragmentAction {
             action: Some(Action::AddDeletionFile(pb::AddDeletionFile {
                 frag_id: 7,
                 deletion_file: Some(pb::DeletionFile {
@@ -627,16 +607,26 @@ mod tests {
                     base_id: None,
                 }),
             })),
+        },
+        "fragment 7 has 3 deleted rows but only 2 physical rows"
+    )]
+    #[case::replacement_of_an_absent_file(
+        action::replace_data_file(7, "data/absent.lance", &make_replacement_data_file(7, 0)),
+        "data/absent.lance"
+    )]
+    fn aggregate_deltas_rejects_input_the_resolved_record_cannot_take(
+        #[case] fragment_action: pb::FragmentAction,
+        #[case] expected: &str,
+    ) {
+        let touched = TouchedFragments {
+            ids: BTreeSet::from([7]),
+            fragments: BTreeMap::from([(7, make_fragment(7).with_physical_rows(2))]),
         };
 
-        let error = aggregate_deltas(&[overcount], &touched, 10, &Path::default()).unwrap_err();
+        let error =
+            aggregate_deltas(&[fragment_action], &touched, 10, &Path::default()).unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains("fragment 7 has 3 deleted rows but only 2 physical rows"),
-            "{error}"
-        );
+        assert!(error.to_string().contains(expected), "{error}");
     }
 }

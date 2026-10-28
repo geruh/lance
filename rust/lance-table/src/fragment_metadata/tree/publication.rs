@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::format::pb::fragment_tree::Root;
-use crate::fragment_metadata::store::NodeLocation;
+use crate::fragment_metadata::store::{NodeLocation, inherit_refs, root_path, stamp_unset_base_id};
 
 /// Publication byte budgets, independent of leaf and semantic-buffer budgets.
 #[derive(Debug, Clone, Copy)]
@@ -33,18 +33,107 @@ struct RootRouting {
     buffer: Vec<pb::FragmentTreeMutation>,
 }
 
-impl FragmentTree {
-    /// Resolve validation state while retaining complete leaf reads on local
-    /// scratch storage for a subsequent bulk materialization. Scratch is owned
-    /// by this writer and never referenced by a published snapshot. Repeated
-    /// calls before [`Self::prepare_snapshot`] share one set of retained reads.
-    pub async fn resolve_touched_for_bulk(&mut self, ids: &[u64]) -> Result<TouchedFragments> {
-        self.store.retain_validation_reads()?;
-        self.resolve_touched(ids).await
-    }
+/// The root a descriptor names, checked, with the version totals it derives
+/// from the root and `mutations_since_root`.
+pub(super) struct CheckedRoot {
+    pub(super) root: pb::FragmentTreeRoot,
+    pub(super) total_fragments: u64,
+    pub(super) total_rows: u64,
+    pub(super) visible_rows: u64,
+}
 
+/// Read the root `snapshot` names and run every descriptor check, before
+/// opening squashes the root buffer and suffix together.
+pub(super) async fn checked_root(
+    store: &NodeStore,
+    snapshot: &pb::FragmentTree,
+    version: u64,
+    next_fragment_id: u64,
+) -> Result<CheckedRoot> {
+    let root = match &snapshot.root {
+        Some(Root::InlineRoot(root)) if snapshot.mutations_since_root.is_empty() => root.clone(),
+        Some(Root::InlineRoot(_)) => {
+            return Err(Error::invalid_input(format!(
+                "fragment metadata tree version {version} has a suffix after an inline root"
+            )));
+        }
+        Some(Root::RootUuid(uuid)) => store.read_root_base(uuid).await?,
+        None => {
+            return Err(Error::invalid_input(format!(
+                "fragment metadata tree version {version} has no root base"
+            )));
+        }
+    };
+    let (base_fragments, base_rows, base_visible_rows) =
+        super::super::validation::root(&root, next_fragment_id)?;
+    super::super::validation::buffer(
+        &snapshot.mutations_since_root,
+        root.next_action_sequence,
+        snapshot.next_action_sequence,
+    )?;
+    if next_fragment_id > u64::from(u32::MAX) + 1 {
+        return Err(super::super::validation::corrupt(format!(
+            "Invalid snapshot allocation frontier at version {version}"
+        )));
+    }
+    super::super::validation::allocated_ids(
+        snapshot
+            .mutations_since_root
+            .iter()
+            .map(content::action_key),
+        next_fragment_id,
+        format_args!("mutations_since_root at version {version}"),
+    )?;
+    if snapshot.next_action_sequence < root.next_action_sequence {
+        return Err(Error::invalid_input(format!(
+            "fragment metadata tree version {version} has next_action_sequence {} below the root's {}",
+            snapshot.next_action_sequence, root.next_action_sequence
+        )));
+    }
+    // Mutations may be serialized in any order, so each column is summed
+    // before it is applied, as buffers sum theirs.
+    let suffix = &snapshot.mutations_since_root;
+    let total_fragments = apply_aggregate_delta(
+        base_fragments,
+        sum_aggregate_deltas(
+            suffix.iter().map(|action| action.fragment_count_delta),
+            "Fragments",
+        )?,
+        "Fragments",
+    )?;
+    let total_rows = apply_aggregate_delta(
+        base_rows,
+        sum_aggregate_deltas(
+            suffix.iter().map(|action| action.total_rows_delta),
+            "physical rows",
+        )?,
+        "physical rows",
+    )?;
+    let visible_rows = apply_aggregate_delta(
+        base_visible_rows,
+        sum_aggregate_deltas(
+            suffix.iter().map(|action| action.visible_rows_delta),
+            "visible rows",
+        )?,
+        "visible rows",
+    )?;
+    if visible_rows > total_rows {
+        return Err(super::super::validation::corrupt(format!(
+            "Derived visible rows {visible_rows} exceed physical rows {total_rows} at version {version}"
+        )));
+    }
+    Ok(CheckedRoot {
+        root,
+        total_fragments,
+        total_rows,
+        visible_rows,
+    })
+}
+
+impl FragmentTree {
     /// Immutable node paths required by this snapshot. Root bases and
     /// mutations_since_root belong to the manifest descriptor.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn node_paths(&self) -> Result<Vec<String>> {
         Ok(self
             .resolved_node_paths()
@@ -54,64 +143,62 @@ impl FragmentTree {
             .collect())
     }
 
-    /// Node paths owned by this dataset, for local retention cleanup.
-    /// Foreign nodes are traversed but are not local GC roots.
+    /// Paths of the objects this snapshot needs that live in the dataset at
+    /// `base` on `store`. Interior and leaf nodes are listed where their
+    /// reference resolves, whichever base id names it. The external root is
+    /// listed only for this snapshot's own dataset, because a root is read
+    /// and written only there. A branch reads its source's nodes in place, so
+    /// asking with the source's location lists what the branch keeps alive in
+    /// the source, and asking with the branch's location lists only the
+    /// branch's own objects.
     ///
     /// ```
-    /// # use lance_core::Result;
-    /// # use lance_table::fragment_metadata::FragmentTree;
-    /// # async fn example(tree: &FragmentTree) -> Result<()> {
-    /// let retained_nodes = tree.local_node_paths().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn local_node_paths(&self) -> Result<Vec<String>> {
-        let store = self.store.object_store.clone();
-        self.node_paths_owned_by(&store, self.store.base()).await
-    }
-
-    /// Node paths that resolve into the dataset at `base` on `store`,
-    /// whichever base id names it from this tree. A shallow clone or branch
-    /// reads its source's leaves and interior nodes in place, so the source's
-    /// cleanup keeps every node one of its clones still reaches through this.
-    /// Nodes owned by any other dataset are traversed and left out.
-    ///
-    /// ```
+    /// # use std::sync::Arc;
     /// # use lance_core::Result;
     /// # use lance_io::object_store::ObjectStore;
     /// # use lance_table::fragment_metadata::FragmentTree;
     /// # use object_store::path::Path;
-    /// # use std::sync::Arc;
-    /// # async fn example(
-    /// #     branch_tree: &FragmentTree,
-    /// #     source_store: &Arc<ObjectStore>,
-    /// #     source_base: &Path,
-    /// # ) -> Result<()> {
-    /// let retained_by_source = branch_tree
-    ///     .node_paths_owned_by(source_store, source_base)
-    ///     .await?;
+    /// # async fn example(tree: &FragmentTree, store: &Arc<ObjectStore>, base: &Path) -> Result<()> {
+    /// let retained = tree.object_paths_owned_by(store, base).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn node_paths_owned_by(
+    pub async fn object_paths_owned_by(
         &self,
         store: &Arc<ObjectStore>,
         base: &Path,
     ) -> Result<Vec<String>> {
         let mut owned = Vec::new();
+        if let Some(root) = self.root_object_path()? {
+            let own =
+                self.store
+                    .location_under(&self.store.object_store, self.store.base(), &root)?;
+            if own == self.store.location_under(store, base, &root)? {
+                owned.push(root);
+            }
+        }
         for (path, location) in self.resolved_node_paths().await? {
             if location == self.store.location_under(store, base, &path)? {
                 owned.push(path);
             }
         }
+        owned.sort();
         Ok(owned)
     }
 
+    fn root_object_path(&self) -> Result<Option<String>> {
+        match &self.descriptor.root {
+            Some(Root::RootUuid(uuid)) => Ok(Some(root_path(uuid)?)),
+            Some(Root::InlineRoot(_)) | None => Ok(None),
+        }
+    }
+
     async fn resolved_node_paths(&self) -> Result<Vec<(String, NodeLocation)>> {
-        let mut pending = self.children.clone();
+        let mut pending: Vec<_> =
+            node::with_exclusive_ends(self.children.clone(), self.next_fragment_id).collect();
         let mut locations = std::collections::BTreeSet::new();
         let mut paths = Vec::new();
-        while let Some(child) = pending.pop() {
+        while let Some((child, end)) = pending.pop() {
             let location = self.store.child_location(&child)?;
             if !locations.insert(location.clone()) {
                 return Err(Error::invalid_input(format!(
@@ -119,139 +206,102 @@ impl FragmentTree {
                     self.version, child.path, child.base_id
                 )));
             }
-            paths.push((child.path.clone(), location));
             if child.height > 0 {
-                pending.extend(self.store.read_internal(&child).await?.children);
+                // Cleanup lists every retained version, and versions share
+                // most interiors, so listing reads them through the cache
+                // their walks use.
+                let interior = self.store.read_internal_shared(&child, end).await?;
+                pending.extend(node::with_exclusive_ends(
+                    interior.node.children.clone(),
+                    end,
+                ));
             }
+            paths.push((child.path, location));
         }
         paths.sort();
         Ok(paths)
     }
 
     /// Build immutable leaves and routing without publishing a version.
-    /// Publish the returned snapshot through the dataset's Version Manifest.
+    /// Publish the returned tree's descriptor through the dataset's Version Manifest.
     /// A failed publication leaves only unreachable immutable objects.
-    /// `fragments` is left sorted by id, so a caller that keeps it holds the
-    /// published list without reading the leaves back.
-    #[allow(clippy::too_many_arguments)]
+    /// `fragments` is left sorted by id and without metadata size hints, so a
+    /// caller that keeps it holds the published list without reading the
+    /// leaves back.
     pub async fn bootstrap_snapshot(
-        object_store: Arc<ObjectStore>,
-        base: Path,
-        scheduler: Arc<ScanScheduler>,
-        cache: Arc<LanceCache>,
+        context: TreeContext,
         config: FragmentTreeConfig,
         fragments: &mut [Fragment],
         version: u64,
         policy: SnapshotPolicy,
-    ) -> Result<(Self, pb::FragmentTree, BootstrapStats)> {
+    ) -> Result<(Self, BootstrapStats)> {
         fragments.sort_by_key(|fragment| fragment.id);
+        for fragment in fragments.iter_mut() {
+            content::clear_metadata_size_hints(fragment);
+        }
         if fragments.windows(2).any(|pair| pair[0].id == pair[1].id) {
             return Err(Error::invalid_input(
                 "fragment metadata tree bootstrap contains duplicate fragment IDs",
             ));
         }
-        let store = NodeStore::new(object_store, base, scheduler, cache);
-        let (mut tree, mut stats) = Self::build(store, config, fragments).await?;
-        tree.version = version;
-        let (snapshot, bytes) = tree.checkpoint_snapshot(policy).await?;
-        tree.snapshot = Some(Box::new(snapshot.clone()));
-        stats.io_write_bytes += bytes;
-        Ok((tree, snapshot, stats))
+        let store = context.into_store(&config, 1);
+        Self::build(store, config, fragments, version, policy).await
+    }
+
+    /// Bootstrap an eager snapshot, retaining the same owned records written to leaves.
+    /// Use [`Self::bootstrap_snapshot`] when the caller does not need residency.
+    ///
+    /// ```
+    /// # use lance_table::{format::Fragment, fragment_metadata::{
+    /// #     FragmentTree, FragmentTreeConfig, SnapshotPolicy, TreeContext,
+    /// # }};
+    /// # async fn example(context: TreeContext, fragments: Vec<Fragment>) -> lance_core::Result<()> {
+    /// let (tree, stats) = FragmentTree::bootstrap_resident_snapshot(
+    ///     context, FragmentTreeConfig::default(), fragments, 1, SnapshotPolicy::default(),
+    /// ).await?;
+    /// assert!(tree.resident_fragments().is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn bootstrap_resident_snapshot(
+        context: TreeContext,
+        config: FragmentTreeConfig,
+        mut fragments: Vec<Fragment>,
+        version: u64,
+        policy: SnapshotPolicy,
+    ) -> Result<(Self, BootstrapStats)> {
+        let (mut tree, stats) =
+            Self::bootstrap_snapshot(context, config, &mut fragments, version, policy).await?;
+        tree.resident = Some(Arc::new(fragments));
+        Ok((tree, stats))
     }
 
     /// Open fragment state using only a manifest descriptor and its named base.
     /// `version` comes from that same authoritative manifest.
-    #[allow(clippy::too_many_arguments)]
     pub async fn open_snapshot(
-        object_store: Arc<ObjectStore>,
-        base: Path,
-        scheduler: Arc<ScanScheduler>,
-        cache: Arc<LanceCache>,
+        context: TreeContext,
         snapshot: &pb::FragmentTree,
         version: u64,
         config: FragmentTreeConfig,
         next_fragment_id: u64,
     ) -> Result<Self> {
-        let mut store = NodeStore::new(object_store, base, scheduler, cache);
-        store.next_action_sequence = snapshot.next_action_sequence;
-        let root = match &snapshot.root {
-            Some(Root::InlineRoot(root)) if snapshot.mutations_since_root.is_empty() => {
-                root.clone()
-            }
-            Some(Root::InlineRoot(_)) => {
-                return Err(Error::invalid_input(format!(
-                    "fragment metadata tree version {version} has a suffix after an inline root"
-                )));
-            }
-            Some(Root::RootUuid(uuid)) => store.read_root_base(uuid).await?,
-            None => {
-                return Err(Error::invalid_input(format!(
-                    "fragment metadata tree version {version} has no root base"
-                )));
-            }
-        };
-        let (base_fragments, base_rows, base_visible_rows) =
-            super::super::validation::root(&root, next_fragment_id)?;
-        store.hard_capacity_bytes = config.hard_capacity_bytes;
-        super::super::validation::buffer(
-            &snapshot.mutations_since_root,
-            root.next_action_sequence,
-            snapshot.next_action_sequence,
-        )?;
-        if next_fragment_id > u64::from(u32::MAX) + 1
-            || snapshot
-                .mutations_since_root
-                .iter()
-                .any(|tagged| node::action_key(tagged) >= next_fragment_id)
-        {
-            return Err(super::super::validation::corrupt(format!(
-                "Invalid snapshot allocation frontier at version {version}"
-            )));
-        }
-        if snapshot.next_action_sequence < root.next_action_sequence {
-            return Err(Error::invalid_input(format!(
-                "fragment metadata tree version {version} has next_action_sequence {} below the root's {}",
-                snapshot.next_action_sequence, root.next_action_sequence
-            )));
-        }
-        if snapshot.mutations_since_root.iter().any(|action| {
-            action.action_sequence < root.next_action_sequence
-                || action.action_sequence >= snapshot.next_action_sequence
-        }) {
-            return Err(Error::invalid_input(format!(
-                "fragment metadata tree version {version} mutations_since_root crosses its root action sequence frontier"
-            )));
-        }
-        let total_fragments = snapshot
-            .mutations_since_root
-            .iter()
-            .try_fold(base_fragments, |value, action| {
-                apply_aggregate_delta(value, action.fragment_count_delta, "Fragments")
-            })?;
-        let total_rows = snapshot
-            .mutations_since_root
-            .iter()
-            .try_fold(base_rows, |value, action| {
-                apply_aggregate_delta(value, action.total_rows_delta, "physical rows")
-            })?;
-        let visible_rows = snapshot
-            .mutations_since_root
-            .iter()
-            .try_fold(base_visible_rows, |value, action| {
-                apply_aggregate_delta(value, action.visible_rows_delta, "visible rows")
-            })?;
-        if visible_rows > total_rows {
-            return Err(super::super::validation::corrupt(format!(
-                "Derived visible rows {visible_rows} exceed physical rows {total_rows} at version {version}"
-            )));
-        }
+        config.validate()?;
+        let mut store = context.into_store(&config, snapshot.next_action_sequence);
+        let CheckedRoot {
+            root,
+            total_fragments,
+            total_rows,
+            visible_rows,
+        } = checked_root(&store, snapshot, version, next_fragment_id).await?;
+        // Interiors below the root were written before it, so the format
+        // bounds them by its frontier, as validate does.
+        store.next_action_sequence = root.next_action_sequence;
         let mut buffer = root.buffer;
         buffer.extend(snapshot.mutations_since_root.iter().cloned());
-        let buffer = node::squash_buffer(
+        let buffer = content::squash_buffer(
             buffer,
             node::combine_from(&root.children, root.next_action_sequence),
         );
-        config.validate()?;
         Ok(Self {
             store,
             config,
@@ -265,68 +315,34 @@ impl FragmentTree {
             total_rows,
             visible_rows,
             next_fragment_id,
-            force_flush: false,
-            snapshot: Some(Box::new(snapshot.clone())),
+            descriptor: Arc::new(snapshot.clone()),
+            resident: None,
         })
     }
 
-    /// Prepare a snapshot without publishing a version. An error or dropped future
-    /// leaves this tree's fragment state unchanged. Unreferenced objects written
-    /// during preparation remain until retention cleanup removes them.
-    pub async fn prepare_snapshot(
-        &mut self,
-        commit: ValidatedCommit,
-        touched: &TouchedFragments,
-        previous_snapshot: &pb::FragmentTree,
-        policy: SnapshotPolicy,
-        bulk: bool,
-    ) -> Result<(pb::FragmentTree, CommitStats)> {
-        if self.snapshot.as_deref() != Some(previous_snapshot) {
-            return Err(Error::invalid_input(format!(
-                "fragment metadata tree version {} received a descriptor from another validation state",
-                self.version
-            )));
-        }
-        let deltas = commit::aggregate_deltas(
-            &commit.fragment_actions,
-            touched,
-            self.next_fragment_id,
-            self.store.base(),
-        )?;
-        // Keep partial rewrites private if preparation fails or is cancelled.
-        let mut staged = self.clone();
-        self.store.clear_validation_reads();
-        let (snapshot, stats) = staged
-            .prepare_snapshot_inner(commit, deltas, previous_snapshot, policy, bulk)
-            .await?;
-        staged.force_flush = false;
-        staged.store.clear_validation_reads();
-        staged.snapshot = Some(Box::new(snapshot.clone()));
-        *self = staged;
-        Ok((snapshot, stats))
-    }
-
-    async fn prepare_snapshot_inner(
+    pub(super) async fn prepare_snapshot_inner(
         &mut self,
         commit: ValidatedCommit,
         deltas: Vec<commit::ActionDeltas>,
-        previous: &pb::FragmentTree,
         policy: SnapshotPolicy,
-        bulk: bool,
-    ) -> Result<(pb::FragmentTree, CommitStats)> {
+        mode: CommitMode,
+    ) -> Result<CommitStats> {
+        let previous = self.descriptor.clone();
         let tagged = self.stage_commit(commit, deltas)?;
         let messages_in = tagged.len() as u64;
         // Only an external root can publish this commit as a suffix, so only
         // then does the suffix need its own copy of the actions.
-        let suffix = (!bulk && matches!(&previous.root, Some(Root::RootUuid(_)))).then(|| {
+        let suffix = (mode == CommitMode::Incremental
+            && matches!(&previous.root, Some(Root::RootUuid(_))))
+        .then(|| {
             let mut suffix = previous.mutations_since_root.clone();
             suffix.extend(tagged.iter().cloned());
-            node::squash_buffer(suffix, self.contiguous_from)
+            content::squash_buffer(suffix, self.contiguous_from)
         });
         self.buffer_index.take();
         self.buffer.extend(tagged);
         let before = self.buffer.len();
-        self.buffer = node::squash_buffer(
+        self.buffer = content::squash_buffer(
             std::mem::take(&mut self.buffer),
             node::combine_from(&self.children, self.contiguous_from),
         );
@@ -335,28 +351,33 @@ impl FragmentTree {
             && !node::internal_overflows(&self.children, &self.buffer, &self.config)
             && node::internal_logical_bytes(&[], &suffix) <= policy.max_suffix_bytes as u64
         {
-            return Ok((
-                self.snapshot_descriptor(previous.root.clone(), suffix),
-                CommitStats {
-                    messages_in,
-                    messages_squashed: squashed as u64,
-                    height: self.height(),
-                    root_buffer_len: self.buffer.len() as u64,
-                    ..Default::default()
-                },
-            ));
-        }
-        self.force_flush = bulk;
-        // A collapse starts only where an ingested interior keeps a single
-        // interior child, which needs a root child at height two or more.
-        // Below that the buffered rewrite never falls back, so the saved
-        // copy of the whole buffer would go unused.
-        let before_rewrite =
-            (!bulk && self.children.iter().any(|child| child.height >= 2)).then(|| RootRouting {
-                children: self.children.clone(),
-                buffer: self.buffer.clone(),
+            self.descriptor = Arc::new(pb::FragmentTree {
+                root: previous.root.clone(),
+                mutations_since_root: suffix,
+                next_action_sequence: self.next_action_sequence,
             });
-        let mut acc = self.rewrite_tree().await?;
+            return Ok(CommitStats {
+                messages_in,
+                messages_squashed: squashed as u64,
+                height: self.height(),
+                root_buffer_len: self.buffer.len() as u64,
+                ..Default::default()
+            });
+        }
+        // A collapse starts where an ingested interior keeps a single
+        // interior child, or where the root keeps a lone interior with a
+        // single child. Over leaves the root flush stops once its buffer
+        // fits beside its references or is empty, so the root can always
+        // adopt a lone interior lifted from them. Without a root child above
+        // the leaves the rewrite never falls back, so the saved copy of the
+        // whole buffer would go unused.
+        let before_rewrite = (mode == CommitMode::Incremental
+            && self.children.iter().any(|child| child.height > 0))
+        .then(|| RootRouting {
+            children: self.children.clone(),
+            buffer: self.buffer.clone(),
+        });
+        let mut acc = self.rewrite_tree(mode).await?;
         if acc.collapses > 0 {
             let Some(before_rewrite) = before_rewrite else {
                 return Err(Error::internal(format!(
@@ -369,60 +390,99 @@ impl FragmentTree {
             self.buffer_index.take();
             self.children = before_rewrite.children;
             self.buffer = before_rewrite.buffer;
-            self.force_flush = true;
-            acc = self.rewrite_tree().await?;
+            acc = self.rewrite_tree(CommitMode::Bulk).await?;
         }
-        let (snapshot, bytes) = self.checkpoint_snapshot(policy).await?;
-        Ok((
-            snapshot,
-            CommitStats {
-                tree_write_bytes: acc.io_bytes + bytes,
-                messages_in,
-                messages_materialized: acc.materialized,
-                messages_squashed: squashed as u64 + acc.squashed,
-                flushes: acc.flushes,
-                splits: acc.splits,
-                merges: acc.merges,
-                max_flush_depth: acc.max_flush_depth,
-                height: self.height(),
-                root_buffer_len: self.buffer.len() as u64,
-                checkpoints: 1,
-            },
-        ))
+        let (descriptor, bytes) =
+            checkpoint(&self.store, &self.config, self.compacted_root(), policy).await?;
+        self.descriptor = Arc::new(descriptor);
+        // The new root bounds every interior below it, this commit's included.
+        self.store.next_action_sequence = self.next_action_sequence;
+        Ok(CommitStats {
+            tree_write_bytes: acc.io_bytes + bytes,
+            messages_in,
+            messages_materialized: acc.materialized,
+            messages_squashed: squashed as u64 + acc.squashed,
+            flushes: acc.flushes,
+            splits: acc.splits,
+            merges: acc.merges,
+            max_flush_depth: acc.max_flush_depth,
+            height: self.height(),
+            root_buffer_len: self.buffer.len() as u64,
+            checkpoints: 1,
+        })
     }
 
-    fn snapshot_descriptor(
-        &self,
-        root: Option<Root>,
-        mutations_since_root: Vec<pb::FragmentTreeMutation>,
-    ) -> pb::FragmentTree {
-        pb::FragmentTree {
-            root,
-            mutations_since_root,
-            next_action_sequence: self.next_action_sequence,
+    /// The first snapshot of a branch whose manifest maps `source_base_id`
+    /// to this snapshot's dataset, prepared for publication. The branch root
+    /// keeps this snapshot's children and its buffer with the suffix folded
+    /// in, so every node stays in the source. The root follows the rules of
+    /// any checkpoint. It is written through `branch` only when it does not
+    /// fit inline. The call fails when the root outgrows `hard_capacity_bytes`.
+    /// A resident inventory stays resident, stamped as a branch read stamps it.
+    ///
+    /// ```
+    /// # use lance_table::fragment_metadata::{FragmentTree, SnapshotPolicy, TreeContext};
+    /// # async fn example(source: FragmentTree, branch: TreeContext) -> lance_core::Result<()> {
+    /// let branch = source
+    ///     .branch_snapshot(branch, 7, SnapshotPolicy::default())
+    ///     .await?;
+    /// assert!(branch.descriptor().mutations_since_root.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn branch_snapshot(
+        mut self,
+        branch: TreeContext,
+        source_base_id: u32,
+        policy: SnapshotPolicy,
+    ) -> Result<Self> {
+        inherit_refs(&mut self.children, &mut self.buffer, source_base_id)?;
+        self.buffer_index.take();
+        if let Some(resident) = self.resident.take() {
+            let mut fragments = Arc::unwrap_or_clone(resident);
+            for fragment in &mut fragments {
+                stamp_unset_base_id(fragment, source_base_id);
+            }
+            self.resident = Some(Arc::new(fragments));
         }
+        self.store = branch.into_store(&self.config, self.next_action_sequence);
+        let (descriptor, _) =
+            checkpoint(&self.store, &self.config, self.compacted_root(), policy).await?;
+        self.descriptor = Arc::new(descriptor);
+        Ok(self)
     }
+}
 
-    async fn checkpoint_snapshot(&self, policy: SnapshotPolicy) -> Result<(pb::FragmentTree, u64)> {
-        let root = self.compacted_root();
-        if root.encoded_len() as u64 > self.config.hard_capacity_bytes {
-            return Err(Error::invalid_input(format!(
-                "fragment metadata root envelope requires {} encoded bytes, exceeding hard_capacity_bytes={}",
-                root.encoded_len(),
-                self.config.hard_capacity_bytes
-            )));
-        }
-        let mut snapshot = self.snapshot_descriptor(Some(Root::InlineRoot(root)), Vec::new());
-        if snapshot.encoded_len() <= policy.inline_root_bytes {
-            return Ok((snapshot, 0));
-        }
-        let Some(Root::InlineRoot(root)) = &snapshot.root else {
-            return Err(Error::internal(
-                "prepared fragment metadata snapshot has no inline root",
-            ));
-        };
-        let (uuid, bytes) = self.store.write_root_base(root).await?;
-        snapshot.root = Some(Root::RootUuid(uuid));
-        Ok((snapshot, bytes))
+/// The descriptor that publishes `root` with an empty suffix, inline when it
+/// fits `policy` and otherwise written to `store`, with the bytes written.
+pub(super) async fn checkpoint(
+    store: &NodeStore,
+    config: &FragmentTreeConfig,
+    root: pb::FragmentTreeRoot,
+    policy: SnapshotPolicy,
+) -> Result<(pb::FragmentTree, u64)> {
+    if root.encoded_len() as u64 > config.hard_capacity_bytes {
+        return Err(Error::invalid_input(format!(
+            "fragment metadata root envelope requires {} encoded bytes, exceeding hard_capacity_bytes={}",
+            root.encoded_len(),
+            config.hard_capacity_bytes
+        )));
     }
+    let next_action_sequence = root.next_action_sequence;
+    let mut snapshot = pb::FragmentTree {
+        root: Some(Root::InlineRoot(root)),
+        mutations_since_root: Vec::new(),
+        next_action_sequence,
+    };
+    if snapshot.encoded_len() <= policy.inline_root_bytes {
+        return Ok((snapshot, 0));
+    }
+    let Some(Root::InlineRoot(root)) = &snapshot.root else {
+        return Err(Error::internal(
+            "prepared fragment metadata snapshot has no inline root",
+        ));
+    };
+    let (uuid, bytes) = store.write_root_base(root).await?;
+    snapshot.root = Some(Root::RootUuid(uuid));
+    Ok((snapshot, bytes))
 }

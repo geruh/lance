@@ -158,6 +158,8 @@ pub(crate) const FRAGMENT_FEATURE_FLAGS: u64 = FLAG_DELETION_FILES
     | FLAG_STABLE_ROW_IDS
     | FLAG_UNSTABLE_DATA_OVERLAY_FILES
     | FLAG_SPILLED_ROW_LINEAGE;
+/// Writer-only requirements that lazy tree fragment records can carry.
+pub(crate) const FRAGMENT_WRITER_FEATURE_FLAGS: u64 = FRAGMENT_FEATURE_FLAGS | FLAG_OBJECT_METADATA;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -755,9 +757,13 @@ mod tests {
             | FLAG_UNSTABLE_DATA_OVERLAY_FILES
             | FLAG_SPILLED_ROW_LINEAGE;
         manifest.reader_feature_flags = features;
+        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
         apply_feature_flags(&mut manifest, false, false).unwrap();
         assert_eq!(manifest.reader_feature_flags, features | FLAG_FRAGMENT_TREE);
-        assert_eq!(manifest.writer_feature_flags, features | FLAG_FRAGMENT_TREE);
+        assert_eq!(
+            manifest.writer_feature_flags,
+            features | FLAG_FRAGMENT_TREE | FLAG_OBJECT_METADATA
+        );
 
         let next_version = Manifest::new_from_previous(
             &manifest,
@@ -766,23 +772,26 @@ mod tests {
         );
         let cloned =
             manifest.shallow_clone(None, "memory://source".to_string(), 7, None, String::new());
+        let all = features | FLAG_FRAGMENT_TREE | FLAG_OBJECT_METADATA;
         for mut derived in [next_version, cloned] {
             apply_feature_flags(&mut derived, false, false).unwrap();
             assert_eq!(
-                derived.reader_feature_flags & (features | FLAG_FRAGMENT_TREE),
+                derived.reader_feature_flags & all,
                 features | FLAG_FRAGMENT_TREE
             );
-            assert_eq!(
-                derived.writer_feature_flags & (features | FLAG_FRAGMENT_TREE),
-                features | FLAG_FRAGMENT_TREE
-            );
+            assert_eq!(derived.writer_feature_flags & all, all);
         }
 
-        // A flat replacement derives its requirements from its own fragments.
+        // A flat successor derives its requirements from its own fragments.
         manifest.fragment_tree = None;
-        apply_feature_flags(&mut manifest, false, false).unwrap();
-        assert_eq!(manifest.reader_feature_flags, 0);
-        assert_eq!(manifest.writer_feature_flags, 0);
+        let mut flat = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            std::sync::Arc::new(Vec::new()),
+        );
+        apply_feature_flags(&mut flat, false, false).unwrap();
+        assert_eq!(flat.reader_feature_flags, 0);
+        assert_eq!(flat.writer_feature_flags, 0);
     }
 
     #[test]

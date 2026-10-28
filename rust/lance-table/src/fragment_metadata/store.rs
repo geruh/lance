@@ -17,6 +17,7 @@ use prost::Message;
 use crate::format::pb;
 use crate::format::pb::fragment_action::Action;
 use crate::format::{DataFileFieldInterner, Fragment};
+use crate::fragment_metadata::content;
 use crate::fragment_metadata::node::{self, InternalNode};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -28,7 +29,7 @@ use lance_file::version::ConcreteFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_io::ReadBatchParams;
 use lance_io::object_reader::SmallReader;
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, WrappingObjectStore};
 use lance_io::scheduler::ScanScheduler;
 use lance_io::traits::Reader;
 use object_store::path::Path;
@@ -36,7 +37,10 @@ use object_store::{GetOptions, ObjectStore as OSObjectStore, PutOptions, PutPayl
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
 use uuid::Uuid;
+mod single_flight;
 mod validation_reads;
+
+pub use single_flight::SingleFlightLeafCache;
 
 // Decode each leaf in batches of READ_BATCH_ROWS, with up to
 // READ_BATCH_READAHEAD decoder batches in flight for that leaf. A scan may
@@ -191,7 +195,7 @@ fn put_outcome(put: std::result::Result<Result<()>, JoinError>) -> Result<()> {
 
 /// Reads and writes fragment metadata tree node files against an object store.
 #[derive(Clone)]
-pub struct NodeStore {
+pub(super) struct NodeStore {
     pub(super) object_store: Arc<ObjectStore>,
     base: Path,
     scheduler: Arc<ScanScheduler>,
@@ -200,20 +204,22 @@ pub struct NodeStore {
     /// Shared by clones, so concurrent drains that each write leaves still
     /// hold at most this many encoded leaves in PUTs at once.
     leaf_puts: Arc<Semaphore>,
+    /// The frontier of the root above every interior this store reads. It
+    /// bounds their buffered sequences and leaf watermarks.
     pub(super) next_action_sequence: u64,
     pub(super) hard_capacity_bytes: u64,
     foreign_bases: HashMap<u32, ForeignBase>,
+    // Wrappers change inner pointers, but not the identity of an in-memory owner.
+    memory_store_owners: HashMap<usize, Arc<dyn OSObjectStore>>,
     interner: Arc<Mutex<DataFileFieldInterner>>,
     /// Records passed to `encode_leaf`, so tests can bound encode work.
     #[cfg(test)]
     encoded_records: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Caches reads go through. Neither changes what a read returns.
+/// The cache reads go through. It never changes what a read returns.
 #[derive(Clone)]
 struct ReadCaches {
-    /// File metadata of opened leaves.
-    files: Arc<LanceCache>,
     /// Checked leaves and interiors, shared by every tree that holds the same cache.
     leaves: Option<LanceCache>,
 }
@@ -231,10 +237,19 @@ pub(super) struct NodeLocation {
     path: Path,
 }
 
+/// Where a leaf object resolves. Leaf objects are never rewritten in place,
+/// so one location always holds the same stored records, and a foreign leaf
+/// never shares a location with a local leaf of the same relative path. The
+/// ids and file paths read from a location are the same in every version,
+/// but an inherited base id is stamped from the child reference that names
+/// the leaf, so references through aliased bases see different ones.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LeafLocation(pub(super) NodeLocation);
+
 /// A leaf's location and the parent reference its contents were checked
 /// against. Any change to the reference, including its inherited base, forms
 /// a different key, so the leaf is checked again.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LeafKey {
     location: NodeLocation,
     reference: Vec<u8>,
@@ -357,7 +372,7 @@ impl CheckedInterior {
 fn buffered_targets(buffer: &[pb::FragmentTreeMutation]) -> Option<RangeInclusive<u64>> {
     buffer
         .iter()
-        .map(node::action_key)
+        .map(content::action_key)
         .fold(None, |bounds, target| {
             Some(match bounds {
                 None => target..=target,
@@ -473,6 +488,30 @@ impl LeafRead {
     }
 }
 
+/// A stored leaf's checked records, shared with the leaf cache when the read
+/// found or admitted the leaf there, so a walk over many versions copies none.
+pub struct StoredFragments(pub(super) LeafRead);
+
+impl std::ops::Deref for StoredFragments {
+    type Target = [Fragment];
+
+    fn deref(&self) -> &[Fragment] {
+        self.0.fragments()
+    }
+}
+
+impl std::fmt::Debug for StoredFragments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for StoredFragments {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
 /// A whole leaf read whose source is decided and whose decode is still to
 /// come. Splitting a read here lets a walk fetch several leaf objects ahead
 /// of the task that decodes them one at a time.
@@ -521,28 +560,44 @@ impl LeafObject {
 }
 
 impl NodeStore {
-    pub fn new(
+    pub(super) fn new(
         object_store: Arc<ObjectStore>,
         base: Path,
         scheduler: Arc<ScanScheduler>,
-        cache: Arc<LanceCache>,
     ) -> Self {
         Self {
             leaf_puts: leaf_put_window(&object_store),
             object_store,
             base,
             scheduler,
-            caches: ReadCaches {
-                files: cache,
-                leaves: None,
-            },
+            caches: ReadCaches { leaves: None },
             validation_reads: None,
             next_action_sequence: u64::MAX,
             hard_capacity_bytes: u64::MAX,
             foreign_bases: HashMap::new(),
+            memory_store_owners: HashMap::new(),
             interner: Arc::new(Mutex::new(DataFileFieldInterner::default())),
             #[cfg(test)]
             encoded_records: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn context(&self) -> super::TreeContext {
+        let bases = self
+            .foreign_bases
+            .iter()
+            .map(|(id, owner)| (*id, (owner.store.clone(), owner.base.clone())))
+            .collect();
+        let context = super::TreeContext::new(
+            self.object_store.clone(),
+            self.base.clone(),
+            self.scheduler.clone(),
+        )
+        .with_foreign_bases(bases);
+        match &self.caches.leaves {
+            Some(cache) => context.with_leaf_cache(cache.clone()),
+            None => context,
         }
     }
 
@@ -560,7 +615,49 @@ impl NodeStore {
         self.caches.leaves = Some(leaves);
     }
 
-    pub(super) fn rebind(&mut self, object_store: Arc<ObjectStore>) {
+    pub(super) fn rebind(
+        &mut self,
+        object_store: Arc<ObjectStore>,
+        wrappers: &[Arc<dyn WrappingObjectStore>],
+    ) {
+        let mut rebound_stores = Vec::with_capacity(self.foreign_bases.len() + 1);
+        let original = if wrappers.is_empty() {
+            object_store.clone()
+        } else {
+            self.object_store.clone()
+        };
+        rebound_stores.push((original, object_store.clone()));
+        for foreign in self.foreign_bases.values_mut() {
+            let wrapped = if wrappers.is_empty() {
+                foreign.store.clone()
+            } else if let Some((_, wrapped)) = rebound_stores
+                .iter()
+                .find(|(original, _)| Arc::ptr_eq(original, &foreign.store))
+            {
+                wrapped.clone()
+            } else {
+                let mut wrapped = foreign.store.as_ref().clone();
+                for wrapper in wrappers {
+                    wrapped.apply_wrapper(wrapper.as_ref());
+                }
+                Arc::new(wrapped)
+            };
+            rebound_stores.push((foreign.store.clone(), wrapped.clone()));
+            foreign.store = wrapped;
+        }
+        self.memory_store_owners = rebound_stores
+            .into_iter()
+            .filter(|(original, _)| original.scheme() == "memory")
+            .map(|(original, rebound)| {
+                let original_id = Arc::as_ptr(&original.inner) as *const () as usize;
+                let owner = self
+                    .memory_store_owners
+                    .get(&original_id)
+                    .cloned()
+                    .unwrap_or_else(|| original.inner.clone());
+                (Arc::as_ptr(&rebound.inner) as *const () as usize, owner)
+            })
+            .collect();
         self.scheduler = ScanScheduler::new(
             object_store.clone(),
             lance_io::scheduler::SchedulerConfig::max_bandwidth(&object_store),
@@ -580,12 +677,31 @@ impl NodeStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn has_validation_reads(&self) -> bool {
+        self.validation_reads.is_some()
+    }
+
     pub(super) fn clear_validation_reads(&mut self) {
         self.validation_reads = None;
     }
 
+    /// A copy that reads every object from storage and bounds sequences by
+    /// `next_action_sequence`. It shares no checked leaves or interiors and
+    /// retains no validation reads. Wrappers and foreign bases stay, so IO
+    /// trackers see its reads.
+    pub(super) fn uncached(&self, next_action_sequence: u64) -> Self {
+        Self {
+            caches: ReadCaches { leaves: None },
+            validation_reads: None,
+            next_action_sequence,
+            ..self.clone()
+        }
+    }
+
     /// Write sorted fragments as a columnar Lance leaf, one row per fragment.
-    pub async fn write_leaf(
+    #[cfg(test)]
+    pub(crate) async fn write_leaf(
         &self,
         fragments: &[Fragment],
         materialized_through_action_sequence: u64,
@@ -673,7 +789,8 @@ impl NodeStore {
     }
 
     /// Read a columnar leaf into fragment records.
-    pub fn read_leaf<'a>(
+    #[cfg(test)]
+    pub(crate) fn read_leaf<'a>(
         &'a self,
         child: &'a pb::FragmentTreeChild,
     ) -> BoxFuture<'a, Result<Vec<Fragment>>> {
@@ -832,7 +949,7 @@ impl NodeStore {
     }
 
     /// Write an internal node (children + buffer) as a protobuf object.
-    pub async fn write_internal(
+    pub(crate) async fn write_internal(
         &self,
         children: Vec<pb::FragmentTreeChild>,
         buffer: Vec<pb::FragmentTreeMutation>,
@@ -867,7 +984,10 @@ impl NodeStore {
     }
 
     /// Read an internal node.
-    pub async fn read_internal(&self, child: &pb::FragmentTreeChild) -> Result<InternalNode> {
+    pub(crate) async fn read_internal(
+        &self,
+        child: &pb::FragmentTreeChild,
+    ) -> Result<InternalNode> {
         let (store, path) = self.resolve_child(child)?;
         let bytes = store
             .inner
@@ -897,15 +1017,8 @@ impl NodeStore {
                 child.path
             )));
         }
-        // Inherited nodes belong to another dataset. Unset child and file
-        // refs, including hidden row lineage columns, take that dataset's base_id.
         if let Some(base_id) = child.base_id {
-            for descendant in &mut node.children {
-                if descendant.base_id.is_none() {
-                    descendant.base_id = Some(base_id);
-                }
-            }
-            preserve_inherited_refs(&mut node.buffer, base_id)?;
+            inherit_refs(&mut node.children, &mut node.buffer, base_id)?;
         }
         Ok(InternalNode {
             children: node.children,
@@ -930,7 +1043,10 @@ impl NodeStore {
 
     /// Write an immutable root base without publishing a dataset version.
     /// The caller must publish its reference through the Version Manifest.
-    pub async fn write_root_base(&self, root: &pb::FragmentTreeRoot) -> Result<(Vec<u8>, u64)> {
+    pub(super) async fn write_root_base(
+        &self,
+        root: &pb::FragmentTreeRoot,
+    ) -> Result<(Vec<u8>, u64)> {
         let uuid = Uuid::new_v4();
         let path = root_path(uuid.as_bytes())?;
         let bytes = root.encode_to_vec();
@@ -942,10 +1058,27 @@ impl NodeStore {
     }
 
     /// Read a base named directly by a Version Manifest, without version lookup.
-    pub async fn read_root_base(&self, uuid: &[u8]) -> Result<pb::FragmentTreeRoot> {
+    pub(super) async fn read_root_base(&self, uuid: &[u8]) -> Result<pb::FragmentTreeRoot> {
         let path = root_path(uuid)?;
         let bytes = get_whole(&self.object_store, &self.resolve_path(&path)?).await?;
         Ok(pb::FragmentTreeRoot::decode(bytes.as_ref())?)
+    }
+
+    /// A leaf's stored records in id order with the actions routed to it applied.
+    pub(super) fn replay(
+        &self,
+        stored: Vec<Fragment>,
+        actions: Vec<pb::FragmentTreeMutation>,
+    ) -> Result<Vec<Fragment>> {
+        if actions.is_empty() {
+            return Ok(stored);
+        }
+        let mut fragments: BTreeMap<u64, Fragment> = stored
+            .into_iter()
+            .map(|fragment| (fragment.id, fragment))
+            .collect();
+        self.apply_verified(&mut fragments, actions)?;
+        Ok(fragments.into_values().collect())
     }
 
     pub(super) fn apply_verified(
@@ -959,9 +1092,9 @@ impl NodeStore {
         let new_file_keys: BTreeSet<u64> = actions
             .iter()
             .filter(|tagged| adds_data_files(tagged))
-            .map(node::action_key)
+            .map(content::action_key)
             .collect();
-        node::apply_verified(fragments, actions)?;
+        crate::fragment_metadata::content::apply_verified(fragments, actions)?;
         if new_file_keys.is_empty() {
             return Ok(());
         }
@@ -1225,36 +1358,35 @@ impl NodeStore {
     ) -> Result<FileReader> {
         let object_reader = Arc::new(object.0);
         let file_scheduler = self.scheduler.open_reader(object_reader.clone());
-        // Relative paths can name different files in cloned dataset bases.
-        let cache = Arc::new(
-            self.caches
-                .files
-                .with_key_prefix(&format!("{:?}", self.child_location(child)?)),
-        );
-        let reader = FileReader::try_open(
+        let opened = FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
-            &cache,
+            &Arc::new(LanceCache::no_cache()),
             FileReaderOptions::default(),
         )
-        .await?;
+        .await;
 
-        // Opening the footer has already fetched the complete SmallReader
-        // object through the scheduler. Inspect those cached bytes, not a HEAD
-        // or a second GET, before trusting the reference's size.
-        let actual_size = object_reader.get_all().await?.len() as u64;
-        if actual_size != child.object_size {
+        // Opening fetched the complete SmallReader object through the
+        // scheduler, so its size is read from those bytes, not a HEAD or a
+        // second GET. A shorter object fails the footer read as an IO error,
+        // so the size is checked before that error is returned.
+        if let Ok(bytes) = object_reader.get_all().await
+            && bytes.len() as u64 != child.object_size
+        {
             return Err(super::validation::corrupt(format!(
-                "Leaf {} has {actual_size} bytes but its parent declares {}",
-                child.path, child.object_size,
+                "Leaf {} has {} bytes but its parent declares {}",
+                child.path,
+                bytes.len(),
+                child.object_size,
             )));
         }
-        Ok(reader)
+        opened
     }
 
     /// Read a leaf from storage and check it against its parent reference,
     /// bypassing every cache.
+    #[cfg(test)]
     pub(super) async fn read_leaf_uncached(
         &self,
         child: &pb::FragmentTreeChild,
@@ -1363,8 +1495,12 @@ impl NodeStore {
         Ok(NodeLocation {
             store_prefix: store.store_prefix.clone(),
             // Separate in-memory stores can have identical URL prefixes.
-            memory_store: (store.scheme() == "memory")
-                .then(|| Arc::as_ptr(&store.inner) as *const () as usize),
+            memory_store: (store.scheme() == "memory").then(|| {
+                let id = Arc::as_ptr(&store.inner) as *const () as usize;
+                self.memory_store_owners
+                    .get(&id)
+                    .map_or(id, |owner| Arc::as_ptr(owner) as *const () as usize)
+            }),
             path: self.resolve_under(base, path)?,
         })
     }
@@ -1492,7 +1628,7 @@ pub fn root_path(bytes: &[u8]) -> Result<String> {
     Ok(format!("_bt/root/{uuid}.root"))
 }
 
-fn stamp_unset_base_id(fragment: &mut Fragment, base_id: u32) {
+pub(super) fn stamp_unset_base_id(fragment: &mut Fragment, base_id: u32) {
     for file in fragment.referenced_lance_files_mut() {
         if file.base_id.is_none() {
             file.base_id = Some(base_id);
@@ -1505,12 +1641,18 @@ fn stamp_unset_base_id(fragment: &mut Fragment, base_id: u32) {
     }
 }
 
-/// Stamp unset file `base_id`s, including row lineage column carriers.
-pub fn preserve_inherited_refs(
-    mutations: &mut [pb::FragmentTreeMutation],
+/// Stamp `base_id` on every child and file reference that has none, row
+/// lineage column carriers included, so a node read or copied out of its
+/// owning dataset still resolves there.
+pub(super) fn inherit_refs(
+    children: &mut [pb::FragmentTreeChild],
+    buffer: &mut [pb::FragmentTreeMutation],
     base_id: u32,
 ) -> Result<()> {
-    for tagged in mutations {
+    for child in children {
+        child.base_id.get_or_insert(base_id);
+    }
+    for tagged in buffer {
         let Some(action) = tagged
             .action
             .as_mut()
@@ -1573,6 +1715,7 @@ mod tests {
     };
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::scheduler::SchedulerConfig;
+    use lance_io::utils::tracking_store::IOTracker;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
 
@@ -1594,6 +1737,84 @@ mod tests {
         fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column);
         fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column);
         fragment
+    }
+
+    #[tokio::test]
+    async fn wrappers_share_one_binding_per_resolved_store() {
+        let original = Arc::new(ObjectStore::memory());
+        let primary_base = Path::from("primary");
+        let mut store = NodeStore::new(
+            original.clone(),
+            primary_base.clone(),
+            ScanScheduler::new(original.clone(), SchedulerConfig::default_for_testing()),
+        );
+        let foreign = Arc::new(ObjectStore::memory());
+        let foreign_base = Path::from("inherited");
+        let original_ordering = foreign.list_is_lexically_ordered;
+        let mut different_settings = foreign.as_ref().clone();
+        different_settings.list_is_lexically_ordered = !original_ordering;
+        store.set_foreign_bases(HashMap::from([
+            (1, (original, primary_base)),
+            (2, (foreign.clone(), foreign_base.clone())),
+            (3, (foreign.clone(), foreign_base.clone())),
+            (4, (Arc::new(different_settings), foreign_base.clone())),
+            (5, (Arc::new(ObjectStore::memory()), foreign_base.clone())),
+        ]));
+        let child = |base_id| pb::FragmentTreeChild {
+            path: "_bt/node/one.node".into(),
+            base_id: Some(base_id),
+            ..Default::default()
+        };
+        let locations: Vec<_> = (1..=5)
+            .map(|base_id| store.child_location(&child(base_id)).unwrap())
+            .collect();
+        assert_eq!(locations[1], locations[2]);
+        assert_eq!(locations[1], locations[3]);
+        assert_ne!(locations[1], locations[4]);
+        for _ in 0..2 {
+            let tracker = Arc::new(IOTracker::default());
+            let mut primary = store.object_store.as_ref().clone();
+            primary.apply_wrapper(tracker.as_ref());
+            let primary = Arc::new(primary);
+            let wrapper: Arc<dyn WrappingObjectStore> = tracker.clone();
+            store.rebind(primary.clone(), std::slice::from_ref(&wrapper));
+            assert!(Arc::ptr_eq(&store.foreign_bases[&1].store, &primary));
+            assert!(Arc::ptr_eq(
+                &store.foreign_bases[&2].store,
+                &store.foreign_bases[&3].store,
+            ));
+            assert_eq!(store.foreign_bases[&2].base, foreign_base);
+            assert_eq!(
+                store.foreign_bases[&2].store.list_is_lexically_ordered,
+                original_ordering
+            );
+            assert_eq!(
+                store.foreign_bases[&4].store.list_is_lexically_ordered,
+                !original_ordering
+            );
+            assert_eq!(
+                store
+                    .location_under(&foreign, &foreign_base, &child(2).path)
+                    .unwrap(),
+                locations[1]
+            );
+            for (base_id, expected) in (1..=5).zip(&locations) {
+                let child = child(base_id);
+                assert_eq!(&store.child_location(&child).unwrap(), expected);
+                let (owner, path) = store.resolve_child(&child).unwrap();
+                owner.put(&path, b"node").await.unwrap();
+                owner.inner.get(&path).await.unwrap().bytes().await.unwrap();
+            }
+            assert_eq!(tracker.stats().read_iops, 5);
+        }
+        let local = pb::FragmentTreeChild {
+            base_id: None,
+            ..child(1)
+        };
+        let previous = store.child_location(&local).unwrap();
+        store.rebind(Arc::new(ObjectStore::memory()), &[]);
+        assert_ne!(store.child_location(&local).unwrap(), previous);
+        assert_eq!(store.child_location(&child(2)).unwrap(), locations[1]);
     }
 
     #[rstest]
@@ -1672,7 +1893,6 @@ mod tests {
     #[case::validation_scratch(true)]
     #[tokio::test]
     async fn leaf_caches_preserve_resolved_owner(#[case] retain: bool) {
-        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
         let mut bases = HashMap::new();
         let mut children = Vec::new();
         for id in 0..2 {
@@ -1681,7 +1901,6 @@ mod tests {
                 object_store.clone(),
                 Path::default(),
                 ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing()),
-                cache.clone(),
             );
             let mut child = source
                 .write_leaf(&[make_fragment_with_files(id, id as u32 + 1)], 0)
@@ -1715,7 +1934,6 @@ mod tests {
             object_store.clone(),
             Path::default(),
             ScanScheduler::new(object_store, SchedulerConfig::default_for_testing()),
-            cache,
         );
         dest.set_foreign_bases(bases);
         dest.set_leaf_cache(LanceCache::with_capacity(1024 * 1024));
@@ -1740,6 +1958,35 @@ mod tests {
         }
     }
 
+    /// A leaf cached for one store is never served for another store that
+    /// names an object at the same path through an equal reference.
+    #[tokio::test]
+    async fn leaf_cache_keeps_stores_with_one_path_apart() {
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let node_store = |object_store: Arc<ObjectStore>| {
+            let mut store = NodeStore::new(
+                object_store.clone(),
+                Path::from("table"),
+                ScanScheduler::new(object_store, SchedulerConfig::default_for_testing()),
+            );
+            store.set_leaf_cache(cache.clone());
+            store
+        };
+        let holder = node_store(Arc::new(ObjectStore::memory()));
+        let child = holder
+            .write_leaf(&[make_fragment(0)], 0)
+            .await
+            .unwrap()
+            .child_ref;
+        // A first sighting, its admission, then a cache hit.
+        for _ in 0..3 {
+            assert_eq!(holder.read_leaf(&child).await.unwrap().len(), 1);
+        }
+        let other = node_store(Arc::new(ObjectStore::memory()));
+        let error = other.read_leaf(&child).await.unwrap_err();
+        assert!(error.is_not_found(), "{error}");
+    }
+
     #[tokio::test]
     async fn root_read_preserves_unknown_protobuf_fields_without_writer_limits() {
         let base = TempObjDir::default();
@@ -1757,8 +2004,11 @@ mod tests {
         store.read_root_base(uuid.as_bytes()).await.unwrap();
     }
 
+    #[rstest]
+    #[case::appended_byte(true)]
+    #[case::truncated_object(false)]
     #[tokio::test]
-    async fn leaf_read_rejects_an_understated_object_size() {
+    async fn leaf_read_rejects_a_misstated_object_size(#[case] appended: bool) {
         let base = TempObjDir::default();
         let store = test_store(base.clone());
         let written = store.write_leaf(&[make_fragment(0)], 0).await.unwrap();
@@ -1767,7 +2017,11 @@ mod tests {
             .await
             .unwrap()
             .to_vec();
-        bytes.push(0);
+        if appended {
+            bytes.push(0);
+        } else {
+            bytes.pop();
+        }
         store.object_store.put(&path, &bytes).await.unwrap();
         let error = store.read_leaf(&written.child_ref).await.unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
@@ -1778,12 +2032,7 @@ mod tests {
         let object_store = Arc::new(ObjectStore::local());
         let scheduler =
             ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
-        NodeStore::new(
-            object_store,
-            base,
-            scheduler,
-            Arc::new(LanceCache::with_capacity(64 * 1024 * 1024)),
-        )
+        NodeStore::new(object_store, base, scheduler)
     }
 
     #[rstest]
@@ -2495,7 +2744,7 @@ mod tests {
         let fragment = column_lineage_fragment(2);
         let mutation = pb::FragmentTreeMutation {
             action_sequence: 1,
-            action: Some(action::upsert_fragment(&fragment)),
+            action: Some(action::upsert_fragment(&fragment).unwrap()),
             fragment_count_delta: 1,
             total_rows_delta: fragment.physical_rows.unwrap_or(0) as i64,
             visible_rows_delta: fragment.num_rows().unwrap_or(0) as i64,
@@ -2626,7 +2875,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::add_deletion_file(action::add_deletion_file(1, &deletion_file(3)), -1)]
+    #[case::add_deletion_file(action::add_deletion_file(1, &deletion_file(3)).unwrap(), -1)]
     #[case::clear_deletion_file(action::clear_deletion_file(1), 2)]
     #[case::remove_data_file(action::remove_data_file(1, data_file_path(1, 1)), 0)]
     #[case::replace_data_file(
@@ -2643,7 +2892,7 @@ mod tests {
         let (mut leaf, twin) = decoded_leaf_and_twin(&store).await;
         let actions = vec![replay_of_fragment_one(action, visible_rows_delta)];
         let mut expected = leaf.clone();
-        node::apply_verified(&mut expected, actions.clone()).unwrap();
+        crate::fragment_metadata::content::apply_verified(&mut expected, actions.clone()).unwrap();
 
         store.apply_verified(&mut leaf, actions).unwrap();
 
@@ -2657,7 +2906,7 @@ mod tests {
         fragment.physical_rows = Some(10);
         fragment.deletion_file = Some(deletion_file(2));
         fragment
-    }))]
+    }).unwrap())]
     #[case::add_data_file(action::add_data_file(1, &make_backfill_data_file(1, 2)))]
     #[tokio::test]
     async fn replay_shares_field_lists_of_new_data_files(#[case] action: pb::FragmentAction) {
@@ -2666,7 +2915,7 @@ mod tests {
         let (mut leaf, twin) = decoded_leaf_and_twin(&store).await;
         let actions = vec![replay_of_fragment_one(action, 0)];
         let mut expected = leaf.clone();
-        node::apply_verified(&mut expected, actions.clone()).unwrap();
+        crate::fragment_metadata::content::apply_verified(&mut expected, actions.clone()).unwrap();
 
         store.apply_verified(&mut leaf, actions).unwrap();
 

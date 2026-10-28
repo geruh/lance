@@ -6,7 +6,8 @@
 //! Qualified for root-to-leaf scatter. An interior child's drain recurses, so
 //! its object size understates the work below it.
 
-use crate::format::pb::{self, fragment_action::Action};
+use crate::format::pb;
+use crate::fragment_metadata::content::retired_keys;
 use crate::fragment_metadata::node::{self, FragmentTreeConfig};
 
 // Drain at most eight children and 32 MiB of encoded child-object bytes
@@ -84,44 +85,11 @@ impl Buckets {
     }
 }
 
-/// Whether a buffered action removes a fragment the subtree below still
-/// holds. A squashed append-then-remove keeps a removal that retires nothing.
-pub(super) fn retires_fragment(mutation: &pb::FragmentTreeMutation) -> bool {
-    mutation.fragment_count_delta < 0
-        && matches!(
-            mutation
-                .action
-                .as_ref()
-                .and_then(|action| action.action.as_ref()),
-            Some(Action::RemoveFragment(_))
-        )
-}
-
-/// Whether a buffered action overwrites a record the subtree below holds.
-/// After squashing, a whole-record upsert that does not change the fragment
-/// count replaces a stored record.
-pub(super) fn replaces_fragment(mutation: &pb::FragmentTreeMutation) -> bool {
-    mutation.fragment_count_delta == 0
-        && matches!(
-            mutation
-                .action
-                .as_ref()
-                .and_then(|action| action.action.as_ref()),
-            Some(Action::UpsertFragment(_))
-        )
-}
-
-/// Fragments of `child` that draining `actions` removes.
-pub(super) fn retired_keys(actions: &[pb::FragmentTreeMutation]) -> u64 {
-    actions
-        .iter()
-        .filter(|action| retires_fragment(action))
-        .count() as u64
-}
-
-/// Estimated child bytes reclaimed by the removed fragments.
+/// Estimated child bytes reclaimed by the removed fragments. The quotient is
+/// at most the object size, but a misstated size can overflow the product.
 fn reclaimed_bytes(child: &pb::FragmentTreeChild, actions: &[pb::FragmentTreeMutation]) -> u64 {
-    child.object_size * retired_keys(actions).min(child.num_keys) / child.num_keys.max(1)
+    let retired = retired_keys(actions).min(child.num_keys);
+    (u128::from(child.object_size) * u128::from(retired) / u128::from(child.num_keys.max(1))) as u64
 }
 
 pub(super) fn fair_share(children: &[pb::FragmentTreeChild], config: &FragmentTreeConfig) -> u64 {
@@ -162,7 +130,7 @@ pub(super) fn select_children(
         .map(|(idx, (actions, bytes))| {
             let reclaimed = reclaimed_bytes(&children[idx], actions);
             let credit = match pressure {
-                Pressure::Pressured => bytes + reclaimed,
+                Pressure::Pressured => bytes.saturating_add(reclaimed),
                 Pressure::Relaxed => reclaimed,
             };
             (credit, idx)
@@ -183,17 +151,20 @@ pub(super) fn select_children(
         .map(|(_, idx)| *idx);
     let limit = io_parallelism.clamp(1, MAX_CONCURRENT_LEAF_DRAINS);
     let mut selected = Vec::with_capacity(limit);
-    let mut batch_bytes = 0;
+    let mut batch_bytes = 0u64;
     for idx in worthwhile {
+        let Some(next_batch_bytes) = batch_bytes.checked_add(children[idx].object_size) else {
+            break;
+        };
         if !selected.is_empty()
             && (children[idx].height > 0
                 || selected.len() >= limit
-                || batch_bytes + children[idx].object_size > MAX_BATCH_OBJECT_BYTES)
+                || next_batch_bytes > MAX_BATCH_OBJECT_BYTES)
         {
             break;
         }
         selected.push(idx);
-        batch_bytes += children[idx].object_size;
+        batch_bytes = next_batch_bytes;
         // Interior drains recurse, so running them together would multiply the bound.
         if children[idx].height > 0 {
             break;
@@ -300,15 +271,20 @@ mod tests {
     }
 
     #[rstest]
-    #[case::emptied_leaf_drains(2048, vec![0])]
-    #[case::one_sixteenth_drains(128, vec![0])]
-    #[case::sparse_removals_wait(127, vec![])]
+    #[case::emptied_leaf_drains(2048, 1024 * 1024, vec![0])]
+    #[case::one_sixteenth_drains(128, 1024 * 1024, vec![0])]
+    #[case::sparse_removals_wait(127, 1024 * 1024, vec![])]
+    #[case::emptied_leaf_of_any_size_drains(2048, u64::MAX, vec![0])]
     #[test]
     fn relaxed_selection_drains_removals_that_shrink_a_leaf(
         #[case] removed: usize,
+        #[case] object_size: u64,
         #[case] expected: Vec<usize>,
     ) {
-        let leaves = leaves_with_keys(2, 2048);
+        let mut leaves = leaves_with_keys(2, 2048);
+        for leaf in &mut leaves {
+            leaf.object_size = object_size;
+        }
         let buckets = vec![bucket(0, removed), vec![]];
         let config = FragmentTreeConfig::default();
         assert_eq!(
@@ -342,7 +318,10 @@ mod tests {
         let leaves = leaves_with_keys(1, 2048);
         let upserts = vec![
             pb::FragmentTreeMutation {
-                action: Some(action::upsert_fragment(&crate::format::Fragment::new(7))),
+                action: Some(
+                    action::upsert_fragment(&crate::format::Fragment::new(7).with_physical_rows(0))
+                        .unwrap()
+                ),
                 ..Default::default()
             };
             4096
@@ -377,9 +356,12 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::over_the_budget(MAX_BATCH_OBJECT_BYTES / 2 + 1)]
+    #[case::overflowing_the_sum(u64::MAX / 2 + 1)]
     #[test]
-    fn selection_bounds_encoded_bytes_in_flight() {
-        let oversized = children(3, 0, MAX_BATCH_OBJECT_BYTES / 2 + 1);
+    fn selection_bounds_encoded_bytes_in_flight(#[case] object_size: u64) {
+        let oversized = children(3, 0, object_size);
         let config = FragmentTreeConfig::default().with_hard_capacity_bytes(u64::MAX / 4);
         let buckets: Vec<_> = (0..3).map(|id| bucket(id, 200_000)).collect();
         assert_eq!(

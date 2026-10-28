@@ -9,29 +9,14 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use lance_core::{Error, Result};
 
-use super::node::{self, FragmentTreeConfig};
-use super::store::{LeafUploads, NodeStore, Uploaded};
+use super::{IngestResult, WriteAcc};
 use crate::format::{Fragment, pb};
+use crate::fragment_metadata::node::{self, FragmentTreeConfig};
+use crate::fragment_metadata::store::{LeafUploads, NodeStore, Uploaded};
 
-#[derive(Default)]
-pub(super) struct BulkResult {
-    pub children: Vec<pb::FragmentTreeChild>,
-    pub io_bytes: u64,
-    pub flushes: u64,
-    pub splits: u64,
-    pub merges: u64,
-    pub materialized: u64,
-    pub max_flush_depth: u32,
-}
-
-impl BulkResult {
-    fn with_leaves(self, leaves: Uploaded) -> Self {
-        Self {
-            children: leaves.children,
-            io_bytes: leaves.io_bytes,
-            ..self
-        }
-    }
+fn with_leaves(mut output: WriteAcc, leaves: Uploaded) -> IngestResult {
+    output.io_bytes = leaves.io_bytes;
+    (leaves.children, output)
 }
 
 enum PendingLeaf {
@@ -70,7 +55,7 @@ impl PendingLeaf {
         uploads: &mut LeafUploads<'_>,
         config: &FragmentTreeConfig,
         watermark: u64,
-        output: &mut BulkResult,
+        output: &mut WriteAcc,
     ) -> Result<()> {
         match self {
             Self::Unchanged(child, _) => uploads.reuse(child),
@@ -96,8 +81,8 @@ pub(super) async fn materialize(
     children: Vec<pb::FragmentTreeChild>,
     buffer: Vec<pb::FragmentTreeMutation>,
     watermark: u64,
-) -> Result<BulkResult> {
-    let mut output = BulkResult::default();
+) -> Result<IngestResult> {
+    let mut output = WriteAcc::default();
     let mut uploads = LeafUploads::new(store);
     let mut pending: Option<PendingLeaf> = None;
     if children.is_empty() {
@@ -112,7 +97,7 @@ pub(super) async fn materialize(
             .write(&mut uploads, config, watermark, &mut output)
             .await?;
         }
-        return Ok(output.with_leaves(uploads.finish().await?));
+        return Ok(with_leaves(output, uploads.finish().await?));
     }
     let mut sequences = node::DecodedSequences::new(&buffer);
     let buckets = node::partition_buffer_by_child(&children, buffer);
@@ -192,5 +177,5 @@ pub(super) async fn materialize(
         leaf.write(&mut uploads, config, watermark, &mut output)
             .await?;
     }
-    Ok(output.with_leaves(uploads.finish().await?))
+    Ok(with_leaves(output, uploads.finish().await?))
 }

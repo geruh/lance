@@ -8,7 +8,7 @@ use std::ops::RangeInclusive;
 
 use lance_core::{Error, Result};
 
-use super::{action, node};
+use super::{action, content, node};
 use crate::format::{Fragment, pb};
 use pb::fragment_action::Action;
 
@@ -18,7 +18,7 @@ pub(super) fn corrupt(message: impl Into<String>) -> Error {
 
 /// Counts in this format are always known, including zero. The shared flat
 /// protobuf conversion treats zero as a legacy unknown count.
-pub(super) fn fragment(mut encoded: pb::DataFragment) -> Result<Fragment> {
+pub(super) fn fragment(encoded: pb::DataFragment) -> Result<Fragment> {
     let rows = usize::try_from(encoded.physical_rows)
         .map_err(|_| corrupt(format!("fragment {} row count exceeds usize", encoded.id)))?;
     let deleted = encoded
@@ -33,14 +33,9 @@ pub(super) fn fragment(mut encoded: pb::DataFragment) -> Result<Fragment> {
             encoded.id, encoded.physical_rows,
         )));
     }
-    // Preserve persisted precedence, including equal-version overlays. The flat
-    // manifest conversion sorts overlays for older writers.
-    let overlays = std::mem::take(&mut encoded.overlays)
-        .into_iter()
-        .map(crate::format::overlay::DataOverlayFile::try_from)
-        .collect::<Result<Vec<_>>>()?;
+    // The flat conversion stable-sorts overlays by committed version, which
+    // is the format's precedence order with stored position breaking ties.
     let mut fragment = Fragment::try_from(encoded)?;
-    fragment.overlays = overlays;
     fragment.physical_rows = Some(rows);
     if let Some(file) = &mut fragment.deletion_file {
         file.num_deleted_rows = deleted.map(|count| count as usize);
@@ -216,16 +211,30 @@ pub(super) fn root(root: &pb::FragmentTreeRoot, next_fragment_id: u64) -> Result
                 "Tree names fragment state but Manifest.max_fragment_id is absent",
             ));
         }
-    } else if root
-        .buffer
-        .iter()
-        .any(|tagged| node::action_key(tagged) >= next_fragment_id)
-    {
-        return Err(corrupt(format!(
-            "Root contains a fragment beyond allocation high-water mark {next_fragment_id}"
-        )));
+    } else {
+        allocated_ids(
+            root.buffer.iter().map(content::action_key),
+            next_fragment_id,
+            "Root buffer",
+        )?;
     }
     Ok((summary.num_keys, summary.total_rows, summary.visible_rows))
+}
+
+/// Stored records and buffered actions may name only ids the Version Manifest
+/// has allocated, which are the ids below `next_fragment_id`. `holder` names
+/// where the ids were read.
+pub(super) fn allocated_ids(
+    ids: impl IntoIterator<Item = u64>,
+    next_fragment_id: u64,
+    holder: impl std::fmt::Display,
+) -> Result<()> {
+    match ids.into_iter().find(|id| *id >= next_fragment_id) {
+        Some(id) => Err(corrupt(format!(
+            "{holder} names fragment {id}, at or above next_fragment_id {next_fragment_id}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

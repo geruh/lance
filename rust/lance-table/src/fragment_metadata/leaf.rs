@@ -4,7 +4,7 @@
 //! One fragment per row, with ordered files and overlays and dictionary-encoded mappings.
 
 use std::collections::HashMap;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, LazyLock, MutexGuard};
 
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::cast::AsArray;
@@ -22,7 +22,7 @@ use prost::Message;
 use super::validation::{corrupt, fragment};
 use crate::format::{DataFile, DataFileFieldInterner, Fragment, pb};
 
-fn file_fields() -> Fields {
+static FILE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     let mapping = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary));
     vec![
         Field::new("path", DataType::Utf8, false),
@@ -34,17 +34,17 @@ fn file_fields() -> Fields {
         Field::new("base_id", DataType::UInt32, true),
     ]
     .into()
-}
+});
 
-fn overlay_fields() -> Fields {
+static OVERLAY_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     vec![
-        Field::new("data_file", DataType::Struct(file_fields()), false),
+        Field::new("data_file", DataType::Struct(FILE_FIELDS.clone()), false),
         Field::new("overlay_meta", DataType::Binary, false),
     ]
     .into()
-}
+});
 
-pub(super) fn schema() -> Arc<Schema> {
+static LEAF_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::UInt64, false),
         Field::new("fragment_meta", DataType::Binary, false),
@@ -52,7 +52,7 @@ pub(super) fn schema() -> Arc<Schema> {
             "files",
             DataType::List(Arc::new(Field::new(
                 "item",
-                DataType::Struct(file_fields()),
+                DataType::Struct(FILE_FIELDS.clone()),
                 false,
             ))),
             false,
@@ -61,22 +61,27 @@ pub(super) fn schema() -> Arc<Schema> {
             "overlays",
             DataType::List(Arc::new(Field::new(
                 "item",
-                DataType::Struct(overlay_fields()),
+                DataType::Struct(OVERLAY_FIELDS.clone()),
                 false,
             ))),
             false,
         ),
     ]))
+});
+
+pub(super) fn schema() -> Arc<Schema> {
+    Arc::clone(&LEAF_SCHEMA)
 }
 
 /// Dictionary-code field-id or column-index lists in order of first
 /// appearance. Interned lists repeat the same allocation, so most files are
 /// matched by pointer before their contents are compared.
-fn mappings<'a>(lists: impl Iterator<Item = &'a Arc<[i32]>>) -> Result<ArrayRef> {
+fn mappings<'a>(lists: impl ExactSizeIterator<Item = &'a Arc<[i32]>>) -> Result<ArrayRef> {
+    let capacity = lists.len();
     let mut by_pointer = HashMap::<(*const i32, usize), i32>::new();
     let mut by_contents = HashMap::<&'a [i32], i32>::new();
     let mut values = BinaryBuilder::new();
-    let mut keys = Vec::new();
+    let mut keys = Vec::with_capacity(capacity);
     for list in lists {
         let pointer = (list.as_ptr(), list.len());
         let key = match by_pointer.get(&pointer) {
@@ -106,7 +111,7 @@ fn mappings<'a>(lists: impl Iterator<Item = &'a Arc<[i32]>>) -> Result<ArrayRef>
 
 fn files_array(files: &[&DataFile]) -> Result<StructArray> {
     Ok(StructArray::try_new(
-        file_fields(),
+        FILE_FIELDS.clone(),
         vec![
             Arc::new(StringArray::from_iter_values(
                 files.iter().map(|f| f.path.as_str()),
@@ -159,7 +164,7 @@ pub(super) fn encode(fragments: &[Fragment]) -> Result<RecordBatch> {
     }
     let file_values = Arc::new(files_array(&files)?);
     let overlay_values = Arc::new(StructArray::try_new(
-        overlay_fields(),
+        OVERLAY_FIELDS.clone(),
         vec![
             Arc::new(files_array(&overlays)?),
             Arc::new(BinaryArray::from_iter_values(
@@ -316,6 +321,8 @@ impl<'a> FileColumns<'a> {
             file_major_version: self.major_versions.value(row),
             file_minor_version: self.minor_versions.value(row),
             file_size_bytes: CachedFileSize::new(self.sizes.value(row)),
+            // TODO: figure this out drew :(
+            // Leaves have no column for the hint yet, so it reads as unknown.
             file_metadata_size_bytes: None,
             base_id: (!self.bases.is_null(row)).then(|| self.bases.value(row)),
         }
@@ -505,9 +512,52 @@ mod tests {
     use lance_core::Error;
     use rstest::rstest;
 
+    /// Version decides overlay precedence and position only breaks ties, so
+    /// a decoded leaf record lists overlays in the order flat decoding does.
     #[test]
-    fn nested_leaf_preserves_file_order_overlays_and_mappings() {
+    fn decoded_overlays_follow_flat_precedence_order() {
+        let file = make_fragment(7).files[0].clone();
+        let overlay = |committed_version: u64, path: &str| {
+            let mut data_file = file.clone();
+            data_file.path = path.into();
+            crate::format::overlay::DataOverlayFile {
+                data_file,
+                coverage: crate::format::overlay::OverlayCoverage::dense(
+                    roaring::RoaringBitmap::from_iter([0u32]),
+                ),
+                committed_version,
+            }
+        };
+        // Another writer may store overlays in any order.
+        let mut stored = make_fragment(7);
+        stored.overlays = vec![
+            overlay(3, "newer.lance"),
+            overlay(1, "older.lance"),
+            overlay(1, "older-tie.lance"),
+        ];
+        let paths = |record: &Fragment| {
+            record
+                .overlays
+                .iter()
+                .map(|overlay| overlay.data_file.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let flat = Fragment::try_from(pb::DataFragment::from(&stored)).unwrap();
+        assert_eq!(
+            paths(&flat),
+            ["older.lance", "older-tie.lance", "newer.lance"]
+        );
+        let decoded = decode_leaf(&encode(&[stored]).unwrap()).unwrap();
+        assert_eq!(paths(&decoded[0]), paths(&flat));
+    }
+
+    #[test]
+    fn nested_leaf_preserves_file_order_overlays_mappings_and_object_metadata() {
         let mut value = pb::DataFragment::from(&make_fragment(7));
+        value.clustering_id = Some(3);
+        value
+            .metadata
+            .insert("org.example.cluster.bucket".into(), "[0, 100)".into());
         value.files[0].fields = vec![-1, 2];
         value.files[0].column_indices = vec![-1, 0];
         value.files[0].base_id = Some(0);
@@ -521,16 +571,42 @@ mod tests {
                 committed_version: 3,
             },
         ));
-        let mut earlier = value.overlays[0].clone();
-        earlier.committed_version = 1;
-        earlier.data_file.as_mut().unwrap().path = "earlier.lance".into();
-        value.overlays.push(earlier);
+        let mut tied = value.overlays[0].clone();
+        let tied_file = tied.data_file.as_mut().unwrap();
+        tied_file.path = "tied.lance".into();
+        value.overlays.push(tied);
         let original = fragment(value).unwrap();
-        assert_eq!(original.overlays[0].committed_version, 3);
-        assert_eq!(original.overlays[1].committed_version, 1);
+        // Overlays of one version keep their stored order.
+        assert_eq!(original.overlays[1].data_file.path, "tied.lance");
         let batch = encode(std::slice::from_ref(&original)).unwrap();
         assert_eq!(batch.num_rows(), 1);
+        let files = batch.column(2).as_list::<i32>().values().as_struct();
+        let mappings = files.column(1).as_dictionary::<Int32Type>();
+        assert_eq!(mappings.keys().values().as_ref(), &[0, 0]);
+        assert_eq!(
+            mappings.values().as_binary::<i32>().value(0),
+            [(-1_i32).to_le_bytes(), 2_i32.to_le_bytes()].concat()
+        );
         assert_eq!(decode_leaf(&batch).unwrap(), vec![original]);
+    }
+
+    #[test]
+    fn file_and_overlay_metadata_size_hints_decode_as_unknown() {
+        let mut stored = make_fragment(7);
+        stored.files[0].file_metadata_size_bytes = std::num::NonZero::new(1_024);
+        let mut data_file = stored.files[0].clone();
+        data_file.path = "overlay.lance".into();
+        stored.overlays = vec![crate::format::overlay::DataOverlayFile {
+            data_file,
+            coverage: crate::format::overlay::OverlayCoverage::dense(
+                roaring::RoaringBitmap::from_iter([0u32]),
+            ),
+            committed_version: 3,
+        }];
+        let decoded = decode_leaf(&encode(std::slice::from_ref(&stored)).unwrap()).unwrap();
+        stored.files[0].file_metadata_size_bytes = None;
+        stored.overlays[0].data_file.file_metadata_size_bytes = None;
+        assert_eq!(decoded, vec![stored]);
     }
 
     #[rstest]

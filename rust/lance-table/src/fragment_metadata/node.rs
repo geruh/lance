@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Routing, accounting, and reduction of validated fragment actions.
+//! Routing and encoded-byte policies for fragment metadata nodes.
 //!
 //! Node policies use encoded bytes because fragments and actions vary in size.
 //! Leaf encoding and object I/O live in `store`; recursive mutation lives in `tree`.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use prost::Message;
 use roaring::RoaringTreemap;
 
+use super::content::{
+    action_key, apply_aggregate_delta, fragment_row_counts, sum_aggregate_deltas,
+    sum_aggregate_values,
+};
 use crate::format::Fragment;
-use crate::format::pb::{self, fragment_action::Action};
-use crate::fragment_metadata::action;
+use crate::format::pb;
 use lance_core::{Error, Result};
 
 /// Default routing and leaf targets. These are independent writer policies.
@@ -129,7 +131,7 @@ pub struct InternalNode {
 /// Derived offsets into an immutable buffer. The wire representation stays a
 /// plain action sequence; a sparse lookup need not examine unrelated actions.
 #[derive(Debug, Clone)]
-pub(crate) struct BufferIndex {
+pub(super) struct BufferIndex {
     offsets: Vec<(u64, usize)>,
     sequences: OnceLock<DecodedSequences>,
 }
@@ -169,7 +171,7 @@ impl BufferIndex {
 /// only the actions routed to one leaf. Every other buffer the operation
 /// decodes is admitted here, so a sequence two of them share is rejected.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DecodedSequences {
+pub(super) struct DecodedSequences {
     /// Shared by every operation on one root buffer, so a point read copies
     /// nothing up front.
     root: Arc<RoaringTreemap>,
@@ -265,14 +267,6 @@ pub fn buffer_pressured(buffer: &[pb::FragmentTreeMutation], config: &FragmentTr
     internal_logical_bytes(&[], buffer) >= config.semantic_buffer_bytes
 }
 
-/// The target key of a buffered action (the fragment id it mutates).
-pub fn action_key(t: &pb::FragmentTreeMutation) -> u64 {
-    t.action
-        .as_ref()
-        .and_then(action::target_frag_id)
-        .unwrap_or(0)
-}
-
 /// Index of the child owning `key`: the rightmost child whose `min_key` is at
 /// most `key`, and the first child for keys below every fence.
 ///
@@ -329,21 +323,7 @@ pub fn leaf_ref(
     object_size: u64,
     materialized_through_action_sequence: u64,
 ) -> Result<pb::FragmentTreeChild> {
-    let total_rows = sum_aggregate_values(
-        fragments
-            .iter()
-            .map(|fragment| fragment.physical_rows.unwrap_or(0) as u64),
-        "total_rows",
-    )?;
-    // Counts are known by the writer invariant
-    // (`commit::require_storable`); a violation here means state
-    // bypassed validation.
-    let visible_rows = sum_aggregate_values(
-        fragments
-            .iter()
-            .map(|fragment| fragment.num_rows().unwrap_or(0) as u64),
-        "visible_rows",
-    )?;
+    let (total_rows, visible_rows) = fragment_row_counts(fragments)?;
     Ok(pb::FragmentTreeChild {
         path,
         base_id: None,
@@ -416,45 +396,6 @@ pub fn internal_ref(
     })
 }
 
-pub(super) fn apply_aggregate_delta(base: u64, delta: i64, name: &str) -> Result<u64> {
-    if delta >= 0 {
-        base.checked_add(delta as u64).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "fragment metadata tree {name} aggregate overflow: base={base}, delta={delta}"
-            ))
-        })
-    } else {
-        base.checked_sub(delta.unsigned_abs()).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "fragment metadata tree {name} aggregate underflow: base={base}, delta={delta}"
-            ))
-        })
-    }
-}
-
-pub(super) fn sum_aggregate_deltas(
-    deltas: impl IntoIterator<Item = i64>,
-    name: &str,
-) -> Result<i64> {
-    deltas.into_iter().try_fold(0i64, |sum, delta| {
-        sum.checked_add(delta).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "fragment metadata tree {name} overflow while summing: sum={sum}, delta={delta}"
-            ))
-        })
-    })
-}
-
-fn sum_aggregate_values(values: impl IntoIterator<Item = u64>, name: &str) -> Result<u64> {
-    values.into_iter().try_fold(0u64, |sum, value| {
-        sum.checked_add(value).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "fragment metadata tree {name} overflow while summing: sum={sum}, value={value}"
-            ))
-        })
-    })
-}
-
 /// Is this child underflowing (a merge candidate)? Leaves underflow by bytes.
 /// Internal nodes must be sparse by both direct-child count and their exact
 /// encoded size so a hot ε-buffer is never merged as "small."
@@ -467,383 +408,14 @@ pub fn is_underflow(child: &pb::FragmentTreeChild, config: &FragmentTreeConfig) 
     }
 }
 
-/// Whether replay checks each mutation's count deltas against the record it
-/// changes. Storage paths verify. The reducer oracle and lowering compare
-/// records only, with deltas left unset.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DeltaCheck {
-    Trust,
-    Verify,
-}
-
-/// Apply buffered mutations to an id-keyed fragment map in `(key, action_sequence)` order.
-/// `action_sequence` is assigned at commit time and only ever grows, so this
-/// order is the commit order per fragment wherever actions meet.
-pub fn apply_actions(
-    frags: &mut BTreeMap<u64, Fragment>,
-    actions: Vec<pb::FragmentTreeMutation>,
-) -> Result<()> {
-    apply_mutations(frags, actions, DeltaCheck::Trust)
-}
-
-/// Apply mutations and reject any whose stored deltas differ from the change
-/// they make. The record before and after is in hand here, so this is where
-/// the format's exact-delta rule is enforced.
-pub fn apply_verified(
-    frags: &mut BTreeMap<u64, Fragment>,
-    actions: Vec<pb::FragmentTreeMutation>,
-) -> Result<()> {
-    apply_mutations(frags, actions, DeltaCheck::Verify)
-}
-
-fn record_counts(fragment: Option<&Fragment>) -> (i64, i64, i64) {
-    fragment.map_or((0, 0, 0), |fragment| {
-        (
-            1,
-            fragment.physical_rows.unwrap_or(0) as i64,
-            fragment.num_rows().unwrap_or(0) as i64,
-        )
-    })
-}
-
-fn apply_mutations(
-    frags: &mut BTreeMap<u64, Fragment>,
-    mut actions: Vec<pb::FragmentTreeMutation>,
-    check: DeltaCheck,
-) -> Result<()> {
-    actions.sort_unstable_by_key(|tagged| tagged.action_sequence);
-    if actions
-        .windows(2)
-        .any(|pair| pair[0].action_sequence == pair[1].action_sequence)
-    {
-        return Err(super::validation::corrupt(
-            "Duplicate action sequence number on a fragment replay path",
-        ));
-    }
-    // Upserted records are validated as `apply_one` decodes them.
-    for tagged in &actions {
-        super::validation::action_target(tagged.action.as_ref().ok_or_else(|| {
-            super::validation::corrupt(format!(
-                "Buffered action sequence number {} has no action",
-                tagged.action_sequence
-            ))
-        })?)?;
-    }
-    actions.sort_by_key(|t| (action_key(t), t.action_sequence));
-    for tagged in actions {
-        let key = action_key(&tagged);
-        let before = record_counts(frags.get(&key));
-        if let Some(action) = tagged.action {
-            apply_one(frags, action)?;
-        }
-        if check == DeltaCheck::Verify {
-            let after = record_counts(frags.get(&key));
-            let actual = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
-            let stored = (
-                tagged.fragment_count_delta,
-                tagged.total_rows_delta,
-                tagged.visible_rows_delta,
-            );
-            if actual != stored {
-                return Err(super::validation::corrupt(format!(
-                    "Mutation action_sequence={} for fragment {key} stores fragment, row, and visible deltas {} {} {} but the record changed by {} {} {}",
-                    tagged.action_sequence,
-                    stored.0,
-                    stored.1,
-                    stored.2,
-                    actual.0,
-                    actual.1,
-                    actual.2
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn apply_one(frags: &mut BTreeMap<u64, Fragment>, action: pb::FragmentAction) -> Result<()> {
-    let Some(action) = action.action else {
-        return Err(super::validation::corrupt(
-            "Buffered action has no recognized variant",
-        ));
-    };
-    match action {
-        Action::UpsertFragment(f) => {
-            let fragment = super::validation::fragment(f)?;
-            frags.insert(fragment.id, fragment);
-        }
-        Action::RemoveFragment(id) => {
-            frags.remove(&id);
-        }
-        Action::AddDataFile(a) => {
-            let file = crate::format::DataFile::try_from(
-                a.file
-                    .ok_or_else(|| Error::invalid_input("AddDataFile action missing file"))?,
-            )?;
-            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "AddDataFile action targets missing frag_id={}",
-                    a.frag_id
-                ))
-            })?;
-            fragment.files.push(file);
-        }
-        Action::RemoveDataFile(a) => {
-            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "RemoveDataFile action targets missing frag_id={}",
-                    a.frag_id
-                ))
-            })?;
-            fragment.files.retain(|f| f.path != a.path);
-        }
-        Action::ReplaceDataFile(a) => {
-            if a.expected_path.is_empty() || a.path.is_empty() {
-                return Err(Error::invalid_input(format!(
-                    "ReplaceDataFile for frag_id={} is missing expected_path or path",
-                    a.frag_id
-                )));
-            }
-            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "ReplaceDataFile action targets missing frag_id={}",
-                    a.frag_id
-                ))
-            })?;
-            let matched = fragment
-                .files
-                .iter_mut()
-                .find(|file| file.path == a.expected_path)
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "ReplaceDataFile for frag_id={} names data file {} which the fragment \
-                         no longer holds; commit-time validation must have seen a different \
-                         state",
-                        a.frag_id, a.expected_path
-                    ))
-                })?;
-            matched.path = a.path.clone();
-            matched.file_size_bytes = lance_io::utils::CachedFileSize::new(a.file_size_bytes);
-            matched.base_id = a.base_id;
-        }
-        Action::AddDeletionFile(a) => {
-            let deletion_file = a.deletion_file.ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "AddDeletionFile action for frag_id={} is missing deletion_file",
-                    a.frag_id
-                ))
-            })?;
-            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "AddDeletionFile action targets missing frag_id={}",
-                    a.frag_id
-                ))
-            })?;
-            let count = usize::try_from(deletion_file.num_deleted_rows)
-                .map_err(|_| super::validation::corrupt("Deleted row count exceeds usize"))?;
-            // Fragment::num_rows subtracts this count from the physical rows
-            // unchecked, so an overcount must not reach the record.
-            if let Some(rows) = fragment.physical_rows
-                && count > rows
-            {
-                return Err(super::validation::corrupt(format!(
-                    "AddDeletionFile for frag_id={} deletes {count} rows but the fragment \
-                     has {rows} physical rows",
-                    a.frag_id
-                )));
-            }
-            let mut file = crate::format::DeletionFile::try_from(deletion_file)?;
-            file.num_deleted_rows = Some(count);
-            fragment.deletion_file = Some(file);
-        }
-        Action::ClearDeletionFile(a) => {
-            let fragment = frags.get_mut(&a.frag_id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "ClearDeletionFile action targets missing frag_id={}",
-                    a.frag_id
-                ))
-            })?;
-            fragment.deletion_file = None;
-        }
-    }
-    Ok(())
-}
-
-/// Normalize validated current-state actions, preserving each fragment's effect.
-///
-/// Callers must validate actions before combining them and retain the originals
-/// in transaction history. From `contiguous_from` onward, each fragment's history
-/// must be contiguous within this buffer, with no intervening action in another
-/// node. Earlier actions pass through unchanged.
-///
-/// The last whole-fragment reset establishes a known state, so its suffix can
-/// be evaluated once. Otherwise, deletion-file assignments form an independent
-/// last-writer-wins register, while file edits retain their order and first-path
-/// matching semantics. In particular, a path-changing replacement chain cannot
-/// be combined blindly: the second edit might match a different file slot.
-///
-/// Combined actions retain the last sequence number and the sum of aggregate
-/// deltas. If a sum overflows, the run stays unchanged.
-pub fn squash_buffer(
-    mut buffer: Vec<pb::FragmentTreeMutation>,
-    contiguous_from: u64,
-) -> Vec<pb::FragmentTreeMutation> {
-    // Distinct keys leave nothing to combine, and proving that costs far less
-    // than grouping every action by key. The order matches the grouped path,
-    // which sorts by action sequence with ties in key order.
-    let mut keys: Vec<u64> = buffer
-        .iter()
-        .filter(|tagged| tagged.action_sequence >= contiguous_from)
-        .map(action_key)
-        .collect();
-    keys.sort_unstable();
-    if keys.windows(2).all(|pair| pair[0] != pair[1]) {
-        buffer.sort_by_key(|tagged| (tagged.action_sequence, action_key(tagged)));
-        return buffer;
-    }
-    let mut squashed = Vec::new();
-    let mut runs: BTreeMap<u64, Vec<pb::FragmentTreeMutation>> = BTreeMap::new();
-    for tagged in buffer {
-        if tagged.action_sequence < contiguous_from {
-            squashed.push(tagged);
-        } else {
-            runs.entry(action_key(&tagged)).or_default().push(tagged);
-        }
-    }
-    for (key, mut run) in runs {
-        run.sort_by_key(|tagged| tagged.action_sequence);
-        if run.len() > 1 {
-            run = squash_run(key, run);
-        }
-        squashed.extend(run);
-    }
-    squashed.sort_by_key(|tagged| tagged.action_sequence);
-    squashed
-}
-
 /// Parents of leaves can combine all their history. They have no deeper buffers,
 /// and ancestors drain whole buckets into them. Above interiors, older history
 /// may interleave with deeper buffers, so the sequence boundary still applies.
-pub(crate) fn combine_from(children: &[pb::FragmentTreeChild], contiguous_from: u64) -> u64 {
+pub(super) fn combine_from(children: &[pb::FragmentTreeChild], contiguous_from: u64) -> u64 {
     if children.iter().all(|child| child.height == 0) {
         0
     } else {
         contiguous_from
-    }
-}
-
-fn combined(run: &[pb::FragmentTreeMutation], action: Action) -> Option<pb::FragmentTreeMutation> {
-    Some(pb::FragmentTreeMutation {
-        action_sequence: run.last()?.action_sequence,
-        action: Some(pb::FragmentAction {
-            action: Some(action),
-        }),
-        fragment_count_delta: run
-            .iter()
-            .try_fold(0i64, |sum, t| sum.checked_add(t.fragment_count_delta))?,
-        total_rows_delta: run
-            .iter()
-            .try_fold(0i64, |sum, t| sum.checked_add(t.total_rows_delta))?,
-        visible_rows_delta: run
-            .iter()
-            .try_fold(0i64, |sum, t| sum.checked_add(t.visible_rows_delta))?,
-    })
-}
-
-fn squash_run(key: u64, run: Vec<pb::FragmentTreeMutation>) -> Vec<pb::FragmentTreeMutation> {
-    if run
-        .iter()
-        .any(|t| t.action.as_ref().and_then(|a| a.action.as_ref()).is_none())
-    {
-        return run;
-    }
-    if let Some(reset) = run.iter().rposition(|t| {
-        matches!(
-            t.action.as_ref().and_then(|a| a.action.as_ref()),
-            Some(Action::UpsertFragment(_)) | Some(Action::RemoveFragment(_))
-        )
-    }) {
-        let mut state = BTreeMap::new();
-        if apply_actions(&mut state, run[reset..].to_vec()).is_err() {
-            return run;
-        }
-        let action = match state.remove(&key) {
-            Some(fragment) => Action::UpsertFragment(pb::DataFragment::from(&fragment)),
-            None => Action::RemoveFragment(key),
-        };
-        return combined(&run, action).map_or(run, |t| vec![t]);
-    }
-
-    // File edits leave the deletion register and fragment existence unchanged.
-    // Its assignments therefore commute across those edits on validated input.
-    let mut deletion: Vec<pb::FragmentTreeMutation> = Vec::new();
-    let mut files: Vec<pb::FragmentTreeMutation> = Vec::with_capacity(run.len());
-    for tagged in &run {
-        let Some(next) = tagged.action.as_ref().and_then(|a| a.action.as_ref()) else {
-            return run;
-        };
-        if matches!(
-            next,
-            Action::AddDeletionFile(_) | Action::ClearDeletionFile(_)
-        ) {
-            deletion.push(tagged.clone());
-            continue;
-        }
-        let mut current = tagged.clone();
-        while let Some(action) = files.last().and_then(|prev| {
-            combine_file_pair(
-                prev.action.as_ref()?.action.as_ref()?,
-                current.action.as_ref()?.action.as_ref()?,
-            )
-        }) {
-            let start = files.len() - 1;
-            let pair = [files[start].clone(), current];
-            let Some(merged) = combined(&pair, action) else {
-                return run;
-            };
-            files.pop();
-            current = merged;
-        }
-        files.push(current);
-    }
-    if let Some(last) = deletion.last() {
-        let Some(action) = last.action.as_ref().and_then(|a| a.action.clone()) else {
-            return run;
-        };
-        let Some(merged) = combined(&deletion, action) else {
-            return run;
-        };
-        files.push(merged);
-    }
-    files.sort_by_key(|t| t.action_sequence);
-    files
-}
-
-/// Only identities valid for ordered lists with arbitrary path aliases belong
-/// here. Path uniqueness is not part of the storage action contract.
-fn combine_file_pair(first: &Action, second: &Action) -> Option<Action> {
-    match (first, second) {
-        (Action::RemoveDataFile(a), Action::RemoveDataFile(b)) if a.path == b.path => {
-            Some(Action::RemoveDataFile(b.clone()))
-        }
-        (Action::AddDataFile(a), Action::RemoveDataFile(b)) if a.file.as_ref()?.path == b.path => {
-            // The remove still has to delete any same-path files in the base.
-            Some(Action::RemoveDataFile(b.clone()))
-        }
-        (Action::ReplaceDataFile(a), Action::ReplaceDataFile(b))
-            if a.expected_path == a.path && a.expected_path == b.expected_path =>
-        {
-            // The first edit did not rename the slot, so both find the same
-            // first matching path, including when the base has duplicate paths.
-            Some(Action::ReplaceDataFile(pb::ReplaceDataFile {
-                frag_id: a.frag_id,
-                expected_path: a.expected_path.clone(),
-                path: b.path.clone(),
-                file_size_bytes: b.file_size_bytes,
-                base_id: b.base_id,
-            }))
-        }
-        _ => None,
     }
 }
 
@@ -991,10 +563,9 @@ pub fn split_internal(
 
 #[cfg(test)]
 mod tests {
-    mod reduction;
     use super::*;
-    use crate::format::{DeletionFile, DeletionFileType};
-    use crate::fragment_metadata::support::{make_backfill_data_file, make_fragment};
+    use crate::fragment_metadata::action;
+    use crate::fragment_metadata::support::make_backfill_data_file;
 
     fn tagged(action: pb::FragmentAction) -> pb::FragmentTreeMutation {
         pb::FragmentTreeMutation {
@@ -1110,119 +681,5 @@ mod tests {
             .collect();
         assert!(buffer_pressured(&pending, &config));
         assert!(!internal_overflows(&children, &pending, &config));
-    }
-
-    #[test]
-    fn clear_deletion_file_action() {
-        let mut fragment = make_fragment(7);
-        fragment.deletion_file = Some(DeletionFile {
-            read_version: 3,
-            id: 11,
-            file_type: DeletionFileType::Bitmap,
-            num_deleted_rows: Some(1),
-            base_id: None,
-        });
-        let mut fragments = BTreeMap::from([(fragment.id, fragment)]);
-
-        apply_actions(&mut fragments, vec![tagged(action::clear_deletion_file(7))]).unwrap();
-
-        assert_eq!(fragments[&7].deletion_file, None);
-    }
-
-    #[test]
-    fn replace_data_file_swaps_the_named_file_only() {
-        use crate::fragment_metadata::support::make_replacement_data_file;
-
-        let fragment = make_fragment(7);
-        let expected_path = fragment.files[0].path.clone();
-        let mut fragments = BTreeMap::from([(fragment.id, fragment)]);
-        let replacement = make_replacement_data_file(7, 0);
-        apply_actions(
-            &mut fragments,
-            vec![tagged(action::replace_data_file(
-                7,
-                &expected_path,
-                &replacement,
-            ))],
-        )
-        .unwrap();
-        assert_eq!(fragments[&7].files.len(), 1);
-        assert_eq!(fragments[&7].files[0].path, replacement.path);
-
-        // The named file is gone: a storage invariant violation, not a user error.
-        let error = apply_actions(
-            &mut fragments,
-            vec![tagged(action::replace_data_file(
-                7,
-                &expected_path,
-                &replacement,
-            ))],
-        )
-        .unwrap_err();
-        assert!(matches!(error, Error::Internal { .. }), "{error}");
-    }
-
-    #[test]
-    fn add_deletion_file_rejects_more_deleted_rows_than_physical_rows() {
-        let fragment = make_fragment(7).with_physical_rows(2);
-        let mut fragments = BTreeMap::from([(fragment.id, fragment)]);
-        let overcount = pb::FragmentAction {
-            action: Some(Action::AddDeletionFile(pb::AddDeletionFile {
-                frag_id: 7,
-                deletion_file: Some(pb::DeletionFile {
-                    read_version: 3,
-                    id: 11,
-                    file_type: pb::deletion_file::DeletionFileType::Bitmap.into(),
-                    num_deleted_rows: 3,
-                    base_id: None,
-                }),
-            })),
-        };
-
-        let error = apply_actions(&mut fragments, vec![tagged(overcount)]).unwrap_err();
-
-        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
-        let message = error.to_string();
-        assert!(message.contains("frag_id=7"), "{message}");
-        assert!(message.contains("deletes 3 rows"), "{message}");
-        assert_eq!(fragments[&7].deletion_file, None);
-    }
-
-    #[test]
-    fn mutation_actions_reject_missing_fragment() {
-        let deletion_file = pb::DeletionFile {
-            read_version: 3,
-            id: 11,
-            file_type: pb::deletion_file::DeletionFileType::Bitmap.into(),
-            num_deleted_rows: 1,
-            base_id: None,
-        };
-        let cases = [
-            (
-                "AddDataFile",
-                action::add_data_file(7, &make_backfill_data_file(7, 0)),
-            ),
-            (
-                "RemoveDataFile",
-                action::remove_data_file(7, "missing.lance"),
-            ),
-            (
-                "AddDeletionFile",
-                pb::FragmentAction {
-                    action: Some(Action::AddDeletionFile(pb::AddDeletionFile {
-                        frag_id: 7,
-                        deletion_file: Some(deletion_file),
-                    })),
-                },
-            ),
-        ];
-
-        for (action_name, action) in cases {
-            let error = apply_actions(&mut BTreeMap::new(), vec![tagged(action)]).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }));
-            let message = error.to_string();
-            assert!(message.contains(action_name), "{message}");
-            assert!(message.contains("frag_id=7"), "{message}");
-        }
     }
 }

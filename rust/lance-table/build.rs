@@ -4,10 +4,12 @@
 use std::io::Result;
 
 fn main() -> Result<()> {
-    // Watch files explicitly: Cargo may miss changes through the protos symlink.
+    // Cargo may miss changes through the protos symlink, so name every
+    // compiled proto and every proto they import.
     println!("cargo:rerun-if-changed=protos/table.proto");
     println!("cargo:rerun-if-changed=protos/fragment_metadata.proto");
     println!("cargo:rerun-if-changed=protos/file.proto");
+    println!("cargo:rerun-if-changed=protos/clustering.proto");
     println!("cargo:rerun-if-changed=protos/transaction.proto");
     println!("cargo:rerun-if-changed=protos/rowids.proto");
 

@@ -3,8 +3,11 @@
 
 //! Storage-action constructors and routing keys.
 //!
-//! These constructors do not validate actions. Tree preparation checks them
-//! against the resolved fragment state before storing them.
+//! Constructors refuse only what an action cannot encode, an unknown row or
+//! deleted-row count. Tree preparation checks every action against the
+//! resolved fragment state before storing it.
+
+use lance_core::{Error, Result};
 
 use crate::format::pb::{self, fragment_action::Action};
 use crate::format::{DataFile, DeletionFile, DeletionFileType, Fragment};
@@ -45,10 +48,11 @@ pub fn replace_data_file(frag_id: u64, expected_path: &str, file: &DataFile) -> 
 }
 
 /// Insert a fragment, or replace the whole record of an existing one.
-pub fn upsert_fragment(fragment: &Fragment) -> pb::FragmentAction {
-    pb::FragmentAction {
+pub fn upsert_fragment(fragment: &Fragment) -> Result<pb::FragmentAction> {
+    require_known_counts(fragment)?;
+    Ok(pb::FragmentAction {
         action: Some(Action::UpsertFragment(pb::DataFragment::from(fragment))),
-    }
+    })
 }
 
 /// Remove a whole fragment (tombstone).
@@ -59,23 +63,49 @@ pub fn remove_fragment(frag_id: u64) -> pb::FragmentAction {
 }
 
 /// Attach or replace the deletion file for `frag_id`.
-pub fn add_deletion_file(frag_id: u64, deletion_file: &DeletionFile) -> pb::FragmentAction {
+pub fn add_deletion_file(frag_id: u64, deletion_file: &DeletionFile) -> Result<pb::FragmentAction> {
+    let num_deleted_rows = known_deleted_rows(frag_id, deletion_file)?;
     let file_type = match deletion_file.file_type {
         DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
         DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
     };
-    pb::FragmentAction {
+    Ok(pb::FragmentAction {
         action: Some(Action::AddDeletionFile(pb::AddDeletionFile {
             frag_id,
             deletion_file: Some(pb::DeletionFile {
                 read_version: deletion_file.read_version,
                 id: deletion_file.id,
                 file_type: file_type.into(),
-                num_deleted_rows: deletion_file.num_deleted_rows.unwrap_or_default() as u64,
+                num_deleted_rows: num_deleted_rows as u64,
                 base_id: deletion_file.base_id,
             }),
         })),
+    })
+}
+
+/// Every count in the tree format is known, and the protobuf encoding
+/// writes an unknown count as zero, so a record must state both counts
+/// before it is encoded.
+pub(super) fn require_known_counts(fragment: &Fragment) -> Result<()> {
+    if fragment.physical_rows.is_none() {
+        return Err(Error::invalid_input(format!(
+            "fragment {} has no physical row count; the fragment metadata tree requires known counts",
+            fragment.id
+        )));
     }
+    match &fragment.deletion_file {
+        Some(deletion_file) => known_deleted_rows(fragment.id, deletion_file).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+fn known_deleted_rows(frag_id: u64, deletion_file: &DeletionFile) -> Result<usize> {
+    deletion_file.num_deleted_rows.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "fragment {frag_id} has a deletion file without a deleted-row count; the fragment \
+             metadata tree requires known counts"
+        ))
+    })
 }
 
 /// Clear the deletion file attached to `frag_id`.
@@ -95,5 +125,53 @@ pub fn target_frag_id(action: &pb::FragmentAction) -> Option<u64> {
         Action::ReplaceDataFile(a) => Some(a.frag_id),
         Action::AddDeletionFile(a) => Some(a.frag_id),
         Action::ClearDeletionFile(a) => Some(a.frag_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fragment_metadata::support::make_fragment;
+    use rstest::rstest;
+
+    #[derive(Clone, Copy, Debug)]
+    enum UnknownCount {
+        UpsertPhysical,
+        UpsertDeleted,
+        AddedDeletionFile,
+    }
+
+    /// The protobuf encoding would store an unknown count as a known zero,
+    /// so the constructors refuse it before encoding.
+    #[rstest]
+    #[case::upserted_physical_rows(UnknownCount::UpsertPhysical, "no physical row count")]
+    #[case::upserted_deleted_rows(UnknownCount::UpsertDeleted, "without a deleted-row count")]
+    #[case::added_deleted_rows(UnknownCount::AddedDeletionFile, "without a deleted-row count")]
+    fn constructors_refuse_unknown_counts(#[case] unknown: UnknownCount, #[case] expected: &str) {
+        let deletion_file = DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: None,
+            base_id: None,
+        };
+        let mut fragment = make_fragment(2);
+        let error = match unknown {
+            UnknownCount::UpsertPhysical => {
+                fragment.physical_rows = None;
+                upsert_fragment(&fragment)
+            }
+            UnknownCount::UpsertDeleted => {
+                fragment.deletion_file = Some(deletion_file);
+                upsert_fragment(&fragment)
+            }
+            UnknownCount::AddedDeletionFile => add_deletion_file(2, &deletion_file),
+        }
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("fragment 2"), "{message}");
+        assert!(message.contains(expected), "{message}");
+        assert!(message.contains("requires known counts"), "{message}");
     }
 }
