@@ -195,7 +195,10 @@ async fn singleton_repair_leaves_the_callers_pending_actions_unmaterialized() {
 async fn root_shrink_that_overflows_never_publishes_a_single_child_interior(
     #[case] mode: CommitMode,
 ) {
-    let policy = SnapshotPolicy::default();
+    let policy = SnapshotPolicy {
+        inline_root_bytes: 0,
+        max_suffix_bytes: 0,
+    };
     let config = FragmentTreeConfig::new(16 * 1024, 16).with_max_leaf_bytes(64 * 1024);
     let mut fixture = Fixture::new(0, config.clone(), policy).await;
     let mut expected: Vec<Fragment> = (0..5).map(make_fragment).collect();
@@ -274,6 +277,7 @@ async fn root_shrink_that_overflows_never_publishes_a_single_child_interior(
         .await
         .unwrap();
 
+    fixture.io.incremental_stats();
     let (tree, stats) = fixture
         .tree
         .begin_commit(mode)
@@ -283,6 +287,11 @@ async fn root_shrink_that_overflows_never_publishes_a_single_child_interior(
         )
         .await
         .unwrap();
+    assert_eq!(
+        stats.tree_write_bytes,
+        fixture.io.stats().written_bytes,
+        "{stats:?}"
+    );
     // Only a bulk rewrite drains both buffers, so in incremental mode this
     // shows that the root collapse retried the commit in bulk.
     assert_eq!(
@@ -3606,7 +3615,10 @@ async fn drain_rejects_a_replacement_that_misstates_its_delta() {
 /// bulk rather than persisting that chain.
 #[tokio::test]
 async fn collapsing_to_one_leaf_rebuilds_instead_of_persisting_a_chain() {
-    let policy = SnapshotPolicy::default();
+    let policy = SnapshotPolicy {
+        inline_root_bytes: 0,
+        max_suffix_bytes: 0,
+    };
     let config = FragmentTreeConfig::new(512, u32::MAX)
         .with_max_leaf_bytes(1024)
         .with_semantic_buffer_bytes(1);
@@ -3621,7 +3633,13 @@ async fn collapsing_to_one_leaf_rebuilds_instead_of_persisting_a_chain() {
         .filter(|id| *id != survivor)
         .map(action::remove_fragment)
         .collect();
-    fixture.commit(actions, policy, false).await;
+    fixture.io.incremental_stats();
+    let stats = fixture.commit(actions, policy, false).await;
+    assert_eq!(
+        stats.tree_write_bytes,
+        fixture.io.stats().written_bytes,
+        "{stats:?}"
+    );
 
     let reopened = fixture
         .open(&fixture.tree.descriptor, fixture.tree.version())

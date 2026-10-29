@@ -65,15 +65,13 @@ impl ValidatedCommit {
                 frontier = frontier.max(next);
             }
         }
-        if let Some(next) = self.next_fragment_id {
-            if next < frontier || next > u64::from(u32::MAX) + 1 {
-                return Err(Error::invalid_input(format!(
-                    "Fragment ID frontier {next} must be between {frontier} and 2^32"
-                )));
-            }
-            frontier = next;
+        let next = self.next_fragment_id.unwrap_or(frontier);
+        if next < frontier || next > u64::from(u32::MAX) + 1 {
+            return Err(Error::invalid_input(format!(
+                "Fragment ID frontier {next} must be between {frontier} and 2^32"
+            )));
         }
-        Ok(frontier)
+        Ok(next)
     }
 }
 
@@ -372,6 +370,27 @@ mod tests {
         make_backfill_data_file, make_fragment, make_replacement_data_file,
     };
     use rstest::rstest;
+
+    #[rstest]
+    #[case::past_address_space(u64::from(u32::MAX) + 2)]
+    #[case::maximum_u64(u64::MAX)]
+    fn allocation_frontier_rejects_invalid_current(#[case] current: u64) {
+        let commit = ValidatedCommit::fragment_actions(Vec::new());
+        let error = commit.allocation_frontier(current).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains(&current.to_string()), "{message}");
+        assert!(message.contains("2^32"), "{message}");
+    }
+
+    #[test]
+    fn allocation_frontier_preserves_exhausted_address_space() {
+        let current = u64::from(u32::MAX) + 1;
+        let commit = ValidatedCommit::fragment_actions(Vec::new());
+
+        assert_eq!(commit.allocation_frontier(current).unwrap(), current);
+    }
 
     #[test]
     fn data_replacement_encodes_matching_or_disjoint_fields() {

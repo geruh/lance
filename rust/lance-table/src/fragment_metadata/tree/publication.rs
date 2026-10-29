@@ -390,7 +390,9 @@ impl FragmentTree {
             self.buffer_index.take();
             self.children = before_rewrite.children;
             self.buffer = before_rewrite.buffer;
+            let abandoned_bytes = acc.io_bytes;
             acc = self.rewrite_tree(CommitMode::Bulk).await?;
+            acc.io_bytes += abandoned_bytes;
         }
         let (descriptor, bytes) =
             checkpoint(&self.store, &self.config, self.compacted_root(), policy).await?;

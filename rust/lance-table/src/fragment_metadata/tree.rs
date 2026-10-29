@@ -1496,6 +1496,9 @@ impl FragmentTree {
                     .try_collect()
                     .await?;
                 if results.iter().any(|(_, (_, a))| a.collapses > 0) {
+                    for (_, (_, work)) in results {
+                        acc.io_bytes += work.io_bytes;
+                    }
                     acc.collapses += 1;
                     return Ok((children, buckets.into_buffer(), acc));
                 }
