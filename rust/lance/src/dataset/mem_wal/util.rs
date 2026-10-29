@@ -151,11 +151,13 @@ pub(crate) fn derived_store_params(params: &ObjectStoreParams) -> ObjectStorePar
     }
 }
 
+pub(crate) const MEM_WAL_DIR: &str = "_mem_wal";
+
 /// Path to the MemWAL root directory.
 ///
 /// Returns: `{base_path}/_mem_wal/`
 pub fn mem_wal_path(base_path: &Path) -> Path {
-    base_path.clone().join("_mem_wal")
+    base_path.clone().join(MEM_WAL_DIR)
 }
 
 /// Base path for a shard within the MemWAL directory.
