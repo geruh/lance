@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::mem_wal::util::MEM_WAL_DIR;
+use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
 use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use crate::utils::temporal::utc_now;
@@ -706,7 +706,7 @@ impl Branches<'_> {
         if let Some(owner) = remaining_branches.iter().find(|remaining| {
             let remaining = BranchRelativePath::new(remaining);
             remaining.is_parent(&target)
-                && DATASET_DIRS.contains(&target.segments[remaining.segments.len()])
+                && is_dataset_dir(target.segments[remaining.segments.len()])
         }) {
             log::warn!(
                 "Keeping {} after deleting branch {}, since it lies in a dataset directory of branch {}",
@@ -1089,8 +1089,11 @@ const DATASET_DIRS: &[&str] = &[
     INDICES_DIR,
     BLOBS_DIR,
     FRAG_REUSE_DIR,
-    MEM_WAL_DIR,
 ];
+
+fn is_dataset_dir(segment: &str) -> bool {
+    DATASET_DIRS.contains(&segment) || is_mem_wal_dir_name(segment)
+}
 
 /// Only restrict new branches so older branch names remain accessible.
 pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
@@ -1098,7 +1101,7 @@ pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
     if let Some(segment) = branch_name
         .split('/')
         .skip(1)
-        .find(|segment| DATASET_DIRS.contains(segment))
+        .find(|segment| is_dataset_dir(segment))
     {
         return Err(Error::InvalidRef {
             message: format!(
@@ -1242,6 +1245,7 @@ mod tests {
     #[case::blobs("outer/_blobs")]
     #[case::frag_reuse("outer/_fri")]
     #[case::mem_wal("outer/_mem_wal")]
+    #[case::dir_id_mem_wal("outer/_a1b2c3d4_mem_wal")]
     #[case::below_a_nested_branch("a/b/_indices")]
     #[case::above_another_segment("a/data/b")]
     fn new_branch_cannot_nest_in_a_dataset_directory(#[case] branch_name: &str) {
