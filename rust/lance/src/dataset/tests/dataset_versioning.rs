@@ -1740,6 +1740,7 @@ async fn create_branch_before_name_check(source: &Dataset, branch: &str) {
 #[case::data_directory("data", true)]
 #[case::versions_directory("_versions", true)]
 #[case::deletions_directory("_deletions", true)]
+#[case::dir_id_mem_wal_directory("_a1b2c3d4_mem_wal", true)]
 #[case::ordinary_name("child", false)]
 #[tokio::test]
 async fn deleting_nested_branch_preserves_parent(

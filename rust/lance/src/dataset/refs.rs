@@ -1480,6 +1480,7 @@ mod tests {
     #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
     #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
     #[case::data_directory_of_a_remaining_parent("outer/data", &["outer"], None)]
+    #[case::dir_id_mem_wal_directory_of_a_remaining_parent("outer/_a1b2c3d4_mem_wal", &["outer"], None)]
     #[case::versions_directory_of_a_nested_parent("a/b/_versions", &["a", "a/b", "c"], None)]
     #[case::inside_the_data_directory_of_a_remaining_ancestor("a/data/x", &["a", "a/data/y"], None)]
     #[case::directory_name_without_a_remaining_parent("outer/data", &["other"], Some("outer"))]
