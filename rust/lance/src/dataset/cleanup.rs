@@ -845,6 +845,7 @@ impl<'a> CleanupTask<'a> {
                     .entry(key)
                     .or_default()
                     .clone();
+                let scan_owner_base_ids = owner_base_ids.clone();
                 async move {
                     let scanned = cell
                         .get_or_try_init(|| async {
@@ -858,7 +859,7 @@ impl<'a> CleanupTask<'a> {
                             let paths = super::blob::managed_paths(
                                 dataset,
                                 self.dataset,
-                                &owner_base_ids,
+                                &scan_owner_base_ids,
                                 fragment.scan(),
                             )
                             .await?;
