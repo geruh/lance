@@ -5012,13 +5012,27 @@ mod tests {
         );
     }
 
+    fn local_file_uri(scheme: &str, path: &str) -> String {
+        let path = path.replace('\\', "/");
+        let path_prefix = if path.starts_with('/') { "" } else { "/" };
+        format!("{scheme}://{path_prefix}{path}")
+    }
+
+    #[test]
+    fn local_file_uri_keeps_windows_drive_letters_out_of_authority() {
+        assert_eq!(
+            local_file_uri("file-object-store", r"C:\Users\runner\dataset"),
+            "file-object-store:///C:/Users/runner/dataset"
+        );
+    }
+
     #[rstest]
     #[case::recorded_spelling(str::to_string)]
-    #[case::file_url(|path: &str| format!("file://{path}"))]
+    #[case::file_url(|path: &str| local_file_uri("file", path))]
     #[case::trailing_slash(|path: &str| format!("{path}/"))]
     #[case::dot_segments(|path: &str| format!("{path}/./sub/.."))]
-    #[case::percent_encoded(|path: &str| format!("file://{}", path.replace('.', "%2E")))]
-    #[case::scheme_alias(|path: &str| format!("file-object-store://{path}"))]
+    #[case::percent_encoded(|path: &str| local_file_uri("file", &path.replace('.', "%2E")))]
+    #[case::scheme_alias(|path: &str| local_file_uri("file-object-store", path))]
     #[tokio::test]
     async fn cleanup_keeps_parent_objects_of_branch_recorded_under_another_uri_spelling(
         #[case] respell: fn(&str) -> String,
@@ -5093,7 +5107,7 @@ mod tests {
 
     #[rstest]
     #[case::recorded_path(str::to_string)]
-    #[case::file_object_store_scheme(|dir: &str| format!("file-object-store://{dir}"))]
+    #[case::file_object_store_scheme(|dir: &str| local_file_uri("file-object-store", dir))]
     #[tokio::test]
     async fn cleanup_keeps_then_reclaims_a_branch_blob_on_a_nested_base(
         #[case] base_uri: fn(&str) -> String,
