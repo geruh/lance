@@ -1738,6 +1738,7 @@ async fn create_branch_before_name_check(source: &Dataset, branch: &str) {
 
 #[rstest]
 #[case::data_directory("data", true)]
+#[case::data_directory_case_alias("Data", true)]
 #[case::versions_directory("_versions", true)]
 #[case::deletions_directory("_deletions", true)]
 #[case::dir_id_mem_wal_directory("_a1b2c3d4_mem_wal", true)]

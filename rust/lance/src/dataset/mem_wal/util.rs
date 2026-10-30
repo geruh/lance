@@ -156,6 +156,7 @@ const LEGACY_MEM_WAL_DIR: &str = "_mem_wal";
 
 /// Returns whether `name` is a directory owned by a MemWAL index.
 pub(crate) fn is_mem_wal_dir_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
     name == LEGACY_MEM_WAL_DIR
         || name
             .strip_prefix('_')

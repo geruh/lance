@@ -1092,7 +1092,10 @@ const DATASET_DIRS: &[&str] = &[
 ];
 
 fn is_dataset_dir(segment: &str) -> bool {
-    DATASET_DIRS.contains(&segment) || is_mem_wal_dir_name(segment)
+    DATASET_DIRS
+        .iter()
+        .any(|directory| segment.eq_ignore_ascii_case(directory))
+        || is_mem_wal_dir_name(segment)
 }
 
 /// Only restrict new branches so older branch names remain accessible.
@@ -1238,6 +1241,7 @@ mod tests {
 
     #[rstest]
     #[case::data("outer/data")]
+    #[case::data_case_alias("outer/Data")]
     #[case::versions("outer/_versions")]
     #[case::transactions("outer/_transactions")]
     #[case::deletions("outer/_deletions")]
