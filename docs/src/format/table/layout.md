@@ -81,6 +81,9 @@ First, the reader determines the base path: if `base_id` is absent, the base pat
 Second, the reader constructs the full file path based on whether the base path represents a dataset root.
 For dataset roots (when `is_dataset_root` is true), the full path includes standard subdirectories: data files are located under `data/`, deletion files under `_deletions/`, and indices under `_indices/`.
 For non-root base paths (when `is_dataset_root` is false), the base path points directly to the file directory, and the file path is appended directly without subdirectory prefixes.
+An explicit deletion file path (`DeletionFile.path`) already starts with `_deletions/`, so it is appended to the root of the dataset its `base_id` names, which must be a dataset root.
+A shallow clone keeps the path: a deletion file without `base_id` is given the source's `base_id` (in a fragment tree, it inherits it from the tree object that holds it), and one that already has a `base_id` keeps it.
+A deep clone copies the file to the same path under the new dataset and clears `base_id`.
 
 ### Example Complex Layout Scenarios
 
@@ -186,11 +189,15 @@ Example: `data/101100101101010011010110a1b2c3d4e5f6g7h8i9j0.lance`
 
 ### Deletion Files
 
-Pattern: `_deletions/{fragment_id}-{read_version}-{id}.{extension}`
+Pattern: `_deletions/{fragment_id}-{read_version}-{id}.{extension}`, or `_deletions/{uuid}.{extension}` for a deletion file that records its own path
 
 Deletion files use two extensions: `.arrow` for Arrow IPC format (sparse deletions) and `.bin` for Roaring bitmap format (dense deletions).
 
-Example: `_deletions/42-10-a1b2c3d4.arrow`
+Example: `_deletions/42-10-a1b2c3d4.arrow`, or `_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin`
+
+The first form is derived from the id of the owning fragment.
+The second is recorded in `DeletionFile.path` with a random UUID, so it stays valid when the fragment is given a different id.
+See [Deletion Files](index.md#deletion-files).
 
 ### Transaction Files
 

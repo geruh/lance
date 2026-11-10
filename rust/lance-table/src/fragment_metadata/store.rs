@@ -1280,6 +1280,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: Some(2),
+            path: Some(uuid::Uuid::from_u128(7).into()),
         });
         fragment
             .overlays
@@ -1320,6 +1321,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(0),
             base_id: None,
+            path: None,
         });
         let written = store
             .write_leaf(std::slice::from_ref(&fragment), 0)
@@ -1410,6 +1412,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(0),
             base_id: None,
+            path: None,
         });
         let written = store.write_leaf(&fragments, 0).await.unwrap();
         for fragment in &fragments {

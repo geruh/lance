@@ -1041,6 +1041,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
         });
         let mut fragments = BTreeMap::from([(fragment.id, fragment)]);
 
@@ -1090,6 +1091,7 @@ mod tests {
             file_type: pb::deletion_file::DeletionFileType::Bitmap.into(),
             num_deleted_rows: 1,
             base_id: None,
+            path: None,
         };
         let cases = [
             (

@@ -28,7 +28,8 @@ use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
-    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+    DataFile, DeletionFile, DeletionFilePath, DeletionFileType, Fragment, RowDatasetVersionMeta,
+    RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
@@ -602,12 +603,14 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
+    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, path=None))]
     fn new(
         read_version: u64,
         id: u64,
         file_type: &str,
         num_deleted_rows: usize,
         base_id: Option<u32>,
+        path: Option<String>,
     ) -> PyResult<Self> {
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
@@ -619,12 +622,17 @@ impl PyDeletionFile {
                 )));
             }
         };
+        let path = path
+            .map(|path| DeletionFilePath::try_new(&path, &file_type))
+            .transpose()
+            .infer_error()?;
         Ok(Self(DeletionFile {
             read_version,
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            path,
         }))
     }
 
@@ -639,6 +647,15 @@ impl PyDeletionFile {
             slf.0.num_deleted_rows,
         )?;
         dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
+        // Only an explicit path is listed, so the dict of a file whose path is
+        // derived from its fragment id still builds a `DeletionFile` in
+        // versions that do not take `path`, and one that has a path fails there.
+        if let Some(path) = &slf.0.path {
+            dict.set_item(
+                intern!(slf.py(), "path"),
+                path.relative_path(&slf.0.file_type),
+            )?;
+        }
 
         Ok(dict)
     }
@@ -648,6 +665,9 @@ impl PyDeletionFile {
         write!(repr, "type='{}'", self.file_type()).unwrap();
         if let Some(num_deleted_rows) = self.0.num_deleted_rows {
             write!(repr, ", num_deleted_rows={}", num_deleted_rows).unwrap();
+        }
+        if let Some(path) = &self.0.path {
+            write!(repr, ", path='{}'", path.relative_path(&self.0.file_type)).unwrap();
         }
         write!(repr, ")").unwrap();
         repr

@@ -844,10 +844,12 @@ async fn test_overwrite_rejects_fragment_with_deletion_file(
     // the overwrite does not make renumbering the fragment any safer.
     #[values(None, Some(HashMap::from([("key".to_string(), "value".to_string())])))]
     config_upsert_values: Option<HashMap<String, String>>,
+    // An explicit path would survive the renumbering, but is refused as well.
+    #[values(false, true)] explicit_path: bool,
 ) {
-    // A deletion file's path embeds the fragment id, so it cannot follow its
-    // fragment to the fresh id an overwrite assigns. Such a fragment belongs to
-    // the dataset being replaced, so the operation is rejected rather than
+    // A derived deletion file path embeds the fragment id, so it cannot follow
+    // its fragment to the fresh id an overwrite assigns. Such a fragment belongs
+    // to the dataset being replaced, so the operation is rejected rather than
     // silently losing the deletions.
     let test_dir = TempStrDir::default();
     let reader = gen_batch()
@@ -856,10 +858,17 @@ async fn test_overwrite_rejects_fragment_with_deletion_file(
     let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
         .await
         .unwrap();
-    dataset.delete("i < 3").await.unwrap();
+    if explicit_path {
+        dataset = crate::utils::test::delete_with_explicit_path(&dataset, 0, &[0, 1, 2]).await;
+    } else {
+        dataset.delete("i < 3").await.unwrap();
+    }
 
     let fragment = dataset.manifest.fragments[0].clone();
-    assert!(fragment.deletion_file.is_some());
+    assert_eq!(
+        fragment.deletion_file.as_ref().unwrap().path.is_some(),
+        explicit_path
+    );
     let schema = dataset.schema().clone();
     let read_version = dataset.manifest.version;
 

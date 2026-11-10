@@ -143,6 +143,12 @@ message Manifest {
    * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
    * * 1 << 12: fragment records live in fragment_tree. The fragments list
    *   must be empty. Readers that do not know this bit must refuse the dataset.
+   * * 1 << 20: EXPERIMENTAL, like DeletionFile.path: some fragment's deletion
+   *   file records its own location in DeletionFile.path. Readers that do not
+   *   know this bit would derive the location from the fragment id and miss the
+   *   file, so they must refuse the dataset. This bit is paired in the reader
+   *   and writer feature words and is one-way: it stays set on every later
+   *   version.
    */
   uint64 reader_feature_flags = 9;
 

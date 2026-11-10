@@ -26,6 +26,7 @@ use crate::session::caches::ManifestKey;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
@@ -49,7 +50,7 @@ use lance_file::{
     writer::FileWriterOptions,
 };
 use lance_io::assert_io_eq;
-use lance_table::feature_flags;
+use lance_table::feature_flags::{self, FLAG_DELETION_FILES, FLAG_UNSTABLE_DELETION_FILE_PATHS};
 use lance_table::format::{BasePath, Fragment, pb};
 use object_store::ObjectStoreExt;
 use prost::Message;
@@ -614,8 +615,13 @@ fn first_base_id(dataset: &Dataset) -> u32 {
         .expect("shallow clone data files must reference the source base")
 }
 
+#[rstest]
+#[case::derived_deletion_path(false)]
+#[case::explicit_deletion_path(true)]
 #[tokio::test]
-async fn test_shallow_clone_base_artifacts_use_base_object_store() {
+async fn test_shallow_clone_base_artifacts_use_base_object_store(
+    #[case] explicit_deletion_path: bool,
+) {
     let source_dir = tempfile::tempdir().unwrap();
     let clone_dir = tempfile::tempdir().unwrap();
     let source_uri = file_object_store_uri(source_dir.path());
@@ -632,7 +638,18 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
         )
         .await
         .unwrap();
-    source.delete("id < 4").await.unwrap();
+    if explicit_deletion_path {
+        // Fragment 0 holds ids 0..8, so these are the rows of "id < 4".
+        source = crate::utils::test::delete_with_explicit_path(&source, 0, &[0, 1, 2, 3]).await;
+    } else {
+        source.delete("id < 4").await.unwrap();
+    }
+    let source_deletion_file = source.get_fragments()[0]
+        .metadata
+        .deletion_file
+        .clone()
+        .unwrap();
+    assert_eq!(source_deletion_file.path.is_some(), explicit_deletion_path);
     let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
     let base = cloned
         .manifest()
@@ -664,10 +681,16 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
         fragment.metadata.deletion_file.as_ref().unwrap().base_id,
         Some(base.id)
     );
+    // The clone only stamps the base; the path stays relative to it.
+    assert_eq!(
+        fragment.metadata.deletion_file.as_ref().unwrap().path,
+        source_deletion_file.path
+    );
 
     let _ = tracker.incremental_stats();
     fragment.get_deletion_vector().await.unwrap().unwrap();
     assert!(tracker.incremental_stats().read_iops > 0);
+    assert_eq!(cloned.count_rows(None).await.unwrap(), 60);
 
     let indices = cloned.load_indices().await.unwrap();
     assert_eq!(indices[0].base_id, Some(base.id));
@@ -1458,6 +1481,54 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+/// The deletion file paths flag is set in both words by the first commit that
+/// references an explicit path, and only then. It stays once no fragment uses
+/// one, through compaction and restore, because older versions may.
+#[tokio::test]
+async fn test_deletion_file_paths_flag_lifecycle() {
+    let flags = |dataset: &Dataset| {
+        (
+            dataset.manifest.reader_feature_flags,
+            dataset.manifest.writer_feature_flags,
+        )
+    };
+    let mut dataset = write_multi_fragment_source("memory://").await;
+    dataset.delete("id < 2").await.unwrap();
+    let legacy_version = dataset.version().version;
+    assert_eq!(flags(&dataset), (FLAG_DELETION_FILES, FLAG_DELETION_FILES));
+
+    // Fragment 1 holds ids 8..16.
+    let mut dataset = crate::utils::test::delete_with_explicit_path(&dataset, 1, &[0]).await;
+    let with_paths = FLAG_DELETION_FILES | FLAG_UNSTABLE_DELETION_FILE_PATHS;
+    assert_eq!(flags(&dataset), (with_paths, with_paths));
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 61);
+
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata.deletion_file.is_none())
+    );
+    // Compaction read the explicit file: the rewritten fragments hold only
+    // the surviving rows.
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 61);
+    assert_eq!(
+        flags(&dataset),
+        (
+            FLAG_UNSTABLE_DELETION_FILE_PATHS,
+            FLAG_UNSTABLE_DELETION_FILE_PATHS
+        )
+    );
+
+    let mut restored = dataset.checkout_version(legacy_version).await.unwrap();
+    restored.restore().await.unwrap();
+    assert_eq!(flags(&restored), (with_paths, with_paths));
+    assert_eq!(restored.count_rows(None).await.unwrap(), 62);
 }
 
 #[tokio::test]
@@ -2442,10 +2513,14 @@ async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
 // use platform-agnostic std/tokio I/O.
 #[cfg(not(windows))]
 #[rstest]
+#[case::legacy(LanceFileVersion::Legacy, false)]
+#[case::stable(LanceFileVersion::Stable, false)]
+// Where the deletion file is does not depend on the data file version.
+#[case::stable_explicit_deletion_path(LanceFileVersion::Stable, true)]
 #[tokio::test]
 async fn test_deep_clone_cross_store(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-    data_storage_version: LanceFileVersion,
+    #[case] data_storage_version: LanceFileVersion,
+    #[case] explicit_deletion_path: bool,
 ) {
     // Source lives in an in-memory store while the target is a local directory. Their
     // different `store_prefix`es exercise separate source and destination implementations.
@@ -2489,7 +2564,19 @@ async fn test_deep_clone_cross_store(
         .unwrap();
 
     // Delete some rows so a deletion file is also streamed across stores.
-    dataset.delete("id < 10").await.unwrap();
+    if explicit_deletion_path {
+        // Fragment 0 holds ids 0..16, so these are the rows of "id < 10".
+        let offsets = (0..10).collect::<Vec<_>>();
+        dataset = crate::utils::test::delete_with_explicit_path(&dataset, 0, &offsets).await;
+    } else {
+        dataset.delete("id < 10").await.unwrap();
+    }
+    let source_deletion_file = dataset.get_fragments()[0]
+        .metadata
+        .deletion_file
+        .clone()
+        .unwrap();
+    assert_eq!(source_deletion_file.path.is_some(), explicit_deletion_path);
     let cloned_dataset = dataset
         .deep_clone(cloned_uri, dataset.version().version, None)
         .await
@@ -2515,6 +2602,25 @@ async fn test_deep_clone_cross_store(
         .unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 54); // 64 rows - 10 deletions
+    // The copy keeps the same relative path and becomes local to the clone.
+    let cloned_deletion_file = reopened.get_fragments()[0]
+        .metadata
+        .deletion_file
+        .clone()
+        .unwrap();
+    assert_eq!(cloned_deletion_file.path, source_deletion_file.path);
+    assert_eq!(cloned_deletion_file.base_id, None);
+    assert!(
+        reopened
+            .object_store
+            .exists(&lance_table::io::deletion::deletion_file_path(
+                &reopened.base,
+                0,
+                &cloned_deletion_file
+            ))
+            .await
+            .unwrap()
+    );
 
     // The scalar index must have been copied and resolve against the target store, with its
     // base reference normalized to local (no external base_paths).

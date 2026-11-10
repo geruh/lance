@@ -250,7 +250,10 @@ message FieldCoverage {
 
 /* Deletion File
  *
- * The path of the deletion file is constructed as:
+ * A deletion file lives under {root}, the root of the dataset named by
+ * `base_id` (this dataset when `base_id` is absent). When `path` is set, the
+ * file is {root}/{path}. Otherwise its path is derived from the id of the
+ * fragment that owns it:
  *   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
  * where {extension} depends on DeletionFileType.
  */
@@ -278,6 +281,36 @@ message DeletionFile {
   uint64 id = 3;
   // The number of rows that are marked as deleted.
   uint64 num_deleted_rows = 4;
+  /* The path of the deletion file relative to {root}, the root of the dataset
+   * named by `base_id`.
+   *
+   * EXPERIMENTAL: this field is an experimental format feature, fenced by the
+   * deletion file paths feature flag. It may change incompatibly without a
+   * separate vote, and is removed if its stabilization vote does not pass.
+   * Tables that never set it are not affected either way.
+   *
+   * Absent: the path is derived from the owning fragment's id, as described
+   * above. Every Lance version understands this form, but it ties the file to
+   * that id, so the fragment cannot be given a different id while it carries
+   * this file.
+   *
+   * Present: the file is exactly {root}/{path}, whatever the owning fragment's
+   * id, so a commit may assign or change the fragment's id without touching
+   * the file. The value MUST be `_deletions/{uuid}.{extension}`, where {uuid}
+   * is a UUID in lowercase hyphenated form and {extension} is that of
+   * `file_type`. A reader MUST reject any other value rather than fall back to
+   * the derived path. Keeping these files directly under `_deletions` lets
+   * cleanup find every deletion file, and the fixed form names the same object
+   * on every object store. A writer MUST use a new random UUID for every file
+   * and never write different contents to a path that was used before, because
+   * readers may cache a deletion vector by its path.
+   *
+   * A writer MUST set the deletion file paths feature flag (1048576) in both
+   * the reader and writer feature flags once any fragment carries this field,
+   * and MUST keep it set in every later version, because earlier versions that
+   * reference such files may still be read and cleaned up.
+   */
+  optional string path = 5;
   /* The base path index of the deletion file. Used when the file is imported or referred from another
    * dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base
    * path of the deletion file.

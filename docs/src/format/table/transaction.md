@@ -62,6 +62,9 @@ Append operation has occurred in the meantime, we still allow the Overwrite to p
 
 Adds new fragments to the table without modifying existing data.
 Fragment IDs are not assigned at transaction creation time; they are assigned during manifest construction.
+Because a retry constructs the manifest again on top of the latest version, a new fragment can receive a different ID on each attempt.
+A new fragment that already carries a deletion file must therefore record the file's own `path` (see [Deletion Files](index.md#deletion-files)): such a file is kept as-is whatever ID the fragment receives.
+A deletion file without `path` is located through the fragment ID it was written for, so a commit that would give its fragment a different ID is rejected.
 
 <details>
 <summary>Append protobuf message</summary>

@@ -25,6 +25,7 @@ use lance_io::{
     utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
+use crate::feature_flags::{FLAG_UNSTABLE_DELETION_FILE_PATHS, ensure_deletion_file_paths_enabled};
 use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
 
 use super::commit::ManifestLocation;
@@ -216,6 +217,28 @@ pub async fn write_manifest(
     indices: Option<Vec<IndexMetadata>>,
     transaction: Option<Transaction>,
 ) -> Result<usize> {
+    // A reader without the capability derives every deletion file's location
+    // from its fragment id and would look for a file that does not exist, so
+    // no writer may publish an explicit path without the bit, including
+    // writers that skip `apply_feature_flags`.
+    let has_deletion_file_paths = manifest.fragments.iter().any(|fragment| {
+        fragment
+            .deletion_file
+            .as_ref()
+            .is_some_and(|deletion_file| deletion_file.path.is_some())
+    });
+    if has_deletion_file_paths {
+        ensure_deletion_file_paths_enabled()?;
+        let paths_flag = FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        if manifest.reader_feature_flags & manifest.writer_feature_flags & paths_flag == 0 {
+            return Err(Error::internal(format!(
+                "Refusing to write manifest version {}: a fragment's deletion file has an \
+                 explicit path, but feature flag {paths_flag} is not set in both the reader \
+                 and writer flags",
+                manifest.version
+            )));
+        }
+    }
     match manifest.data_storage_format.version {
         ConcreteFileVersion::V1 => {
             write_schema_dictionaries(writer, &mut manifest.schema).await?;
@@ -255,7 +278,9 @@ mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
 
-    use crate::format::SelfDescribingFileReader;
+    use crate::format::{
+        DeletionFile, DeletionFilePath, DeletionFileType, Fragment, SelfDescribingFileReader,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::versions::v1::{
@@ -350,6 +375,49 @@ mod test {
         assert!(manifest.index_section.is_none());
         let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
         assert!(roundtripped_manifest.index_section.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_requires_flag_for_explicit_deletion_paths() {
+        let mut fragment = Fragment::new(0).with_physical_rows(10);
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 2,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some(DeletionFilePath::new_random()),
+        });
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let store = ObjectStore::memory();
+        let path = Path::from("/explicit_deletion_paths");
+        // Neither word, or only one of them, is not enough.
+        for (reader, writer_flags) in [
+            (0, 0),
+            (FLAG_UNSTABLE_DELETION_FILE_PATHS, 0),
+            (0, FLAG_UNSTABLE_DELETION_FILE_PATHS),
+        ] {
+            manifest.reader_feature_flags = reader;
+            manifest.writer_feature_flags = writer_flags;
+            let mut writer = store.create(&path).await.unwrap();
+            let err = write_manifest(writer.as_mut(), &mut manifest, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal { .. }), "{err:?}");
+            assert!(err.to_string().contains("explicit path"), "{err}");
+        }
+
+        manifest.reader_feature_flags = FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        manifest.writer_feature_flags = FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        let mut writer = store.create(&path).await.unwrap();
+        write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

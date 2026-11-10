@@ -99,9 +99,12 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
 }
 
 // An overwrite's fragments are newly written, so they are given fresh ids at
-// commit time. A deletion file cannot come along for that ride: its path embeds
-// the fragment id, so renumbering the fragment would orphan the deletion vector
-// and silently resurrect deleted rows.
+// commit time. A deletion file without an explicit path cannot come along for
+// that ride: its path embeds the fragment id, so renumbering the fragment would
+// orphan the deletion vector and silently resurrect deleted rows. One with an
+// explicit path would survive the renumbering, but is refused as well: no
+// writer produces one for an overwrite, and creating a fragment-tree table reads
+// deletion files under the new table's root without resolving `base_id`.
 fn overwrite_fragments_valid(fragments: &[Fragment]) -> Result<()> {
     for fragment in fragments {
         if let Some(deletion_file) = &fragment.deletion_file {

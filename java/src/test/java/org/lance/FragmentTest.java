@@ -60,6 +60,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -76,6 +77,18 @@ public class FragmentTest {
     assertEquals("_deletions/5-11-7.arrow", array.getRelativePath(5));
     assertEquals("_deletions/5-11-18446744073709551615.bin", highBitId.getRelativePath(5));
     assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+
+    // An explicit path does not depend on the fragment id.
+    String path = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin";
+    DeletionFile explicit = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, path);
+    assertEquals(path, explicit.getRelativePath(5));
+    assertEquals(path, explicit.getRelativePath(-1));
+    assertEquals(Optional.of(path), explicit.getPath());
+    assertEquals(Optional.empty(), bitmap.getPath());
+    assertNotEquals(bitmap, explicit);
+    assertEquals(
+        explicit.hashCode(),
+        new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, path).hashCode());
   }
 
   @Test

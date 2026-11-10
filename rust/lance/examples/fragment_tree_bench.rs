@@ -802,6 +802,7 @@ impl Bench {
                     file_type: DeletionFileType::Bitmap,
                     num_deleted_rows: Some(deleted + 1),
                     base_id: None,
+                    path: None,
                 });
                 self.next_deletion_id += 1;
                 fragment

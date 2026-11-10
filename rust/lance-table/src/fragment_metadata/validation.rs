@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use lance_core::{Error, Result};
 
 use super::{action, node};
-use crate::format::{Fragment, pb};
+use crate::format::{DeletionFile, Fragment, pb};
 use pb::fragment_action::Action;
 
 pub(super) fn corrupt(message: impl Into<String>) -> Error {
@@ -49,8 +49,19 @@ pub(super) fn fragment(mut encoded: pb::DataFragment) -> Result<Fragment> {
 
 pub(super) fn action(encoded: &pb::FragmentAction) -> Result<u64> {
     let id = action_target(encoded)?;
-    if let Some(Action::UpsertFragment(value)) = &encoded.action {
-        fragment(value.clone())?;
+    match &encoded.action {
+        Some(Action::UpsertFragment(value)) => {
+            fragment(value.clone())?;
+        }
+        // Decoded here as well as on apply, so a malformed explicit path is
+        // refused even when a later action would squash this one away.
+        Some(Action::AddDeletionFile(pb::AddDeletionFile {
+            deletion_file: Some(deletion_file),
+            ..
+        })) => {
+            DeletionFile::try_from(deletion_file.clone())?;
+        }
+        _ => {}
     }
     Ok(id)
 }
@@ -219,6 +230,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+    }
+
+    #[test]
+    fn rejects_buffered_deletion_file_with_malformed_path() {
+        let action = pb::FragmentAction {
+            action: Some(Action::AddDeletionFile(pb::AddDeletionFile {
+                frag_id: 1,
+                deletion_file: Some(pb::DeletionFile {
+                    read_version: 1,
+                    id: 2,
+                    num_deleted_rows: 1,
+                    path: Some("_deletions/../escape.bin".to_string()),
+                    ..Default::default()
+                }),
+            })),
+        };
+        let error = buffer(
+            &[pb::FragmentTreeMutation {
+                action_sequence: 1,
+                action: Some(action),
+                ..Default::default()
+            }],
+            1,
+            2,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error.to_string().contains("Invalid deletion file path"),
+            "{error}"
+        );
     }
 
     #[test]

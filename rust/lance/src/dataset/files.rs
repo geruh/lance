@@ -929,6 +929,7 @@ mod tests {
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(1),
                 base_id: Some(2),
+                path: None,
             }),
             row_id_meta: None,
             physical_rows: Some(3),

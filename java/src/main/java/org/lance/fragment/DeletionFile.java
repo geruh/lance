@@ -27,14 +27,34 @@ public class DeletionFile implements Serializable {
   private final Long numDeletedRows;
   private final DeletionFileType fileType;
   private final Integer baseId;
+  private final String path;
 
   public DeletionFile(
       long id, long readVersion, Long numDeletedRows, DeletionFileType fileType, Integer baseId) {
+    this(id, readVersion, numDeletedRows, fileType, baseId, null);
+  }
+
+  /**
+   * @param path the explicit path of the file relative to its dataset-root base, {@code
+   *     _deletions/{uuid}.arrow} or {@code _deletions/{uuid}.bin} to match {@code fileType}, with
+   *     the UUID in lowercase hyphenated form; or null to locate the file by the id of the fragment
+   *     that owns it. Lance rejects any other value when the file metadata is passed to it.
+   *     Experimental: committing a table that uses it requires {@code
+   *     LANCE_ENABLE_UNSTABLE_DELETION_FILE_PATHS} in release builds.
+   */
+  public DeletionFile(
+      long id,
+      long readVersion,
+      Long numDeletedRows,
+      DeletionFileType fileType,
+      Integer baseId,
+      String path) {
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
     this.fileType = fileType;
     this.baseId = baseId;
+    this.path = path;
   }
 
   public long getId() {
@@ -58,11 +78,23 @@ public class DeletionFile implements Serializable {
   }
 
   /**
+   * Returns the explicit path of the file relative to its dataset-root base, or empty when the
+   * location is derived from the id of the fragment that owns the file.
+   */
+  public Optional<String> getPath() {
+    return Optional.ofNullable(path);
+  }
+
+  /**
    * Returns the deletion file path relative to its dataset-root base.
    *
-   * @param fragmentId fragment that owns this deletion file
+   * @param fragmentId fragment that owns this deletion file, which must be non-negative; ignored
+   *     when the file has an explicit path
    */
   public String getRelativePath(long fragmentId) {
+    if (path != null) {
+      return path;
+    }
     if (fragmentId < 0) {
       throw new IllegalArgumentException("fragmentId must be non-negative");
     }
@@ -95,7 +127,13 @@ public class DeletionFile implements Serializable {
     return id == that.id
         && readVersion == that.readVersion
         && fileType == that.fileType
-        && Objects.equals(numDeletedRows, that.numDeletedRows);
+        && Objects.equals(numDeletedRows, that.numDeletedRows)
+        && Objects.equals(path, that.path);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(id, readVersion, fileType, numDeletedRows, path);
   }
 
   @Override
@@ -106,6 +144,7 @@ public class DeletionFile implements Serializable {
         .add("numDeletedRows", numDeletedRows)
         .add("fileType", fileType)
         .add("baseId", baseId)
+        .add("path", path)
         .toString();
   }
 }

@@ -167,6 +167,21 @@ The Arrow IPC format (`.arrow` extension) stores a flat Int32Array of deleted ro
 The Roaring Bitmap format (`.bin` extension) stores a compressed roaring bitmap and is efficient for dense deletions.
 Readers must filter rows whose offsets appear in the deletion file for the fragment.
 
+A deletion file is stored under the root of the dataset named by its `base_id`, or of this dataset when `base_id` is absent.
+When `path` is absent, the file is `_deletions/{fragment_id}-{read_version}-{id}.{extension}` under that root.
+Its location derives from the id of the fragment that owns it, so the fragment must keep that id.
+When `path` is set, the file is exactly `{root}/{path}`, and the owning fragment may be given any id without the file being touched.
+For example, a commit can assign ids to new fragments that already carry deletions, and assign different ones when it retries.
+`path` must be `_deletions/{uuid}.{extension}`, where `{uuid}` is in lowercase hyphenated form and `{extension}` is that of `file_type`.
+Readers must reject any other value rather than derive the location from the fragment id.
+Writers choose a new random UUID for every file and never reuse one, because readers may cache a deletion vector by its path.
+A table that references a deletion file by `path` sets `FLAG_UNSTABLE_DELETION_FILE_PATHS` (see [Feature Flags](versioning.md#feature-flags)).
+
+!!! warning "Experimental"
+
+    Deletion file paths (`DeletionFile.path`) are not yet a stable part of the format.
+    Release builds reject tables that use them unless explicitly opted in.
+
 Deletions can be materialized by rewriting data files with deleted rows removed.
 However, this invalidates row addresses and requires rebuilding indices, which can be expensive.
 

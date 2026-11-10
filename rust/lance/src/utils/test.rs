@@ -19,6 +19,7 @@ use lance_table::io::commit::{
     CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
     ManifestNamingScheme, ManifestWriter,
 };
+use lance_table::io::deletion::{DeletionFileNaming, write_deletion_file_with_naming};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
@@ -531,6 +532,50 @@ pub async fn assert_plan_node_equals(
 
     // Use the extracted string matching logic
     assert_string_matches(&raw_plan_desc, raw_expected)
+}
+
+/// Commit a Delete that adds `offsets` to the deletions of fragment
+/// `fragment_id`, through a new deletion file at an explicit
+/// `_deletions/{uuid}` path (the form a fragment needs when its id is only
+/// assigned at commit). Returns the committed dataset.
+pub async fn delete_with_explicit_path(
+    dataset: &Dataset,
+    fragment_id: u64,
+    offsets: &[u32],
+) -> Dataset {
+    let fragment = dataset
+        .get_fragment(fragment_id as usize)
+        .expect("fragment exists");
+    let mut deletion_vector = fragment
+        .get_deletion_vector()
+        .await
+        .unwrap()
+        .map(|deletion_vector| deletion_vector.as_ref().clone())
+        .unwrap_or_default();
+    deletion_vector.extend(offsets.iter().copied());
+    let mut metadata = fragment.metadata().clone();
+    metadata.deletion_file = write_deletion_file_with_naming(
+        &dataset.base,
+        DeletionFileNaming::Uuid,
+        dataset.manifest.version,
+        &deletion_vector,
+        dataset.object_store.as_ref(),
+    )
+    .await
+    .unwrap();
+    let transaction = crate::dataset::transaction::Transaction::new(
+        dataset.manifest.version,
+        Operation::Delete {
+            updated_fragments: vec![metadata],
+            deleted_fragment_ids: vec![],
+            predicate: format!("explicit deletion of {offsets:?}"),
+        },
+        None,
+    );
+    crate::dataset::CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(transaction)
+        .await
+        .unwrap()
 }
 
 #[cfg(test)]

@@ -18,7 +18,9 @@ use lance_file::version::ConcreteFileVersion;
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
 use lance_io::utils::failpoint::{FailOn, FailWhen, Failpoint, FailpointController};
 use lance_io::utils::tracking_store::{IOTracker, IoRequestRecord};
-use lance_table::feature_flags::{FLAG_FRAGMENT_TREE, FLAG_UNSTABLE_SPILLED_ROW_LINEAGE};
+use lance_table::feature_flags::{
+    FLAG_FRAGMENT_TREE, FLAG_UNSTABLE_DELETION_FILE_PATHS, FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+};
 use lance_table::format::{
     BasePath, DataFile, Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
     ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
@@ -136,8 +138,11 @@ fn replacement(version: u64) -> Transaction {
     )
 }
 
+#[rstest]
 #[tokio::test]
-async fn deletion_only_changes_buffer_deletion_file_actions() {
+async fn deletion_only_changes_buffer_deletion_file_actions(
+    #[values(false, true)] explicit_path: bool,
+) {
     use lance_table::format::pb::fragment_action::Action;
     let (mut target, _, original) = fixture(false).await;
     target.base_path = target.base_path.join("deletion");
@@ -165,7 +170,11 @@ async fn deletion_only_changes_buffer_deletion_file_actions() {
     .await
     .unwrap();
     let mut expected = fragments[7].clone();
-    expected.deletion_file = Some(differential::deletion_file(1, created.manifest.version));
+    let mut deletion_file = differential::deletion_file(1, created.manifest.version);
+    if explicit_path {
+        deletion_file.path = Some(uuid::Uuid::from_u128(1).into());
+    }
+    expected.deletion_file = Some(deletion_file.clone());
     let committed = execute_commit(
         target.clone(),
         &CommitConfig::default(),
@@ -193,12 +202,51 @@ async fn deletion_only_changes_buffer_deletion_file_actions() {
         .filter_map(|mutation| mutation.action.as_ref()?.action.as_ref())
         .collect();
     assert!(
-        matches!(buffered.as_slice(), [Action::AddDeletionFile(file)] if file.frag_id == 7),
+        matches!(
+            buffered.as_slice(),
+            [Action::AddDeletionFile(file)]
+                if file.frag_id == 7
+                    && file.deletion_file.as_ref().unwrap().path
+                        == deletion_file
+                            .path
+                            .as_ref()
+                            .map(|path| path.relative_path(&deletion_file.file_type))
+        ),
         "{buffered:?}"
     );
     let (tree, _) = open_tree(&target, None).await.unwrap();
     let fragments = tree.materialize().await.unwrap();
     assert_eq!(fragments[7], expected);
+
+    // A later commit cannot see fragment 7's record, but keeps its requirement.
+    let mut other = fragments[8].clone();
+    other.deletion_file = Some(differential::deletion_file(2, committed.manifest.version));
+    let later = execute_commit(
+        target.clone(),
+        &CommitConfig::default(),
+        &Transaction::new_from_version(
+            committed.manifest.version,
+            Operation::Delete {
+                updated_fragments: vec![other],
+                deleted_fragment_ids: Vec::new(),
+                predicate: "id = 2".to_string(),
+            },
+        ),
+        None,
+        &crate::dataset::ManifestWriteConfig::default(),
+    )
+    .await
+    .unwrap();
+    for manifest in [&committed.manifest, &later.manifest] {
+        for flags in [manifest.reader_feature_flags, manifest.writer_feature_flags] {
+            assert_eq!(
+                flags & FLAG_UNSTABLE_DELETION_FILE_PATHS != 0,
+                explicit_path,
+                "version {}",
+                manifest.version
+            );
+        }
+    }
 }
 
 #[tokio::test]

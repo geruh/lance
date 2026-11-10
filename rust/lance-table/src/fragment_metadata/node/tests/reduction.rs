@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::format::pb::fragment_action::Action;
-use crate::format::{DataFile, DeletionFile, DeletionFileType, Fragment, pb};
+use crate::format::{DataFile, DeletionFile, DeletionFilePath, DeletionFileType, Fragment, pb};
 use crate::fragment_metadata::support::{make_backfill_data_file, make_fragment};
 use crate::fragment_metadata::{action, node};
 use proptest::prelude::*;
@@ -157,6 +157,9 @@ fn random_action(
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(rng.random_range(0..100)),
                 base_id: None,
+                path: rng
+                    .random_bool(0.5)
+                    .then(|| DeletionFilePath::from(uuid::Uuid::from_u128(step as u128))),
             },
         ),
         _ => action::clear_deletion_file(id),
@@ -218,6 +221,7 @@ fn legal_reductions_preserve_aggregates(#[case] case: u8) {
         file_type: DeletionFileType::Bitmap,
         num_deleted_rows: Some(0),
         base_id: None,
+        path: None,
     };
     let actions = match case {
         0 => vec![

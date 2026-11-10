@@ -22,6 +22,7 @@ use lance_table::{
     format::{
         DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
     },
+    io::deletion::relative_deletion_file_path,
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -130,6 +131,11 @@ impl CacheKey for TransactionKey<'_> {
     }
 }
 
+/// The deletion vector of one deletion file, identified by where the file is:
+/// the base that holds it and its path there, as resolved by
+/// [`relative_deletion_file_path`]. Two files whose other fields are equal but
+/// whose explicit paths differ never share an entry, and an explicit-path file
+/// keeps its entry when its fragment is given a new id.
 #[derive(Debug)]
 pub struct DeletionFileKey<'a> {
     pub fragment_id: u64,
@@ -140,11 +146,8 @@ impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "deletion/{}/{}/{}/{}",
-            self.fragment_id,
-            self.deletion_file.read_version,
-            self.deletion_file.id,
-            self.deletion_file.file_type.suffix()
+            "deletion/{}",
+            relative_deletion_file_path(self.fragment_id, self.deletion_file)
         ))
     }
     fn type_name() -> &'static str {
@@ -152,13 +155,14 @@ impl CacheKey for DeletionFileKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 1)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.fragment_id);
-        builder.write_u64(self.deletion_file.read_version);
-        builder.write_u64(self.deletion_file.id);
+        builder.write_str(&relative_deletion_file_path(
+            self.fragment_id,
+            self.deletion_file,
+        ));
         builder.write_variant(match &self.deletion_file.file_type {
             DeletionFileType::Array => 0,
             DeletionFileType::Bitmap => 1,
@@ -364,6 +368,7 @@ impl DSMetadataCache {
 mod tests {
     use std::sync::Arc;
 
+    use lance_table::format::DeletionFilePath;
     use lance_table::rowids::write_row_ids;
     use lance_table::transaction::{Operation, TransactionBuilder};
 
@@ -378,6 +383,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
         };
         cache
             .insert_with_key(
@@ -402,6 +408,64 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn deletion_file_key_is_the_file_location() {
+        let cache = LanceCache::with_capacity(4096);
+        let explicit = || DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some(DeletionFilePath::new_random()),
+        };
+        let first = explicit();
+        let deletion_vector = Arc::new(DeletionVector::Bitmap([1].into_iter().collect()));
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 42,
+                    deletion_file: &first,
+                },
+                deletion_vector.clone(),
+            )
+            .await;
+
+        // The same file is found again after its fragment is renumbered.
+        let renumbered = cache
+            .get_with_key(&DeletionFileKey {
+                fragment_id: 43,
+                deletion_file: &first,
+            })
+            .await
+            .expect("an explicit path does not depend on the fragment id");
+        assert!(Arc::ptr_eq(&renumbered, &deletion_vector));
+
+        // Equal legacy fields but a different object: the path, the derived
+        // location, or the decoding.
+        let second = explicit();
+        let legacy = DeletionFile {
+            path: None,
+            ..first.clone()
+        };
+        let as_array = DeletionFile {
+            file_type: DeletionFileType::Array,
+            ..first.clone()
+        };
+        for (fragment_id, other) in [(42, &second), (42, &legacy), (42, &as_array)] {
+            assert!(
+                cache
+                    .get_with_key(&DeletionFileKey {
+                        fragment_id,
+                        deletion_file: other,
+                    })
+                    .await
+                    .is_none(),
+                "{other:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -11,9 +11,9 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS,
-    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    inherit_sticky_feature_flags,
+    ENABLE_UNSTABLE_DELETION_FILE_PATHS_ENV, FLAG_COVERED_INDEX_METADATA,
+    FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS, apply_feature_flags, ensure_can_read_manifest,
+    ensure_can_write_manifest, inherit_sticky_feature_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
@@ -22,6 +22,7 @@ use crate::format::{
 };
 use crate::io::{
     commit::CommitHandler,
+    deletion::relative_deletion_file_path,
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
@@ -122,19 +123,43 @@ fn apply_range_segments(
 }
 
 impl Transaction {
+    /// Give each newly written fragment (id 0) the next id from `fragment_id`.
+    ///
+    /// The assigned id depends on the version the commit lands on, so it can
+    /// change on every retry. A deletion file with an explicit path follows
+    /// its fragment unchanged. One without is found through the fragment id it
+    /// was written for, so a fragment carrying one cannot be given a different
+    /// id: that is refused instead of committing a reference to a file that
+    /// does not exist.
     pub(super) fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
-    ) -> impl Iterator<Item = Fragment> + 'a
+    ) -> impl Iterator<Item = Result<Fragment>> + 'a
     where
         T: IntoIterator<Item = Fragment> + 'a,
     {
         new_fragments.into_iter().map(move |mut f| {
             if f.id == 0 {
+                if let Some(deletion_file) = &f.deletion_file
+                    && deletion_file.path.is_none()
+                    && *fragment_id != f.id
+                {
+                    return Err(Error::invalid_input(format!(
+                        "A new fragment carries deletion file {}, whose location is derived \
+                         from fragment id {}, but this commit assigns it fragment id {}. A \
+                         deletion file for an uncommitted fragment must record its own path \
+                         (DeletionFile.path, _deletions/{{uuid}}.{{extension}}) to survive id \
+                         assignment; that is an unstable feature, enabled by \
+                         {ENABLE_UNSTABLE_DELETION_FILE_PATHS_ENV}.",
+                        relative_deletion_file_path(f.id, deletion_file),
+                        f.id,
+                        *fragment_id
+                    )));
+                }
                 f.id = *fragment_id;
                 *fragment_id += 1;
             }
-            f
+            Ok(f)
         })
     }
 
@@ -649,7 +674,7 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -808,7 +833,7 @@ impl Transaction {
 
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
 
                 // Assign row IDs to any fragments that don't have them yet
                 // (e.g., inserted rows from merge_insert operations)
@@ -1755,10 +1780,12 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::FLAG_UNSTABLE_DELETION_FILE_PATHS;
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
     use crate::format::{
-        DeletionFile, DeletionFileType, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+        DeletionFile, DeletionFilePath, DeletionFileType, RowDatasetVersionMeta,
+        RowDatasetVersionSequence, RowIdMeta,
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
@@ -1945,6 +1972,101 @@ mod tests {
         assert_eq!(rows, vec![None, Some(42), None, Some(43)]);
     }
 
+    /// Each commit attempt rebuilds the transaction against the latest
+    /// manifest, so a new fragment gets a different id after a competing
+    /// commit lands. A deletion file with an explicit path follows the
+    /// fragment unchanged; one whose location is derived from the id it was
+    /// written for cannot, and is refused instead of left dangling.
+    #[rstest::rstest]
+    #[case::append("append")]
+    #[case::update_new_fragments("update")]
+    #[case::rewrite_new_fragments("rewrite")]
+    fn test_assigned_ids_keep_explicit_deletion_file_and_refuse_derived_one(
+        #[case] operation: &str,
+    ) {
+        let explicit = DeletionFile {
+            read_version: 1,
+            id: 10,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some(DeletionFilePath::new_random()),
+        };
+        // The new fragment comes last in every case; a rewrite replaces the
+        // last existing fragment with it.
+        let build = |deletion_file: &DeletionFile, existing: std::ops::Range<u64>| {
+            // Id 0: the commit assigns the real one.
+            let mut fragment = Fragment::new(0).with_physical_rows(10);
+            fragment.deletion_file = Some(deletion_file.clone());
+            let operation = match operation {
+                "append" => Operation::Append {
+                    fragments: vec![fragment],
+                },
+                "update" => Operation::Update {
+                    removed_fragment_ids: vec![],
+                    updated_fragments: vec![],
+                    new_fragments: vec![fragment],
+                    fields_modified: vec![],
+                    compacted_sstables: vec![],
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                "rewrite" => Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![Fragment::new(existing.end - 1)],
+                        new_fragments: vec![fragment],
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                },
+                other => panic!("unknown operation {other}"),
+            };
+            Transaction::new(1, operation, None).build_manifest(
+                Some(&sample_manifest_with_fragments(existing)),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+        };
+
+        // The first attempt sees fragments 0..=41; the retry also sees the
+        // fragment a competing commit added in between.
+        let mut assigned_ids = Vec::new();
+        for existing in [0..42, 0..43] {
+            let (new_manifest, _) = build(&explicit, existing).unwrap();
+            let fragment = new_manifest.fragments.last().unwrap();
+            assigned_ids.push(fragment.id);
+            assert_eq!(fragment.deletion_file.as_ref(), Some(&explicit));
+            assert_ne!(
+                new_manifest.reader_feature_flags & FLAG_UNSTABLE_DELETION_FILE_PATHS,
+                0
+            );
+        }
+        assert_eq!(assigned_ids, vec![42, 43]);
+
+        let derived = DeletionFile {
+            path: None,
+            ..explicit
+        };
+        let err = build(&derived, 0..42).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("derived from fragment id 0, but this commit assigns it fragment id 42"),
+            "{err}"
+        );
+        // Still valid when the fragment really is given id 0, which a rewrite
+        // never does: it replaces an existing fragment.
+        if operation != "rewrite" {
+            let (new_manifest, _) = build(&derived, 0..0).unwrap();
+            let fragment = new_manifest.fragments.last().unwrap();
+            assert_eq!(fragment.id, 0);
+            assert_eq!(fragment.deletion_file.as_ref(), Some(&derived));
+        }
+    }
+
     #[test]
     fn test_delete_build_manifest_applies_deletion_to_current_fragment() {
         let mut manifest = sample_manifest_with_fragments(0..5);
@@ -1967,6 +2089,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
         };
         updated2.deletion_file = Some(deletion_file.clone());
 

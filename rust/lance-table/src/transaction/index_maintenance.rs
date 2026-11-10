@@ -411,7 +411,7 @@ impl Transaction {
 
             // Compaction supplies the rewritten fragments' version metadata.
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             if let Some(replace_range) = replace_range {
                 final_fragments.splice(replace_range, new_fragments);
             } else {

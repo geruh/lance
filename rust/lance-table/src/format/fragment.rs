@@ -15,6 +15,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
 use super::row_ids::RowIdMeta;
 use crate::format::pb;
+use crate::io::deletion::DELETIONS_DIR;
+use uuid::Uuid;
 
 use crate::rowids::version::{
     RowDatasetVersionMeta, created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb,
@@ -432,7 +434,78 @@ impl DeletionFileType {
     }
 }
 
+/// The explicit path of a deletion file, `_deletions/{uuid}.{extension}` under
+/// the root of the dataset that holds it, where `{uuid}` is in lowercase
+/// hyphenated form and `{extension}` is that of the file's [`DeletionFileType`].
+///
+/// Only the UUID is kept, so the path cannot disagree with the file type, and
+/// resolving it never fails or falls back to the location derived from a
+/// fragment id. It is boxed so that a fragment without one pays one pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionFilePath(Box<Uuid>);
+
+impl DeletionFilePath {
+    /// A path for a new deletion file, with a random UUID.
+    pub fn new_random() -> Self {
+        Uuid::new_v4().into()
+    }
+
+    /// Parse a stored path, which must be exactly the path of a deletion file
+    /// of `file_type`. The error is the reason, for the caller to report with
+    /// the error kind that fits where the path came from.
+    fn parse(path: &str, file_type: &DeletionFileType) -> std::result::Result<Self, String> {
+        let invalid = || {
+            format!(
+                "Invalid deletion file path {path:?}: a {file_type:?} deletion file must be \
+                 at {DELETIONS_DIR}/{{uuid}}.{}, with the UUID in lowercase hyphenated form",
+                file_type.suffix()
+            )
+        };
+        let name = path
+            .strip_prefix(DELETIONS_DIR)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.strip_suffix(file_type.suffix()))
+            .and_then(|rest| rest.strip_suffix('.'))
+            .ok_or_else(invalid)?;
+        let uuid = Uuid::try_parse(name).map_err(|_| invalid())?;
+        // Other spellings of the same UUID parse too; only one names the file.
+        if uuid.hyphenated().encode_lower(&mut Uuid::encode_buffer()) != name {
+            return Err(invalid());
+        }
+        Ok(uuid.into())
+    }
+
+    /// Parse a path given by a caller, which must be exactly the path of a
+    /// deletion file of `file_type`.
+    pub fn try_new(path: &str, file_type: &DeletionFileType) -> Result<Self> {
+        Self::parse(path, file_type).map_err(Error::invalid_input)
+    }
+
+    /// The file's name inside `_deletions/`.
+    pub fn file_name(&self, file_type: &DeletionFileType) -> String {
+        format!("{}.{}", self.0.hyphenated(), file_type.suffix())
+    }
+
+    /// The path relative to the root of the dataset that holds the file.
+    pub fn relative_path(&self, file_type: &DeletionFileType) -> String {
+        format!("{DELETIONS_DIR}/{}", self.file_name(file_type))
+    }
+}
+
+impl From<Uuid> for DeletionFilePath {
+    fn from(uuid: Uuid) -> Self {
+        Self(Box::new(uuid))
+    }
+}
+
+impl DeepSizeOf for DeletionFilePath {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        std::mem::size_of::<Uuid>()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[serde(try_from = "SerializedDeletionFile", into = "SerializedDeletionFile")]
 pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
@@ -440,6 +513,64 @@ pub struct DeletionFile {
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
+    /// Where the file is, relative to the root of the dataset named by
+    /// `base_id`.
+    ///
+    /// `None` derives the location from the owning fragment's id
+    /// (`_deletions/{fragment_id}-{read_version}-{id}.{extension}`). Every Lance
+    /// version reads that form, but the file only belongs to a fragment while
+    /// the fragment keeps that id. `Some` is the location itself, so the
+    /// fragment can be given a different id without touching the file; a
+    /// manifest that references one needs
+    /// [`FLAG_UNSTABLE_DELETION_FILE_PATHS`](crate::feature_flags::FLAG_UNSTABLE_DELETION_FILE_PATHS).
+    /// Resolve either form with
+    /// [`deletion_file_path`](crate::io::deletion::deletion_file_path).
+    pub path: Option<DeletionFilePath>,
+}
+
+/// [`DeletionFile`] as serde sees it: `path` is spelled out as in protobuf,
+/// so loading checks it against `file_type` the same way.
+#[derive(Serialize, Deserialize)]
+struct SerializedDeletionFile {
+    read_version: u64,
+    id: u64,
+    file_type: DeletionFileType,
+    num_deleted_rows: Option<usize>,
+    base_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+impl TryFrom<SerializedDeletionFile> for DeletionFile {
+    type Error = Error;
+
+    fn try_from(value: SerializedDeletionFile) -> Result<Self> {
+        let path = value
+            .path
+            .map(|path| DeletionFilePath::try_new(&path, &value.file_type))
+            .transpose()?;
+        Ok(Self {
+            read_version: value.read_version,
+            id: value.id,
+            file_type: value.file_type,
+            num_deleted_rows: value.num_deleted_rows,
+            base_id: value.base_id,
+            path,
+        })
+    }
+}
+
+impl From<DeletionFile> for SerializedDeletionFile {
+    fn from(value: DeletionFile) -> Self {
+        Self {
+            path: value.path.map(|path| path.relative_path(&value.file_type)),
+            read_version: value.read_version,
+            id: value.id,
+            file_type: value.file_type,
+            num_deleted_rows: value.num_deleted_rows,
+            base_id: value.base_id,
+        }
+    }
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -460,13 +591,41 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
         } else {
             Some(value.num_deleted_rows as usize)
         };
+        let path = value
+            .path
+            .map(|path| {
+                DeletionFilePath::parse(&path, &file_type)
+                    .map_err(|reason| Error::corrupt_file_named("table metadata", reason))
+            })
+            .transpose()?;
         Ok(Self {
             read_version: value.read_version,
             id: value.id,
             file_type,
             num_deleted_rows,
             base_id: value.base_id,
+            path,
         })
+    }
+}
+
+impl From<&DeletionFile> for pb::DeletionFile {
+    fn from(deletion_file: &DeletionFile) -> Self {
+        let file_type = match deletion_file.file_type {
+            DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
+            DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
+        };
+        Self {
+            read_version: deletion_file.read_version,
+            id: deletion_file.id,
+            file_type: file_type.into(),
+            num_deleted_rows: deletion_file.num_deleted_rows.unwrap_or_default() as u64,
+            base_id: deletion_file.base_id,
+            path: deletion_file
+                .path
+                .as_ref()
+                .map(|path| path.relative_path(&deletion_file.file_type)),
+        }
     }
 }
 
@@ -768,19 +927,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
 
 impl From<&Fragment> for pb::DataFragment {
     fn from(f: &Fragment) -> Self {
-        let deletion_file = f.deletion_file.as_ref().map(|f| {
-            let file_type = match f.file_type {
-                DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
-                DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
-            };
-            pb::DeletionFile {
-                read_version: f.read_version,
-                id: f.id,
-                file_type: file_type.into(),
-                num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
-                base_id: f.base_id,
-            }
-        });
+        let deletion_file = f.deletion_file.as_ref().map(pb::DeletionFile::from);
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
             RowIdMeta::Inline(data) => {
@@ -952,6 +1099,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -962,6 +1110,112 @@ mod tests {
         let proto = pb::DataFragment::from(&fragment);
         let fragment2 = Fragment::try_from(proto).unwrap();
         assert_eq!(fragment, fragment2);
+    }
+
+    #[rstest::rstest]
+    #[case::array(DeletionFileType::Array, "arrow")]
+    #[case::bitmap(DeletionFileType::Bitmap, "bin")]
+    fn test_explicit_deletion_file_path_round_trips(
+        #[case] file_type: DeletionFileType,
+        #[case] suffix: &str,
+    ) {
+        let uuid = Uuid::new_v4();
+        let path = format!("_deletions/{}.{suffix}", uuid.hyphenated());
+        let deletion_file = DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type,
+            num_deleted_rows: Some(10),
+            base_id: Some(3),
+            path: Some(uuid.into()),
+        };
+        let mut fragment = Fragment::new(42);
+        fragment.deletion_file = Some(deletion_file.clone());
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert_eq!(
+            proto.deletion_file.as_ref().unwrap().path.as_deref(),
+            Some(path.as_str())
+        );
+        let decoded = Fragment::try_from(proto.clone()).unwrap();
+        assert_eq!(decoded, fragment);
+        // The interning decoder used for manifests must agree.
+        let interned = DataFileFieldInterner::default()
+            .intern_fragment(proto)
+            .unwrap();
+        assert_eq!(interned, fragment);
+
+        let json = serde_json::to_value(&deletion_file).unwrap();
+        assert_eq!(json["path"], Value::String(path.clone()));
+        let from_json: DeletionFile = serde_json::from_value(json).unwrap();
+        assert_eq!(from_json, deletion_file);
+        assert_eq!(
+            DeletionFilePath::try_new(&path, &deletion_file.file_type).unwrap(),
+            uuid.into()
+        );
+    }
+
+    const UUID: &str = "0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b";
+
+    #[rstest::rstest]
+    #[case::empty(String::new())]
+    #[case::absolute(format!("/_deletions/{UUID}.bin"))]
+    #[case::outside_deletions(format!("data/{UUID}.bin"))]
+    #[case::directory_only("_deletions/".to_string())]
+    #[case::traversal(format!("_deletions/../{UUID}.bin"))]
+    #[case::nested(format!("_deletions/a/{UUID}.bin"))]
+    #[case::empty_segment(format!("_deletions//{UUID}.bin"))]
+    #[case::backslash(format!("_deletions\\{UUID}.bin"))]
+    #[case::trailing_slash(format!("_deletions/{UUID}.bin/"))]
+    #[case::not_a_uuid("_deletions/name.bin".to_string())]
+    #[case::uppercase_uuid(format!("_deletions/{}.bin", UUID.to_uppercase()))]
+    #[case::simple_uuid(format!("_deletions/{}.bin", UUID.replace('-', "")))]
+    #[case::braced_uuid(format!("_deletions/{{{UUID}}}.bin"))]
+    #[case::urn_uuid(format!("_deletions/urn:uuid:{UUID}.bin"))]
+    #[case::other_file_type(format!("_deletions/{UUID}.arrow"))]
+    #[case::unknown_extension(format!("_deletions/{UUID}.lance"))]
+    #[case::no_extension(format!("_deletions/{UUID}"))]
+    #[case::trailing_space(format!("_deletions/{UUID}.bin "))]
+    #[case::url(format!("s3://bucket/_deletions/{UUID}.bin"))]
+    fn test_malformed_deletion_file_path_is_rejected(#[case] path: String) {
+        let message = format!("Invalid deletion file path {path:?}");
+        // From a caller, it is invalid input.
+        let err = DeletionFilePath::try_new(&path, &DeletionFileType::Bitmap).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains(&message), "{err}");
+
+        // In stored metadata, it is corruption, and decoding never falls back
+        // to the location derived from the fragment id.
+        let proto = pb::DeletionFile {
+            read_version: 1,
+            id: 2,
+            file_type: pb::deletion_file::DeletionFileType::Bitmap.into(),
+            num_deleted_rows: 1,
+            base_id: None,
+            path: Some(path.clone()),
+        };
+        let fragment = pb::DataFragment {
+            id: 1,
+            deletion_file: Some(proto.clone()),
+            ..Default::default()
+        };
+        for err in [
+            DeletionFile::try_from(proto).unwrap_err(),
+            Fragment::try_from(fragment.clone()).unwrap_err(),
+            DataFileFieldInterner::default()
+                .intern_fragment(fragment)
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+            assert!(err.to_string().contains(&message), "{err}");
+        }
+
+        let json = json!({
+            "read_version": 1, "id": 2, "file_type": "bitmap",
+            "num_deleted_rows": 1, "base_id": null, "path": path,
+        });
+        let err = serde_json::from_value::<DeletionFile>(json).unwrap_err();
+        assert!(err.to_string().contains(&message), "{err}");
     }
 
     #[test]
@@ -1042,6 +1296,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();

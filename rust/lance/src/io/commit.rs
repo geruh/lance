@@ -1854,24 +1854,34 @@ mod tests {
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
+    use lance_core::utils::deletion::DeletionVector;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::ConcreteFileVersion;
     use lance_index::IndexType;
+    use lance_io::utils::tracking_store::IoStats;
     use lance_linalg::distance::MetricType;
-    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
+    use lance_table::feature_flags::{
+        FLAG_FRAGMENT_TREE, FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_UNSTABLE_DELETION_FILE_PATHS,
+    };
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
         commit_handler_from_url,
     };
+    use lance_table::io::deletion::{
+        DELETIONS_DIR, DeletionFileNaming, deletion_file_path, write_deletion_file_with_naming,
+    };
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
 
     use crate::Dataset;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::fragment_metadata::FragmentMetadataOptions;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -3715,5 +3725,273 @@ mod tests {
             index_segment("idx_a", Some(RoaringBitmap::from_iter(5..10))),
         ];
         assert!(detect_overlapping_fragments(&disjoint).is_ok());
+    }
+
+    /// Lands a competing append on the version the first attempt is about to
+    /// take, then hands that attempt to the real handler, so it loses the
+    /// version and the commit loop retries on top of the competitor. Records
+    /// each attempt's version and the ids it gave the staged fragments, which
+    /// a flat manifest lists.
+    #[derive(Debug)]
+    struct LoseFirstAttemptToAppend {
+        competitor: tokio::sync::Mutex<Option<(Arc<Dataset>, RecordBatch)>>,
+        staged_deletion_files: Vec<lance_table::format::DeletionFile>,
+        attempts: Mutex<Vec<(u64, Vec<u64>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for LoseFirstAttemptToAppend {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let staged_ids = manifest
+                .fragments
+                .iter()
+                .filter(|fragment| {
+                    fragment
+                        .deletion_file
+                        .as_ref()
+                        .is_some_and(|file| self.staged_deletion_files.contains(file))
+                })
+                .map(|fragment| fragment.id)
+                .collect();
+            self.attempts
+                .lock()
+                .unwrap()
+                .push((manifest.version, staged_ids));
+            if let Some((competitor, batch)) = self.competitor.lock().await.take() {
+                InsertBuilder::new(competitor)
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Append,
+                        ..Default::default()
+                    })
+                    .execute(vec![batch])
+                    .await
+                    .unwrap();
+            }
+            lance_table::io::commit::ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    /// Fragments staged together with their deletions keep those deletion
+    /// files when a retry gives them different ids, and no attempt writes,
+    /// rewrites or moves a deletion object.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_retry_that_renumbers_staged_fragment_keeps_its_deletion_file(
+        #[values(false, true)] fragment_tree: bool,
+    ) {
+        let tmp = TempStrDir::default();
+        // Through object_store, so the dataset's IO tracker sees every write.
+        let path_prefix = if tmp.as_str().starts_with('/') {
+            ""
+        } else {
+            "/"
+        };
+        let uri = format!("file-object-store://{path_prefix}{}", tmp.as_str());
+        let schema = simple_schema();
+        let batch = |values: std::ops::Range<i32>| simple_batch(&schema, values.collect());
+        let writes_to_deletions = |stats: IoStats| {
+            stats
+                .requests
+                .iter()
+                .filter(|request| {
+                    matches!(request.method, "put_opts" | "put_part" | "copy" | "rename")
+                        && request.path.as_ref().contains(&format!("{DELETIONS_DIR}/"))
+                })
+                .count()
+        };
+
+        let mut create = InsertBuilder::new(uri.as_str())
+            .execute_uncommitted(vec![batch(0..10)])
+            .await
+            .unwrap();
+        if fragment_tree {
+            let Operation::Overwrite {
+                config_upsert_values,
+                ..
+            } = &mut create.operation
+            else {
+                panic!("expected an overwrite, got {:?}", create.operation);
+            };
+            *config_upsert_values = Some(
+                FragmentMetadataOptions::default()
+                    .into_table_config()
+                    .unwrap(),
+            );
+        }
+        let dataset = CommitBuilder::new(uri.as_str())
+            .execute(create)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_FRAGMENT_TREE != 0,
+            fragment_tree
+        );
+        // Ids up to 41 are taken, so the first attempt assigns 42 and 43.
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                1,
+                Operation::ReserveFragments { num_fragments: 41 },
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(41));
+
+        // Stage two fragments and delete row 5 of each before they have ids.
+        let mut transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 10,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![batch(100..120)])
+            .await
+            .unwrap();
+        let Operation::Append { fragments } = &mut transaction.operation else {
+            panic!("expected an append, got {:?}", transaction.operation);
+        };
+        assert_eq!(fragments.len(), 2);
+        let mut staged_deletion_files = Vec::new();
+        for fragment in fragments.iter_mut() {
+            assert_eq!(fragment.id, 0, "the commit assigns the id");
+            let deletion_file = write_deletion_file_with_naming(
+                &dataset.base,
+                DeletionFileNaming::Uuid,
+                dataset.manifest.version,
+                &DeletionVector::from_iter([5u32]),
+                dataset.object_store.as_ref(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            fragment.deletion_file = Some(deletion_file.clone());
+            staged_deletion_files.push(deletion_file);
+        }
+        // The tracker does see deletion-object writes: these are the staged ones.
+        assert_eq!(
+            writes_to_deletions(dataset.object_store.io_stats_incremental()),
+            2
+        );
+        let deletions_dir = dataset.base.clone().join(DELETIONS_DIR);
+        let list_deletions = || async {
+            let mut objects = dataset
+                .object_store
+                .read_dir_all(&deletions_dir, None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            objects.sort_by(|a, b| a.location.cmp(&b.location));
+            objects
+        };
+        let staged_objects = list_deletions().await;
+        let mut staged_paths = staged_deletion_files
+            .iter()
+            .map(|file| deletion_file_path(&dataset.base, 0, file))
+            .collect::<Vec<_>>();
+        staged_paths.sort();
+        assert_eq!(
+            staged_objects
+                .iter()
+                .map(|object| object.location.clone())
+                .collect::<Vec<_>>(),
+            staged_paths
+        );
+
+        let competitor = Arc::new(Dataset::open(&uri).await.unwrap());
+        let handler = Arc::new(LoseFirstAttemptToAppend {
+            competitor: tokio::sync::Mutex::new(Some((competitor, batch(200..210)))),
+            staged_deletion_files: staged_deletion_files.clone(),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_commit_handler(handler.clone())
+            .execute(transaction)
+            .await
+            .unwrap();
+
+        // Attempt 1 gave the fragments ids 42 and 43 and lost version 3 to the
+        // competitor, whose fragment took 42; the retry gave them 43 and 44.
+        let attempts = handler.attempts.lock().unwrap().clone();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|(version, _)| *version)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        if !fragment_tree {
+            assert_eq!(attempts[0].1, vec![42, 43]);
+            assert_eq!(attempts[1].1, vec![43, 44]);
+        }
+        assert_eq!(committed.manifest.version, 4);
+        assert_eq!(
+            writes_to_deletions(dataset.object_store.io_stats_incremental()),
+            0,
+            "no attempt may write a deletion object"
+        );
+        assert_eq!(list_deletions().await, staged_objects);
+
+        // A new session, with nothing cached, sees exactly row 5 of each
+        // staged fragment deleted, under the ids the retry assigned.
+        let reopened = DatasetBuilder::from_uri(&uri)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(reopened.manifest.version, 4);
+        for flags in [
+            reopened.manifest.reader_feature_flags,
+            reopened.manifest.writer_feature_flags,
+        ] {
+            assert_ne!(flags & FLAG_UNSTABLE_DELETION_FILE_PATHS, 0);
+        }
+        let deletion_files_by_id = reopened
+            .get_fragments()
+            .iter()
+            .filter_map(|fragment| {
+                let deletion_file = fragment.metadata().deletion_file.clone()?;
+                Some((fragment.id() as u64, deletion_file))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deletion_files_by_id,
+            vec![
+                (43, staged_deletion_files[0].clone()),
+                (44, staged_deletion_files[1].clone())
+            ]
+        );
+        let scanned = reopened.scan().try_into_batch().await.unwrap();
+        let mut values = scanned["x"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        values.sort_unstable();
+        let mut expected = (0..10)
+            .chain((100..120).filter(|value| *value != 105 && *value != 115))
+            .chain(200..210)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(values, expected);
     }
 }

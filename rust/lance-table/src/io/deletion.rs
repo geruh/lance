@@ -20,7 +20,8 @@ use roaring::bitmap::RoaringBitmap;
 use snafu::ResultExt;
 use tracing::{info, instrument};
 
-use crate::format::{DeletionFile, DeletionFileType};
+use crate::feature_flags::ensure_deletion_file_paths_enabled;
+use crate::format::{DeletionFile, DeletionFilePath, DeletionFileType};
 
 pub const DELETIONS_DIR: &str = "_deletions";
 
@@ -33,32 +34,70 @@ static DELETION_ARROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-/// Get the file path for a deletion file. This is relative to the dataset root.
+/// Get the path of a deletion file under `base`, the root of the dataset that
+/// holds it (the dataset named by [`DeletionFile::base_id`]).
+///
+/// An explicit [`DeletionFile::path`] is the location itself, and
+/// `fragment_id` plays no part in it. Otherwise this is the legacy location
+/// `_deletions/{fragment_id}-{read_version}-{id}.{extension}`, derived from the
+/// id of the fragment that owns the file.
 pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &DeletionFile) -> Path {
-    let DeletionFile {
-        read_version,
-        id,
-        file_type,
-        ..
-    } = deletion_file;
-    let suffix = file_type.suffix();
     base.clone()
         .join(DELETIONS_DIR)
-        .join(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
+        .join(deletion_file_name(fragment_id, deletion_file))
 }
 
+/// [`deletion_file_path`] relative to the root of the dataset that holds the
+/// file.
 pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFile) -> String {
+    format!(
+        "{DELETIONS_DIR}/{}",
+        deletion_file_name(fragment_id, deletion_file)
+    )
+}
+
+/// The name of a deletion file inside `_deletions/`. This is the only place
+/// that tells an explicit path from a location derived from the fragment id.
+fn deletion_file_name(fragment_id: u64, deletion_file: &DeletionFile) -> String {
+    // Destructured on purpose: a new field fails to compile here until someone
+    // decides whether it changes where the file is.
     let DeletionFile {
         read_version,
         id,
         file_type,
-        ..
+        num_deleted_rows: _,
+        // Selects the root the caller passes in, not the path under it.
+        base_id: _,
+        path,
     } = deletion_file;
-    let suffix = file_type.suffix();
-    format!("{DELETIONS_DIR}/{fragment_id}-{read_version}-{id}.{suffix}")
+    match path {
+        Some(path) => path.file_name(file_type),
+        None => format!("{fragment_id}-{read_version}-{id}.{}", file_type.suffix()),
+    }
 }
 
-/// Write a deletion file for a fragment for a given deletion vector.
+/// How [`write_deletion_file_with_naming`] names a new deletion file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionFileNaming {
+    /// Derive the name from the id of the fragment that owns the file:
+    /// `_deletions/{fragment_id}-{read_version}-{id}.{extension}`. Every Lance
+    /// version reads it, but it is only found while the fragment keeps this id,
+    /// so use it for fragments whose id is final.
+    FragmentId(u64),
+    /// Name the file `_deletions/{uuid}.{extension}` and record that path in
+    /// [`DeletionFile::path`]. The fragment can then be given an id later -- by
+    /// a commit, or by a retry of that commit -- without the file being
+    /// rewritten or renamed. A manifest that references the file needs
+    /// [`FLAG_UNSTABLE_DELETION_FILE_PATHS`](crate::feature_flags::FLAG_UNSTABLE_DELETION_FILE_PATHS),
+    /// which commits set from the fragments they write, so this is only
+    /// available where
+    /// [`deletion_file_paths_enabled`](crate::feature_flags::deletion_file_paths_enabled)
+    /// holds.
+    Uuid,
+}
+
+/// Write a deletion file for a fragment for a given deletion vector, named
+/// after `fragment_id` (see [`DeletionFileNaming::FragmentId`]).
 ///
 /// Returns the deletion file if one was written. If no deletions were present,
 /// returns `Ok(None)`.
@@ -69,19 +108,35 @@ pub async fn write_deletion_file(
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionFile>> {
-    let deletion_file = match removed_rows {
-        DeletionVector::NoDeletions => None,
-        DeletionVector::Set(set) => {
-            let id = rand::rng().random::<u64>();
-            let deletion_file = DeletionFile {
-                read_version,
-                id,
-                file_type: DeletionFileType::Array,
-                num_deleted_rows: Some(set.len()),
-                base_id: None,
-            };
-            let path = deletion_file_path(base, fragment_id, &deletion_file);
+    write_deletion_file_with_naming(
+        base,
+        DeletionFileNaming::FragmentId(fragment_id),
+        read_version,
+        removed_rows,
+        object_store,
+    )
+    .await
+}
 
+/// Write a deletion file for a given deletion vector, named as `naming` says.
+///
+/// Returns the deletion file if one was written. If no deletions were present,
+/// returns `Ok(None)`.
+pub async fn write_deletion_file_with_naming(
+    base: &Path,
+    naming: DeletionFileNaming,
+    read_version: u64,
+    removed_rows: &DeletionVector,
+    object_store: &ObjectStore,
+) -> Result<Option<DeletionFile>> {
+    // Refused rather than written under a name derived from a fragment id the
+    // caller does not have: that name would not survive the id assignment.
+    if naming == DeletionFileNaming::Uuid {
+        ensure_deletion_file_paths_enabled()?;
+    }
+    let (file_type, num_deleted_rows, out) = match removed_rows {
+        DeletionVector::NoDeletions => return Ok(None),
+        DeletionVector::Set(set) => {
             let array = UInt32Array::from_iter(set.iter().copied());
             let array = Arc::new(array);
 
@@ -101,35 +156,34 @@ pub async fn write_deletion_file(
                 writer.finish()?;
                 // Drop writer so out is no longer borrowed.
             }
-
-            object_store.put(&path, &out).await?;
-
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-
-            Some(deletion_file)
+            (DeletionFileType::Array, set.len(), out)
         }
         DeletionVector::Bitmap(bitmap) => {
-            let id = rand::rng().random::<u64>();
-            let deletion_file = DeletionFile {
-                read_version,
-                id,
-                file_type: DeletionFileType::Bitmap,
-                num_deleted_rows: Some(bitmap.len() as usize),
-                base_id: None,
-            };
-            let path = deletion_file_path(base, fragment_id, &deletion_file);
-
             let mut out: Vec<u8> = Vec::new();
             bitmap.serialize_into(&mut out)?;
-
-            object_store.put(&path, &out).await?;
-
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-
-            Some(deletion_file)
+            (DeletionFileType::Bitmap, bitmap.len() as usize, out)
         }
     };
-    Ok(deletion_file)
+    let (fragment_id, path) = match naming {
+        DeletionFileNaming::FragmentId(fragment_id) => (fragment_id, None),
+        // An explicit path does not depend on the fragment id at all.
+        DeletionFileNaming::Uuid => (0, Some(DeletionFilePath::new_random())),
+    };
+    let deletion_file = DeletionFile {
+        read_version,
+        id: rand::rng().random::<u64>(),
+        file_type,
+        num_deleted_rows: Some(num_deleted_rows),
+        base_id: None,
+        path,
+    };
+    let path = deletion_file_path(base, fragment_id, &deletion_file);
+
+    object_store.put(&path, &out).await?;
+
+    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
+
+    Ok(Some(deletion_file))
 }
 
 #[instrument(
@@ -219,6 +273,7 @@ pub async fn read_deletion_file(
 mod test {
 
     use super::*;
+    use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
 
     #[tokio::test]
@@ -228,10 +283,100 @@ mod test {
         let (object_store, path) = ObjectStore::from_uri("memory:///no_deletion")
             .await
             .unwrap();
-        let file = write_deletion_file(&path, 0, 0, &dv, &object_store)
+        for naming in [DeletionFileNaming::FragmentId(0), DeletionFileNaming::Uuid] {
+            let file = write_deletion_file_with_naming(&path, naming, 0, &dv, &object_store)
+                .await
+                .unwrap();
+            assert!(file.is_none());
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::array(DeletionVector::Set(HashSet::from_iter([5, 9])), "arrow")]
+    #[case::bitmap(DeletionVector::Bitmap(RoaringBitmap::from_iter([5, 9])), "bin")]
+    #[tokio::test]
+    async fn test_uuid_naming_is_independent_of_fragment_id(
+        #[case] dv: DeletionVector,
+        #[case] suffix: &str,
+    ) {
+        let object_store = ObjectStore::memory();
+        let base = Path::from("/uuid");
+        let file = write_deletion_file_with_naming(
+            &base,
+            DeletionFileNaming::Uuid,
+            12,
+            &dv,
+            &object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let explicit = file
+            .path
+            .as_ref()
+            .expect("uuid naming records the path")
+            .relative_path(&file.file_type);
+        let (name, extension) = explicit
+            .strip_prefix("_deletions/")
+            .unwrap()
+            .rsplit_once('.')
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(name).is_ok(), "{explicit}");
+        assert_eq!(extension, suffix);
+        assert_eq!(file.read_version, 12);
+        assert_eq!(file.num_deleted_rows, Some(2));
+
+        // The one stored object is the explicit path, whatever the fragment id.
+        let mut stored = object_store
+            .read_dir_all(&base, None)
+            .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert!(file.is_none());
+        assert_eq!(stored.len(), 1);
+        let stored = stored.pop().unwrap().location;
+        assert_eq!(stored.as_ref(), format!("uuid/{explicit}"));
+        for fragment_id in [0, 42, 43] {
+            assert_eq!(deletion_file_path(&base, fragment_id, &file), stored);
+            assert_eq!(relative_deletion_file_path(fragment_id, &file), explicit);
+            let read_dv = read_deletion_file(fragment_id, &file, &base, &object_store)
+                .await
+                .unwrap();
+            assert_eq!(read_dv, dv);
+        }
+    }
+
+    #[test]
+    fn test_deletion_file_path_derives_legacy_location_only_without_path() {
+        let legacy = DeletionFile {
+            read_version: 3,
+            id: 77,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: Some(2),
+            path: None,
+        };
+        let base = Path::from("root");
+        assert_eq!(
+            deletion_file_path(&base, 9, &legacy),
+            Path::from("root/_deletions/9-3-77.bin")
+        );
+        assert_eq!(
+            relative_deletion_file_path(9, &legacy),
+            "_deletions/9-3-77.bin"
+        );
+
+        let uuid = uuid::Uuid::from_u128(0xabc);
+        let explicit = DeletionFile {
+            path: Some(uuid.into()),
+            ..legacy
+        };
+        let expected = format!("_deletions/{}.bin", uuid.hyphenated());
+        assert_eq!(
+            deletion_file_path(&base, 9, &explicit),
+            Path::from(format!("root/{expected}"))
+        );
+        assert_eq!(relative_deletion_file_path(9, &explicit), expected);
     }
 
     #[tokio::test]

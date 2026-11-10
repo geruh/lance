@@ -9,7 +9,7 @@
 //! and translated into these in [`crate::fragment_metadata::commit`].
 
 use crate::format::pb::{self, fragment_action::Action};
-use crate::format::{DataFile, DeletionFile, DeletionFileType, Fragment};
+use crate::format::{DataFile, DeletionFile, Fragment};
 
 /// Attach `file` to fragment `frag_id` (the validated add-column case).
 pub fn add_data_file(frag_id: u64, file: &DataFile) -> pb::FragmentAction {
@@ -62,20 +62,10 @@ pub fn remove_fragment(frag_id: u64) -> pb::FragmentAction {
 
 /// Attach or replace the deletion file for `frag_id`.
 pub fn add_deletion_file(frag_id: u64, deletion_file: &DeletionFile) -> pb::FragmentAction {
-    let file_type = match deletion_file.file_type {
-        DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
-        DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
-    };
     pb::FragmentAction {
         action: Some(Action::AddDeletionFile(pb::AddDeletionFile {
             frag_id,
-            deletion_file: Some(pb::DeletionFile {
-                read_version: deletion_file.read_version,
-                id: deletion_file.id,
-                file_type: file_type.into(),
-                num_deleted_rows: deletion_file.num_deleted_rows.unwrap_or_default() as u64,
-                base_id: deletion_file.base_id,
-            }),
+            deletion_file: Some(pb::DeletionFile::from(deletion_file)),
         })),
     }
 }

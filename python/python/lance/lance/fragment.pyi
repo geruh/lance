@@ -22,6 +22,17 @@ class DeletionFile:
     file_type : str
         The type of deletion file. "array" is used for small sets, while
         "bitmap" is used for large sets.
+    base_id : int, optional
+        The base that holds the file, or None for this dataset.
+
+    Use :meth:`path` to locate the file. Most deletion files are located by
+    the id of the fragment that owns them. One with an explicit ``path``
+    (``_deletions/{uuid}.arrow`` or ``_deletions/{uuid}.bin``, matching
+    ``file_type``) stays at that path whatever id the fragment is given;
+    :meth:`asdict` includes it under ``"path"``. The UUID must be in lowercase
+    hyphenated form. Explicit paths are experimental: release builds only
+    commit and read tables that use them when
+    ``LANCE_ENABLE_UNSTABLE_DELETION_FILE_PATHS`` is set.
     """
 
     read_version: int
@@ -37,6 +48,7 @@ class DeletionFile:
         file_type: Literal["array", "bitmap"],
         num_deleted_rows: int,
         base_id: Optional[int] = None,
+        path: Optional[str] = None,
     ): ...
     def asdict(self) -> dict:
         """Get a dictionary representation of the deletion file."""
@@ -48,7 +60,8 @@ class DeletionFile:
         Parameters
         ----------
         fragment_id : int
-            The fragment id.
+            The id of the fragment that owns the file. Ignored when the deletion
+            file has an explicit path.
         base_uri : str, optional
             The base URI to use for the path. If not provided, a relative path
             is returned.

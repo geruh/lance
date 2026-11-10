@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import dataclasses
 import json
 import multiprocessing
 import pickle
@@ -590,6 +591,97 @@ def test_deletion_file_with_base_id_serialization():
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+
+
+def test_deletion_file_with_explicit_path_serialization():
+    """An explicit path survives every round trip and ignores the fragment id."""
+    from lance.fragment import DeletionFile, FragmentMetadata
+
+    path = f"_deletions/{uuid.uuid4()}.bin"
+    deletion_file = DeletionFile(
+        read_version=1, id=123, file_type="bitmap", num_deleted_rows=10, path=path
+    )
+    assert deletion_file.asdict()["path"] == path
+    assert path in repr(deletion_file)
+    assert deletion_file.path(5) == deletion_file.path(6) == path
+
+    # Files located by their fragment id keep the dict they always had.
+    legacy = DeletionFile(
+        read_version=1, id=123, file_type="bitmap", num_deleted_rows=10
+    )
+    assert "path" not in legacy.asdict()
+    assert legacy != deletion_file
+
+    metadata = FragmentMetadata(
+        id=1, files=[], physical_rows=1000, deletion_file=deletion_file
+    )
+    assert pickle.loads(pickle.dumps(metadata)) == metadata
+    json_data = metadata.to_json()
+    assert json_data["deletion_file"]["path"] == path
+    assert FragmentMetadata.from_json(json.dumps(json_data)) == metadata
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "/_deletions/{uuid}.bin",
+        "_deletions/../{uuid}.bin",
+        "data/{uuid}.bin",
+        "_deletions/{upper}.bin",
+        "_deletions/{uuid}.arrow",
+        "_deletions/name.bin",
+    ],
+)
+def test_deletion_file_rejects_malformed_path(path: str):
+    from lance.fragment import DeletionFile
+
+    value = uuid.uuid4()
+    path = path.format(uuid=value, upper=str(value).upper())
+    with pytest.raises(ValueError, match="Invalid deletion file path"):
+        DeletionFile(
+            read_version=1, id=123, file_type="bitmap", num_deleted_rows=1, path=path
+        )
+
+
+def test_commit_fragment_with_explicit_deletion_path(tmp_path: Path, monkeypatch):
+    """A deletion file that records its own path is read through that path."""
+    from lance.fragment import DeletionFile
+
+    # Release builds only commit explicit deletion file paths when opted in.
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DELETION_FILE_PATHS", "1")
+    ds = lance.write_dataset(pa.table({"a": range(10)}), tmp_path)
+
+    # Write the deletion vector at an explicit path, as a writer staging a
+    # fragment before it has an id would.
+    path = f"_deletions/{uuid.uuid4()}.arrow"
+    schema = pa.schema([pa.field("row_id", pa.uint32(), nullable=False)])
+    (tmp_path / "_deletions").mkdir()
+    with pa.ipc.new_file(str(tmp_path / path), schema) as writer:
+        writer.write_table(
+            pa.table({"row_id": pa.array([3], pa.uint32())}, schema=schema)
+        )
+    fragment = dataclasses.replace(
+        ds.get_fragments()[0].metadata,
+        deletion_file=DeletionFile(
+            read_version=ds.version,
+            id=1,
+            file_type="array",
+            num_deleted_rows=1,
+            path=path,
+        ),
+    )
+    ds = lance.LanceDataset.commit(
+        tmp_path,
+        lance.LanceOperation.Delete([fragment], [], "a = 3"),
+        read_version=ds.version,
+    )
+
+    reopened = lance.dataset(tmp_path)
+    deletion_file = reopened.get_fragments()[0].metadata.deletion_file
+    assert deletion_file is not None
+    assert deletion_file.asdict()["path"] == path
+    assert reopened.to_table()["a"].to_pylist() == [0, 1, 2, 4, 5, 6, 7, 8, 9]
 
 
 def test_fragment_update_columns_basic(tmp_path):
